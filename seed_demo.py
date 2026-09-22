@@ -1,78 +1,114 @@
 """
-Seeds the MDM database with sample records that deliberately exercise:
-  - auto-merge on exact email match
-  - queued for steward review (moderate fuzzy similarity)
-  - stands alone (no match at all)
-  - two tenants with IDENTICAL data, proving they never cross-match
+Seeds the MDM database across all three domains (Customer, Product,
+Vendor) for the "default" tenant, exercising auto-merge, review-queue,
+and standalone paths in each -- plus a cross-tenant isolation check.
 
 Run with:  python3 seed_demo.py
-Then start the API (uvicorn app.api:app --reload) and open http://localhost:8000/
-(the UI defaults to the "default" tenant -- see note at the bottom).
+Then:      uvicorn app.api:app --reload --port 8000
+           open http://localhost:8000/ (defaults to Customer domain in the UI)
 """
 from app.db import Store
 from app.pipeline import ingest_record
 
 DB_PATH = "mdm.db"
-TENANT = "default"  # matches api.py's default when no X-Tenant-Id header is sent
+TENANT = "default"
 
 
-def main():
-    store = Store(DB_PATH)
-
-    print("Ingesting seed records for tenant:", TENANT, "\n")
-
-    print(">> Robert Smith from CRM")
-    print(ingest_record(store, TENANT, "salesforce", "SF-1001", {
+def seed_customer(store):
+    print("--- Customer domain ---")
+    print(ingest_record(store, TENANT, "customer", "salesforce", "SF-1001", {
         "first_name": "Robert", "last_name": "Smith", "email": "bob.smith@acme.com",
         "phone": "415-555-0100", "address_line1": "123 Main Street", "city": "San Francisco",
         "state": "CA", "postal_code": "94107",
     }))
-
-    print("\n>> Bob Smith from Shopify (same email -> should auto-merge)")
-    print(ingest_record(store, TENANT, "shopify", "SHOP-9981", {
+    print(ingest_record(store, TENANT, "customer", "shopify", "SHOP-9981", {
         "first_name": "Bob", "last_name": "Smith", "email": "bob.smith@acme.com",
         "phone": "(415) 555-0100", "address_line1": "123 Main St, Apt 4", "city": "San Francisco",
         "state": "CA", "postal_code": "94107-1234",
     }))
-
-    print("\n>> Jennifer Nguyen from CRM")
-    print(ingest_record(store, TENANT, "salesforce", "SF-2002", {
+    print(ingest_record(store, TENANT, "customer", "salesforce", "SF-2002", {
         "first_name": "Jennifer", "last_name": "Nguyen", "email": "jnguyen@work.com",
-        "phone": "512-555-2200", "address_line1": "45 Birch Ln", "city": "Austin",
-        "state": "TX", "postal_code": "73301",
+        "address_line1": "45 Birch Ln", "city": "Austin", "state": "TX", "postal_code": "73301",
     }))
-
-    print("\n>> Jen Nguyen from a CSV import (similar but not certain -> should queue for review)")
-    print(ingest_record(store, TENANT, "csv_import", "ROW-77", {
-        "first_name": "Jen", "last_name": "Nguyen", "email": "",
-        "phone": "", "address_line1": "450 Birchwood Lane", "city": "Austin",
-        "state": "TX", "postal_code": "73344",
+    print(ingest_record(store, TENANT, "customer", "csv_import", "ROW-77", {
+        "first_name": "Jen", "last_name": "Nguyen",
+        "address_line1": "450 Birchwood Lane", "city": "Austin", "state": "TX", "postal_code": "73344",
     }))
-
-    print("\n>> Maria Garcia from CRM (a genuinely distinct customer)")
-    print(ingest_record(store, TENANT, "salesforce", "SF-3003", {
+    print(ingest_record(store, TENANT, "customer", "salesforce", "SF-3003", {
         "first_name": "Maria", "last_name": "Garcia", "email": "maria.garcia@example.com",
-        "phone": "312-555-9999", "address_line1": "90 Lake Shore Dr", "city": "Chicago",
-        "state": "IL", "postal_code": "60601",
+        "address_line1": "90 Lake Shore Dr", "city": "Chicago", "state": "IL", "postal_code": "60601",
     }))
 
-    # --- Bonus: prove tenant isolation with a second tenant ---
-    other_tenant = "tenant_globex"
-    print(f"\n>> (Isolation demo) Ingesting a record IDENTICAL to Robert Smith's, "
-          f"but under a different tenant ('{other_tenant}')")
-    print(ingest_record(store, other_tenant, "salesforce", "SF-1001", {
-        "first_name": "Robert", "last_name": "Smith", "email": "bob.smith@acme.com",
-        "phone": "415-555-0100", "address_line1": "123 Main Street", "city": "San Francisco",
-        "state": "CA", "postal_code": "94107",
+
+def seed_product(store):
+    print("\n--- Product domain ---")
+    print(ingest_record(store, TENANT, "product", "erp", "SKU-1001", {
+        "sku": "NK-AM90-BLK-10", "product_name": "Nike Air Max 90", "brand": "Nike",
+        "category": "Shoes", "price": "120.00",
     }))
-    print(f"   -> This creates its own separate golden record under '{other_tenant}' -- "
-          f"it will NEVER show up when querying tenant '{TENANT}', even with identical data.")
+    print(ingest_record(store, TENANT, "product", "shopify", "SHOP-P-77", {
+        "sku": "nk-am90-blk-10", "product_name": "Air Max 90 by Nike", "brand": "Nike",
+        "category": "Footwear", "price": "119.99",
+    }))
+    print(ingest_record(store, TENANT, "product", "erp", "SKU-2002", {
+        "sku": "GEN-WDGT-PRO", "product_name": "Widget Pro 3000", "brand": "Acme Tools",
+        "category": "Hardware", "price": "45.00",
+    }))
+    print(ingest_record(store, TENANT, "product", "distributor_feed", "DIST-9", {
+        "sku": "GEN-WDGT-PRO-V2", "product_name": "Widget Pro 3000 (New Edition)", "brand": "Acme Tools",
+        "category": "Hardware", "price": "47.50",
+    }))
+    print(ingest_record(store, TENANT, "product", "erp", "SKU-3003", {
+        "sku": "AD-UB22-WHT-9", "product_name": "Adidas Ultraboost 22", "brand": "Adidas",
+        "category": "Shoes", "price": "180.00",
+    }))
+
+
+def seed_vendor(store):
+    print("\n--- Vendor domain ---")
+    print(ingest_record(store, TENANT, "vendor", "erp", "VEND-1", {
+        "company_name": "Acme Supply Co", "tax_id": "12-3456789",
+        "contact_email": "ap@acmesupply.com", "city": "Dallas", "state": "TX", "postal_code": "75201",
+    }))
+    print(ingest_record(store, TENANT, "vendor", "ap_system", "AP-VEND-1", {
+        "company_name": "Acme Supply Company Inc", "tax_id": "123456789",
+        "contact_email": "ap@acmesupply.com", "city": "Dallas", "state": "TX", "postal_code": "75201",
+    }))
+    print(ingest_record(store, TENANT, "vendor", "erp", "VEND-2", {
+        "company_name": "Northwind Distributors", "contact_email": "info@northwind-dist.com",
+        "contact_phone": "312-555-4400", "city": "Chicago", "state": "IL", "postal_code": "60601",
+    }))
+    print(ingest_record(store, TENANT, "vendor", "csv_import", "ROW-V-9", {
+        "company_name": "Northwind Distribution LLC", "contact_phone": "(312) 555-4400",
+        "city": "Chicago", "state": "IL", "postal_code": "60602",
+    }))
+    print(ingest_record(store, TENANT, "vendor", "erp", "VEND-3", {
+        "company_name": "Globex Industrial", "tax_id": "98-7654321",
+        "contact_email": "billing@globex.com", "city": "Reno", "state": "NV", "postal_code": "89501",
+    }))
+
+
+def main():
+    store = Store(DB_PATH)
+    seed_customer(store)
+    seed_product(store)
+    seed_vendor(store)
+
+    print(f"\n--- (Isolation demo) Ingesting a vendor-shaped payload with a customer-shaped "
+          f"'first_name' field into the 'product' domain, same tenant ---")
+    r = ingest_record(store, TENANT, "product", "erp", "SKU-9999", {
+        "sku": "MISC-9999", "product_name": "Assorted Widget", "brand": "Acme Tools",
+    })
+    print(r)
+    print("This only ever matches against other PRODUCT records for this tenant -- "
+          "never against the Customer or Vendor records above, no matter how similar any field looks.")
 
     print("\nDone. Start the API with:")
     print("  uvicorn app.api:app --reload --port 8000")
-    print(f"Then open http://localhost:8000/ (defaults to tenant '{TENANT}').")
-    print(f"To see the isolated '{other_tenant}' tenant's data instead, query the API directly with:")
-    print(f'  curl -H "X-Tenant-Id: {other_tenant}" http://localhost:8000/v1/customer/entities')
+    print(f"Then open http://localhost:8000/ (defaults to tenant '{TENANT}', Customer domain).")
+    print("Switch domains in the UI's tabs, or query directly:")
+    print('  curl http://localhost:8000/v1/product/review-queue')
+    print('  curl http://localhost:8000/v1/vendor/review-queue')
 
 
 if __name__ == "__main__":

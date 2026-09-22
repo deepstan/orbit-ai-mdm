@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Customer MDM — Steward Console</title>
+<title>MDM — Steward Console</title>
 <style>
   :root {
     --bg: #0F1720;
@@ -30,13 +30,16 @@
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   header {
-    padding: 20px 28px;
+    padding: 20px 28px 0 28px;
     border-bottom: 1px solid var(--border);
+  }
+  .header-top {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 10px;
+    padding-bottom: 16px;
   }
   header h1 {
     font-size: 17px;
@@ -48,6 +51,29 @@
   .stats { display: flex; gap: 22px; font-family: var(--mono); font-size: 13px; }
   .stats span b { color: var(--text); font-weight: 600; }
   .stats span { color: var(--text-dim); }
+  .tabs {
+    display: flex;
+    gap: 4px;
+  }
+  .tab {
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-dim);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab .count {
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-left: 6px;
+    color: var(--text-dim);
+  }
   main {
     max-width: 980px;
     margin: 0 auto;
@@ -82,6 +108,12 @@
     font-weight: 600;
   }
   .score.high { background: rgba(224,169,62,0.15); color: var(--warn); }
+  .match-type {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    margin-left: 8px;
+  }
   .reasons {
     font-size: 12px;
     color: var(--text-dim);
@@ -108,14 +140,14 @@
     margin-bottom: 8px;
   }
   .rec .field { display: flex; gap: 8px; font-size: 13px; padding: 2px 0; }
-  .rec .field .k { color: var(--text-dim); width: 90px; flex-shrink: 0; }
-  .rec .field .v { color: var(--text); }
+  .rec .field .k { color: var(--text-dim); width: 100px; flex-shrink: 0; text-transform: capitalize; }
+  .rec .field .v { color: var(--text); word-break: break-word; }
   .actions {
     display: flex;
     gap: 10px;
     padding: 14px 18px 18px 18px;
   }
-  button {
+  button.action-btn {
     font-family: var(--sans);
     font-size: 13px;
     font-weight: 600;
@@ -161,14 +193,17 @@
 <body>
 
 <header>
-  <div>
-    <h1>Customer MDM — Steward Console</h1>
-    <div class="sub">Phase 1 MVP · single domain</div>
+  <div class="header-top">
+    <div>
+      <h1>MDM — Steward Console</h1>
+      <div class="sub">Phase 1+2 · multi-domain</div>
+    </div>
+    <div class="stats">
+      <span>Pending review <b id="stat-pending">–</b></span>
+      <span>Golden records <b id="stat-entities">–</b></span>
+    </div>
   </div>
-  <div class="stats">
-    <span>Pending review <b id="stat-pending">–</b></span>
-    <span>Golden records <b id="stat-entities">–</b></span>
-  </div>
+  <div class="tabs" id="tabs"></div>
 </header>
 
 <main>
@@ -176,10 +211,7 @@
 
   <section class="golden">
     <h2>Golden records</h2>
-    <table id="entities-table">
-      <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>City</th><th>Sources</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div id="entities-container"></div>
   </section>
 </main>
 
@@ -187,6 +219,22 @@
 
 <script>
 const API = '';
+const DOMAINS = [
+  { id: 'customer', label: 'Customer' },
+  { id: 'product',  label: 'Product' },
+  { id: 'vendor',   label: 'Vendor' },
+];
+// Which attributes to show as the "identity" columns in the golden-records
+// table per domain -- everything else still shows in the review-queue
+// record cards (which render ALL attributes generically), this is just
+// for a readable summary table.
+const SUMMARY_FIELDS = {
+  customer: ['first_name', 'last_name', 'email', 'city'],
+  product:  ['product_name', 'brand', 'sku', 'category'],
+  vendor:   ['company_name', 'tax_id', 'contact_email', 'city'],
+};
+
+let currentDomain = 'customer';
 
 async function fetchJSON(url, opts) {
   const res = await fetch(API + url, opts);
@@ -201,23 +249,33 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2200);
 }
 
-function fieldRow(rec, key, label) {
-  const val = rec.attributes[key];
-  if (!val) return '';
-  return `<div class="field"><span class="k">${label}</span><span class="v">${val}</span></div>`;
+function renderTabs(counts) {
+  const tabsEl = document.getElementById('tabs');
+  tabsEl.innerHTML = DOMAINS.map(d => `
+    <button class="tab ${d.id === currentDomain ? 'active' : ''}" onclick="switchDomain('${d.id}')">
+      ${d.label}<span class="count">${counts[d.id] ?? ''}</span>
+    </button>
+  `).join('');
 }
 
+function switchDomain(domain) {
+  currentDomain = domain;
+  loadAll();
+}
+
+// Renders EVERY attribute a record has, generically -- no hardcoded field
+// names, so this works identically for customer/product/vendor/any future
+// domain without UI changes.
 function renderRecord(rec) {
   if (!rec) return '<div class="rec"><span class="src">unknown</span></div>';
+  const fields = Object.entries(rec.attributes || {})
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `<div class="field"><span class="k">${k.replace(/_/g, ' ')}</span><span class="v">${v}</span></div>`)
+    .join('');
   return `
     <div class="rec">
       <div class="src">${rec.source_system}</div>
-      ${fieldRow(rec, 'first_name', 'First')}
-      ${fieldRow(rec, 'last_name', 'Last')}
-      ${fieldRow(rec, 'email', 'Email')}
-      ${fieldRow(rec, 'phone', 'Phone')}
-      ${fieldRow(rec, 'address_line1', 'Address')}
-      ${fieldRow(rec, 'city', 'City')}
+      ${fields}
     </div>`;
 }
 
@@ -226,7 +284,7 @@ function renderCandidate(c) {
   return `
     <div class="card" data-id="${c.candidate_id}">
       <div class="card-head">
-        <div>Possible duplicate</div>
+        <div>Possible duplicate<span class="match-type">${c.match_type}</span></div>
         <div class="score high">${(c.score * 100).toFixed(0)}% match</div>
       </div>
       <div class="reasons">Why: <ul>${reasonsHtml}</ul></div>
@@ -235,15 +293,15 @@ function renderCandidate(c) {
         ${renderRecord(c.record_b)}
       </div>
       <div class="actions">
-        <button class="confirm" onclick="resolve('${c.candidate_id}', 'confirm')">Confirm match &amp; merge</button>
-        <button class="reject" onclick="resolve('${c.candidate_id}', 'reject')">Not a match</button>
+        <button class="action-btn confirm" onclick="resolve('${c.candidate_id}', 'confirm')">Confirm match &amp; merge</button>
+        <button class="action-btn reject" onclick="resolve('${c.candidate_id}', 'reject')">Not a match</button>
       </div>
     </div>`;
 }
 
 async function resolve(candidateId, decision) {
   try {
-    await fetchJSON(`/v1/customer/review-queue/${candidateId}/resolve`, {
+    await fetchJSON(`/v1/${currentDomain}/review-queue/${candidateId}/resolve`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({decision, decided_by: 'steward:demo_user'})
@@ -256,35 +314,60 @@ async function resolve(candidateId, decision) {
 }
 
 async function loadQueue() {
-  const items = await fetchJSON('/v1/customer/review-queue');
+  const items = await fetchJSON(`/v1/${currentDomain}/review-queue`);
   const queueEl = document.getElementById('queue');
   document.getElementById('stat-pending').textContent = items.length;
   if (items.length === 0) {
-    queueEl.innerHTML = `<div class="empty"><div class="big">Review queue is empty</div>All incoming records were either auto-merged or had no plausible match.</div>`;
+    queueEl.innerHTML = `<div class="empty"><div class="big">Review queue is empty</div>All incoming ${currentDomain} records were either auto-merged or had no plausible match.</div>`;
     return;
   }
   queueEl.innerHTML = items.map(renderCandidate).join('');
+  return items.length;
 }
 
 async function loadEntities() {
-  const entities = await fetchJSON('/v1/customer/entities?status=active');
+  const entities = await fetchJSON(`/v1/${currentDomain}/entities?status=active`);
   document.getElementById('stat-entities').textContent = entities.length;
-  const tbody = document.querySelector('#entities-table tbody');
-  tbody.innerHTML = entities.map(e => `
-    <tr>
-      <td class="id">${e.entity_id.slice(0, 12)}…</td>
-      <td>${(e.attributes.first_name || '')} ${(e.attributes.last_name || '')}</td>
-      <td>${e.attributes.email || '—'}</td>
-      <td>${e.attributes.city || '—'}</td>
-      <td>${e.source_record_ids.length}</td>
-    </tr>
-  `).join('');
+  const container = document.getElementById('entities-container');
+  const summaryFields = SUMMARY_FIELDS[currentDomain] || Object.keys(entities[0]?.attributes || {}).slice(0, 4);
+
+  if (entities.length === 0) {
+    container.innerHTML = `<div class="empty">No ${currentDomain} golden records yet.</div>`;
+    return;
+  }
+
+  const headerRow = summaryFields.map(f => `<th>${f.replace(/_/g, ' ')}</th>`).join('');
+  const rows = entities.map(e => {
+    const cells = summaryFields.map(f => `<td>${e.attributes[f] || '—'}</td>`).join('');
+    return `<tr><td class="id">${e.entity_id.slice(0, 12)}…</td>${cells}<td>${e.source_record_ids.length}</td></tr>`;
+  }).join('');
+
+  container.innerHTML = `
+    <table>
+      <thead><tr><th>ID</th>${headerRow}<th>Sources</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 async function loadAll() {
-  await Promise.all([loadQueue(), loadEntities()]);
+  const pendingCount = await loadQueue();
+  await loadEntities();
+
+  // Fetch pending counts for every domain so the tab bar shows all three
+  // at once without switching -- accumulate into one object before the
+  // final render so earlier counts aren't clobbered.
+  const counts = { [currentDomain]: pendingCount };
+  for (const d of DOMAINS) {
+    if (d.id === currentDomain) continue;
+    try {
+      const items = await fetchJSON(`/v1/${d.id}/review-queue`);
+      counts[d.id] = items.length;
+    } catch (e) { /* ignore */ }
+  }
+  renderTabs(counts);
 }
 
+renderTabs({});
 loadAll();
 setInterval(loadAll, 8000);
 </script>
