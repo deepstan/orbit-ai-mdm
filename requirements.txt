@@ -6,3 +6,7 @@ pydantic>=2.6
 # for real semantic embeddings instead of the built-in pure-Python fallback.
 # Requires network access to download the model on first use.
 #   sentence-transformers>=2.7
+
+# Optional (Phase 2): only needed if you set DATABASE_URL to a postgresql://
+# connection string instead of using the default SQLite backend.
+#   psycopg2-binary>=2.9

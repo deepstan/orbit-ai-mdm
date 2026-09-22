@@ -1,87 +1,43 @@
-# Multi-Domain MDM — Phase 1 + Phase 2 MVP
+# Multi-Domain MDM — Phase 1 + 2 + 3 MVP
 
-A master data management prototype spanning **three domains — Customer,
-Product, and Vendor** — sharing one engine: ingestion → standardization →
-AI-assisted matching (string + semantic + optional LLM adjudication) →
+A master data management prototype spanning **Customer, Product, and
+Vendor** domains: ingestion → standardization → AI-assisted matching →
 human-in-the-loop review → golden record with full lineage → active
-learning from steward decisions, all with per-tenant AND per-domain
-isolation.
+learning, now with **RBAC/auth, an immutable audit log, right-to-be-
+forgotten, usage metering, and a connector interface** on top.
 
-This implements Phase 1, Phase 2, and the Phase 3 roadmap item "prove the
-entity envelope is genuinely domain-agnostic" from the [multi-domain MDM
-architecture doc] — the same engine now runs three domains without any
-domain-specific code in the matching, survivorship, or pipeline layers.
+## What's implemented, by phase
 
-## The domain registry — how multi-domain actually works
+**Phase 1** — standardization, blocking, deterministic + fuzzy matching, survivorship, lineage, stewardship UI, REST API.
 
-Every domain-specific decision lives in **one place**: `app/domains.py`.
-A `DomainConfig` ties together a schema, a standardizer, which fields are
-deterministic identity keys, fuzzy-match weights, which fields feed
-semantic similarity, blocking strategy, and survivorship rules:
+**Phase 2** — semantic embeddings, optional LLM adjudication, multi-tenancy, active learning, Product + Vendor domains (proving the engine is domain-agnostic via `app/domains.py`'s registry), Postgres backend.
 
-```python
-PRODUCT_CONFIG = DomainConfig(
-    name="product",
-    schema_fields=PRODUCT_SCHEMA_FIELDS,
-    standardizer=standardize_product,
-    deterministic_fields=["sku", "upc"],
-    fuzzy_weights={"brand": 0.20, "category": 0.15, "description": 0.10},
-    semantic_fields=["brand", "product_name"],
-    semantic_weight=0.35,
-    blocking_field_groups=[["sku"], ["upc"], ["brand", "category"]],
-    field_strategies={...},
-)
-```
+**Phase 3 (this round)**
+- **RBAC + API-key auth** (`app/auth.py`) — 4 roles (`tenant_admin`, `domain_admin`, `data_steward`, `api_consumer`), each API key optionally scoped to specific domains. Real, enforced permission checks — not a stub.
+- **Immutable audit log** (`app/audit.py`) — hash-chained (blockchain-style) log of every ingest, review-queue decision, key lifecycle event, and purge. `verify_chain()` detects tampering, not just claims immutability — proven with a test that actually corrupts an entry and confirms detection.
+- **Right-to-be-forgotten** (`app/compliance.py`) — permanently purges a golden record and every contributing source record across systems, logs the purge itself to the audit trail.
+- **Usage metering / billing hooks** (`app/billing.py`) — real event tracking (ingests, API calls) with cost estimation; a pluggable `BillingProvider` interface with a working "log what would be charged" default and a documented Stripe extension point.
+- **Connector interface** (`app/connectors.py`) — `BaseConnector` + a fully working `CSVConnector`; Salesforce/Shopify are documented scaffolds, not implementations (see caveat below).
 
-`matching.py`, `survivorship.py`, `active_learning.py`, and `pipeline.py`
-contain **zero references** to "first_name" or "sku" by name — they're
-driven entirely by whichever `DomainConfig` is passed in. That's what let
-Product and Vendor plug in as config additions rather than engine rewrites.
-
-**Adding a 4th domain** means: add a schema field list to `models.py`, a
-`standardize_X()` function to `standardize.py`, and a `DomainConfig` entry
-to `domains.py`. Nothing else changes.
-
-## Isolation: two independent axes
-
-Every table and query is scoped by **both** `tenant_id` and `domain`.
-Matching never crosses either boundary — proven with dedicated tests, not
-just assumed:
-
-- `test_identical_records_in_different_tenants_never_match_each_other` — byte-identical customer data across two tenants never merges.
-- `test_identical_looking_data_never_matches_across_domains` — a customer record and a vendor record with colliding field values (same "company name", same email) never merge, because there's no shared candidate pool between domains.
-- `test_entity_lookup_respects_domain_boundary` / `test_entity_lookup_respects_tenant_boundary` — fetching an entity ID under the wrong domain or tenant scope returns nothing, even though the ID technically exists in the database.
-
-## What's implemented
-
-**Phase 1 (core pipeline)** — standardization, blocking, deterministic +
-fuzzy matching, confidence-band routing, configurable survivorship, full
-lineage, stewardship UI, REST API.
-
-**Phase 2**
-- **Semantic embeddings** (`app/embeddings.py`) — pure-Python n-gram hash fallback (zero deps), pluggable to real `sentence-transformers`.
-- **LLM adjudication** (`app/llm_adjudication.py`) — optional Anthropic API call for the ambiguous score band, domain-aware prompt, fails safe to the review queue.
-- **Multi-tenancy** — every table/query scoped by `tenant_id`.
-- **Active learning** (`app/active_learning.py`, `retrain.py`) — per-(tenant, domain) logistic regression trained from steward decisions, with domain-appropriate feature vectors (a product model's features aren't shaped like a customer model's).
-- **Product and Vendor domains** — full parity with Customer: matching, survivorship, lineage, review queue, active learning, all working through the same domain-agnostic engine.
-
-## ⚠️ Tested live vs. needs your machine
-
-Built in a sandbox with **no network access** — this shaped what could be verified directly:
+## ⚠️ Honest status by feature
 
 | Feature | Status |
 |---|---|
-| Standardization, matching, blocking, survivorship, lineage — all 3 domains | ✅ Fully tested (26 unit tests) |
-| Cross-tenant AND cross-domain isolation | ✅ Fully tested, dedicated tests for each |
-| Semantic embeddings (n-gram hash fallback) | ✅ Fully tested, all 3 domains |
-| Active learning (training, persistence, blending, per-domain isolation) | ✅ Fully tested |
-| LLM adjudication integration logic (routing, fallback, domain-aware prompts) | ✅ Fully tested, actual API call mocked |
+| Standardization, matching, survivorship, lineage — all 3 domains | ✅ Fully tested |
+| Cross-tenant AND cross-domain isolation | ✅ Fully tested |
+| Semantic embeddings, active learning | ✅ Fully tested |
+| **RBAC / permission checks** | ✅ Fully tested — role × action × domain matrix, all combinations |
+| **Audit log hash chain, including tamper detection** | ✅ Fully tested — a test actually corrupts a stored entry and confirms `verify_chain()` catches it |
+| **Right-to-be-forgotten purge** | ✅ Fully tested — entity + source records deleted, audit-logged, tenant/domain isolation preserved |
+| **Usage metering** | ✅ Fully tested |
+| **CSV connector** | ✅ Fully tested, real file I/O |
+| LLM adjudication integration logic | ✅ Fully tested (API call itself mocked) |
 | LLM adjudication **real API call** | ⚠️ Not tested — no network here |
-| FastAPI HTTP layer (`api.py`) | ⚠️ Not tested — FastAPI isn't installable in this sandbox |
-| `sentence-transformers` real embeddings | ⚠️ Not tested — optional upgrade path |
-| Real PostgreSQL | ⚠️ Not tested — still SQLite; the tenant+domain isolation *pattern* is proven, the engine swap isn't |
+| **FastAPI HTTP layer, including auth wiring** | ⚠️ **Not tested** — FastAPI isn't installable in this sandbox. The RBAC/audit/billing *logic* is tested directly (bypassing HTTP); the `api.py` wiring that calls it has not been run |
+| Postgres backend (incl. new Phase 3 tables) | ⚠️ Written, not run — see the Postgres section |
+| **Salesforce / Shopify connectors** | ❌ **Not implemented** — scaffolds only. Real integrations need live API credentials this sandbox can't reach; unlike the LLM/Postgres code, there's no stable public contract to write against without a real account, so nothing was written to "validate later" here |
 
-Run `python3 -m unittest discover -s tests -v` — 26 tests pass with zero setup.
+Run `python3 -m unittest discover -s tests -v` — 48 tests pass, 7 skip (Postgres-only).
 
 ## Setup
 
@@ -90,64 +46,164 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-python3 seed_demo.py            # seeds all 3 domains, exercises every matching path + isolation
+python3 seed_demo.py
 uvicorn app.api:app --reload --port 8000
 ```
 
-Open **http://localhost:8000/** — the stewardship console now has **Customer / Product / Vendor tabs**. Or **http://localhost:8000/docs** for the API.
+By default, **auth is OFF** (`MDM_ENABLE_AUTH` unset) — the API and stewardship UI work exactly as before, full access, tenant from the `X-Tenant-Id` header. This is "dev mode," clearly labeled as such everywhere it appears (mirrors how LLM adjudication defaults off) — real functionality is opt-in, not silently broken by default.
 
-## API surface (generic across domains)
-
-```
-POST /v1/{domain}/records
-GET  /v1/{domain}/entities
-GET  /v1/{domain}/entities/{entity_id}
-GET  /v1/{domain}/entities/{entity_id}/lineage
-GET  /v1/{domain}/review-queue
-POST /v1/{domain}/review-queue/{candidate_id}/resolve
-GET  /v1/{domain}/schema
-GET  /v1/domains                  # lists all registered domains + their schemas
-```
-
-`{domain}` is `customer`, `product`, or `vendor` — an unknown domain returns 404, not a silent fallback.
+## Turning on RBAC for real
 
 ```bash
-# Product domain example
-curl -X POST http://localhost:8000/v1/product/records \
-  -H "Content-Type: application/json" \
-  -d '{"source_system":"erp","source_record_id":"SKU-1","attributes":{"sku":"ABC-123","product_name":"Widget Pro","brand":"Acme"}}'
+# 1. Bootstrap a tenant_admin key (do this BEFORE enabling auth, or you'll lock yourself out)
+python3 manage_api_keys.py create --tenant acme --role tenant_admin --label "root key"
+#    -> copy the printed key
 
-curl http://localhost:8000/v1/product/review-queue
+# 2. Create scoped keys for other roles as needed
+python3 manage_api_keys.py create --tenant acme --role data_steward --label "Jane" --domains customer,product
+python3 manage_api_keys.py create --tenant acme --role api_consumer --label "BI dashboard read-only"
 
-# Vendor domain example
-curl -X POST http://localhost:8000/v1/vendor/records \
-  -H "Content-Type: application/json" -H "X-Tenant-Id: acme_corp" \
-  -d '{"source_system":"ap_system","source_record_id":"V1","attributes":{"company_name":"Acme Supply","tax_id":"12-3456789"}}'
+# 3. Turn on enforcement
+export MDM_ENABLE_AUTH=true
+uvicorn app.api:app --reload --port 8000
+
+# 4. Every request now needs the header
+curl -H "Authorization: Bearer mdm_..." http://localhost:8000/v1/customer/entities
 ```
+
+**Roles:**
+
+| Role | Can do |
+|---|---|
+| `tenant_admin` | Everything: ingest, resolve queue, retrain, manage API keys, purge (right-to-be-forgotten), view audit log/usage |
+| `domain_admin` | Ingest, resolve queue, retrain — within their `allowed_domains` only |
+| `data_steward` | Ingest, resolve queue — within their `allowed_domains` only |
+| `api_consumer` | Read-only — within their `allowed_domains` only |
+
+`allowed_domains: null` (the default, and what `create --domains` omitted means) grants all domains.
+
+```bash
+python3 manage_api_keys.py list --tenant acme
+python3 manage_api_keys.py revoke --tenant acme --key-id key_abc123
+```
+
+## Audit log
+
+Every ingest, review-queue resolution, API key created/revoked, and purge is logged with a hash that chains to the previous entry — tampering with any historical row breaks every subsequent hash.
+
+```bash
+curl -H "Authorization: Bearer <tenant_admin key>" http://localhost:8000/v1/admin/audit-log
+# -> { "chain_valid": true, "broke_at_entry_id": null, "entries": [...] }
+```
+
+`chain_valid: false` plus a `broke_at_entry_id` means someone modified a stored entry after the fact — worth investigating immediately, not something that should ever happen in normal operation.
+
+**What "immutable" means here, precisely:** tamper-*evident*, not tamper-*proof*. Someone with direct database write access could forge a whole new consistent-looking chain from scratch. What this actually guarantees: a partial edit (changing one entry without rebuilding everything after it) is always detectable. That's the realistic guarantee a hash chain on a regular SQL database can make — genuinely useful, not a false claim of cryptographic tamper-proofing.
+
+## Right-to-be-forgotten
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <tenant_admin key>" \
+  http://localhost:8000/v1/customer/entities/<entity_id>
+```
+
+Permanently deletes the golden record and every source record that contributed to it. The purge itself is audit-logged (the fact that data was erased is retained, even though the data isn't). **Documented limitation:** doesn't clean up dangling `source_record_id` references in *other* entities' lineage history that might mention a since-purged record — full graph-wide referential cleanup is beyond this MVP's scope.
+
+## Usage metering (billing hooks)
+
+```bash
+curl -H "Authorization: Bearer <tenant_admin key>" http://localhost:8000/v1/admin/usage
+# -> { "counts_by_event_type": {"record_ingested": 47}, "estimated_cost_usd": 0.094 }
+```
+
+Real tracking, illustrative per-unit prices. `LoggingBillingProvider` (the only implementation that runs here) records what *would* be charged rather than charging anything — swapping in a real Stripe integration is a documented one-class extension point in `app/billing.py`, not a rewrite. **Not yet metered:** LLM adjudication calls specifically (only `record_ingested` is metered at the API boundary right now).
+
+## Connectors
+
+```python
+from app.connectors import CSVConnector, ingest_from_connector
+from app.store_factory import get_store
+
+store = get_store()
+connector = CSVConnector(
+    csv_path="customers.csv",
+    field_mapping={"Email Address": "email", "First": "first_name", "Last": "last_name"},
+    source_record_id_column="CustomerID",
+)
+results = ingest_from_connector(store, "acme", "customer", connector)
+```
+
+Salesforce/Shopify connectors are scaffolds in the same file (`SalesforceConnectorStub`, `ShopifyConnectorStub`) that raise `NotImplementedError` with a clear explanation — building a real one means working against a live account's actual API, which isn't something to fake having validated.
+
+## Postgres (optional — SQLite is the default)
+
+```bash
+docker run --name mdm-postgres -e POSTGRES_PASSWORD=devpass -p 5432:5432 -d postgres:16
+createdb -h localhost -U postgres mdm_dev
+pip install psycopg2-binary
+export DATABASE_URL=postgresql://postgres:devpass@localhost:5432/mdm_dev
+python3 seed_demo.py
+```
+
+`app/db_postgres.py` now includes the Phase 3 tables (`api_keys`, `audit_log`, `usage_events`) with the same interface as SQLite's `Store` — written but **not run** here (no reachable Postgres server). Validate with:
+
+```bash
+export TEST_DATABASE_URL=postgresql://postgres:devpass@localhost:5432/mdm_dev
+python3 -m unittest tests.test_postgres_backend -v
+```
+
+**Not yet built:** Postgres row-level security policies as a second isolation layer beneath the application-level `tenant_id` + `domain` filtering.
 
 ## Active learning per domain
 
 ```bash
-python3 retrain.py --tenant acme_corp --domain product
-python3 retrain.py --tenant acme_corp --domain vendor
+python3 retrain.py --tenant acme --domain product
 ```
 
-Models are saved to `models/<tenant>__<domain>_match_model.json` — isolated per (tenant, domain) pair, since a product-domain model's feature vector isn't even the same shape as a customer-domain model's (see `feature_names()` in `app/active_learning.py`).
+Models isolated per (tenant, domain) — see `models/<tenant>__<domain>_match_model.json`.
 
-## Known gaps / honest limitations
+## Multi-domain API (generic across Customer/Product/Vendor)
+
+```
+POST   /v1/{domain}/records
+GET    /v1/{domain}/entities
+GET    /v1/{domain}/entities/{entity_id}
+GET    /v1/{domain}/entities/{entity_id}/lineage
+DELETE /v1/{domain}/entities/{entity_id}          # purge (tenant_admin only)
+GET    /v1/{domain}/review-queue
+POST   /v1/{domain}/review-queue/{candidate_id}/resolve
+GET    /v1/{domain}/schema
+GET    /v1/domains
+POST   /v1/admin/api-keys                          # tenant_admin only
+GET    /v1/admin/api-keys
+DELETE /v1/admin/api-keys/{key_id}
+GET    /v1/admin/audit-log
+GET    /v1/admin/usage
+```
+
+## Running the tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Known gaps / honest limitations (cumulative)
 
 - Rejecting a match candidate doesn't immediately spin the still-unclustered record into its own entity in the same call.
-- Active learning models have no train/test split or drift monitoring — good enough to prove the loop closes, not production ML ops.
-- `EMBEDDING_PROVIDER=sentence_transformers` and `ENABLE_LLM_ADJUDICATION=true` are real, complete code paths, neither run against a live model/API from this sandbox.
-- Blocking key prefix length (3 chars) is a reasonable default but untuned against real duplicate-pair data for any domain — tune per your actual data before trusting recall at scale.
-- Postgres migration is still a documented intention in `app/db.py`'s docstring, not built.
+- Active learning has no train/test split or drift monitoring.
+- `EMBEDDING_PROVIDER=sentence_transformers`, `ENABLE_LLM_ADJUDICATION=true`, Postgres, and the full `api.py` HTTP layer are real code paths never run against live network/services in this sandbox.
+- Postgres RLS (defense-in-depth beneath application-level tenant/domain filtering) not built.
+- LLM adjudication calls aren't separately usage-metered yet.
+- Purge doesn't clean up dangling references in other entities' lineage history.
+- Salesforce/Shopify connectors are documented scaffolds, not working integrations.
+- No SSO (Auth0/Ory/Keycloak) — API keys are the real, working auth mechanism for now; SSO would be a second way to resolve a `Principal` alongside API keys, not a replacement.
 
 ## Suggested next steps
 
-1. Validate the untested paths above on your machine.
-2. Swap SQLite → PostgreSQL (tenant+domain scoping pattern already transfers).
-3. Add train/test split and basic precision/recall metrics to active learning before trusting it in production.
-4. Load-test blocking against realistic volume per domain.
-5. A 4th domain (Location? Employee?) as a config-only addition, to further stress-test the registry pattern.
+1. Validate everything flagged ⚠️/❌ above on your own machine — this is genuinely the highest-value next step, since it's the largest block of "written but unverified" code accumulated so far.
+2. Postgres RLS policies.
+3. Real Stripe billing integration.
+4. A real Salesforce or Shopify connector, built against an actual account.
+5. Extend usage metering to LLM adjudication calls.
 
 [multi-domain MDM architecture doc]: ./mdm-saas-architecture.md

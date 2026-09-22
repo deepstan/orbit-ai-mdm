@@ -7,10 +7,9 @@ Run with:  python3 seed_demo.py
 Then:      uvicorn app.api:app --reload --port 8000
            open http://localhost:8000/ (defaults to Customer domain in the UI)
 """
-from app.db import Store
 from app.pipeline import ingest_record
+from app.store_factory import get_store
 
-DB_PATH = "mdm.db"
 TENANT = "default"
 
 
@@ -89,7 +88,9 @@ def seed_vendor(store):
 
 
 def main():
-    store = Store(DB_PATH)
+    # Uses DATABASE_URL if set (e.g. postgresql://...), else SQLite's mdm.db
+    # in the current directory -- see app/store_factory.py.
+    store = get_store()
     seed_customer(store)
     seed_product(store)
     seed_vendor(store)
@@ -103,12 +104,29 @@ def main():
     print("This only ever matches against other PRODUCT records for this tenant -- "
           "never against the Customer or Vendor records above, no matter how similar any field looks.")
 
+    print("\n--- Phase 3: audit log + usage (dev mode, no auth needed for this demo) ---")
+    from app.audit import log_action, verify_chain
+    from app.billing import get_usage_summary, record_usage
+
+    log_action(store, TENANT, "seed_demo_run", actor="system:seed_demo",
+               details={"note": "seed_demo.py populated demo data"})
+    for _ in range(15):
+        record_usage(store, TENANT, "record_ingested", domain="customer")
+    ok, _ = verify_chain(store, TENANT)
+    print(f"Audit chain valid: {ok}")
+    summary = get_usage_summary(store, TENANT)
+    print(f"Usage so far: {summary.counts_by_event_type} (~${summary.estimated_cost_usd})")
+
     print("\nDone. Start the API with:")
     print("  uvicorn app.api:app --reload --port 8000")
-    print(f"Then open http://localhost:8000/ (defaults to tenant '{TENANT}', Customer domain).")
+    print(f"Then open http://localhost:8000/ (defaults to tenant '{TENANT}', Customer domain, auth OFF).")
     print("Switch domains in the UI's tabs, or query directly:")
     print('  curl http://localhost:8000/v1/product/review-queue')
     print('  curl http://localhost:8000/v1/vendor/review-queue')
+    print("\nTo try RBAC + audit log + usage metering for real:")
+    print(f'  python3 manage_api_keys.py create --tenant {TENANT} --role tenant_admin --label "root key"')
+    print("  export MDM_ENABLE_AUTH=true")
+    print('  curl -H "Authorization: Bearer <key>" http://localhost:8000/v1/admin/audit-log')
 
 
 if __name__ == "__main__":

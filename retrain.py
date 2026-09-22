@@ -13,8 +13,8 @@ data yet and leaves any existing model untouched.
 import argparse
 
 from app.active_learning import MIN_TRAINING_EXAMPLES, build_training_set, feature_names, retrain
-from app.db import Store
 from app.domains import REGISTRY, get_domain_config
+from app.store_factory import get_store
 
 
 def main():
@@ -22,10 +22,12 @@ def main():
     parser.add_argument("--tenant", default="default", help="Tenant ID to retrain (default: 'default')")
     parser.add_argument("--domain", default="customer", choices=list(REGISTRY),
                          help="Domain to retrain (default: 'customer')")
-    parser.add_argument("--db", default="mdm.db", help="Path to the SQLite database (default: mdm.db)")
+    parser.add_argument("--db", default=None,
+                         help="SQLite file path, or a postgresql:// URL. Defaults to DATABASE_URL "
+                              "env var if set, else mdm.db.")
     args = parser.parse_args()
 
-    store = Store(args.db)
+    store = get_store(args.db)
     examples = build_training_set(store, args.tenant, args.domain)
     confirmed = sum(1 for _, label in examples if label == 1)
     rejected = sum(1 for _, label in examples if label == 0)

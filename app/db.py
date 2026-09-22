@@ -16,7 +16,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import Entity, LineageEvent, MatchCandidate, SourceRecord
+from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_records (
@@ -68,11 +68,48 @@ CREATE TABLE IF NOT EXISTS lineage (
     changed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    allowed_domains TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    domain TEXT,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    details TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    domain TEXT,
+    event_type TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    metadata TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_source_records_entity ON source_records(tenant_id, domain, entity_id);
 CREATE INDEX IF NOT EXISTS idx_source_records_scope ON source_records(tenant_id, domain);
 CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(tenant_id, domain);
 CREATE INDEX IF NOT EXISTS idx_match_candidates_scope_status ON match_candidates(tenant_id, domain, status);
 CREATE INDEX IF NOT EXISTS idx_lineage_scope_entity ON lineage(tenant_id, domain, entity_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log(tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_tenant ON usage_events(tenant_id, created_at);
 """
 
 
@@ -136,6 +173,19 @@ class Store:
                 (entity_id, record_id, tenant_id, domain),
             )
 
+    def delete_source_record(self, record_id: str, tenant_id: str, domain: str) -> None:
+        """Hard delete -- used only by the right-to-be-forgotten purge
+        workflow (app/compliance.py). Normal operations never delete a
+        source record; this bypasses lineage/history by design, since
+        erasure requests are explicitly about removing data, not
+        recording its removal in the normal audit trail (the purge
+        itself is separately logged to audit_log)."""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM source_records WHERE id = ? AND tenant_id = ? AND domain = ?",
+                (record_id, tenant_id, domain),
+            )
+
     @staticmethod
     def _row_to_source_record(row) -> SourceRecord:
         return SourceRecord(
@@ -182,6 +232,14 @@ class Store:
                     "SELECT id FROM entities WHERE tenant_id = ? AND domain = ?", (tenant_id, domain)
                 ).fetchall()
         return [self.get_entity(r["id"], tenant_id, domain) for r in rows]
+
+    def delete_entity(self, entity_id: str, tenant_id: str, domain: str) -> None:
+        """Hard delete -- right-to-be-forgotten purge only (app/compliance.py)."""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM entities WHERE id = ? AND tenant_id = ? AND domain = ?",
+                (entity_id, tenant_id, domain),
+            )
 
     # --- match candidates --------------------------------------------------
     def save_candidate(self, c: MatchCandidate) -> None:
@@ -263,6 +321,116 @@ class Store:
                 id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"], entity_id=r["entity_id"],
                 field=r["field"], old_value=r["old_value"], new_value=r["new_value"],
                 source_record_id=r["source_record_id"], reason=r["reason"], changed_at=r["changed_at"],
+            )
+            for r in rows
+        ]
+
+    # --- API keys (RBAC / auth, see app/auth.py) --------------------------
+    def save_api_key(self, key: ApiKeyRecord) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO api_keys (id, tenant_id, role, key_hash, label, allowed_domains, "
+                "created_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (key.id, key.tenant_id, key.role, key.key_hash, key.label,
+                 json.dumps(key.allowed_domains) if key.allowed_domains is not None else None,
+                 key.created_at, key.revoked_at),
+            )
+
+    def get_api_key_by_hash(self, key_hash: str) -> ApiKeyRecord | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,)).fetchone()
+            return self._row_to_api_key(row) if row else None
+
+    def list_api_keys(self, tenant_id: str) -> list[ApiKeyRecord]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM api_keys WHERE tenant_id = ?", (tenant_id,)).fetchall()
+        return [self._row_to_api_key(r) for r in rows]
+
+    def revoke_api_key(self, key_id: str, tenant_id: str, revoked_at: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND tenant_id = ?",
+                (revoked_at, key_id, tenant_id),
+            )
+
+    @staticmethod
+    def _row_to_api_key(row) -> ApiKeyRecord:
+        return ApiKeyRecord(
+            id=row["id"], tenant_id=row["tenant_id"], role=row["role"], key_hash=row["key_hash"],
+            label=row["label"],
+            allowed_domains=json.loads(row["allowed_domains"]) if row["allowed_domains"] else None,
+            created_at=row["created_at"], revoked_at=row["revoked_at"],
+        )
+
+    # --- Audit log (immutable, hash-chained -- see app/audit.py) ----------
+    def append_audit_entry(self, entry: AuditLogEntry) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO audit_log (id, tenant_id, domain, action, actor, details, prev_hash, "
+                "entry_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (entry.id, entry.tenant_id, entry.domain, entry.action, entry.actor,
+                 json.dumps(entry.details), entry.prev_hash, entry.entry_hash, entry.created_at),
+            )
+
+    def get_last_audit_entry(self, tenant_id: str) -> AuditLogEntry | None:
+        """Most recent entry for a tenant -- needed to chain the next
+        entry's prev_hash. Returns None if this tenant has no audit
+        history yet (the chain's genesis case)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM audit_log WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+            return self._row_to_audit_entry(row) if row else None
+
+    def list_audit_log(self, tenant_id: str, domain: str | None = None, limit: int = 200) -> list[AuditLogEntry]:
+        with self._conn() as conn:
+            if domain:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log WHERE tenant_id = ? AND domain = ? "
+                    "ORDER BY created_at ASC LIMIT ?",
+                    (tenant_id, domain, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log WHERE tenant_id = ? ORDER BY created_at ASC LIMIT ?",
+                    (tenant_id, limit),
+                ).fetchall()
+        return [self._row_to_audit_entry(r) for r in rows]
+
+    @staticmethod
+    def _row_to_audit_entry(row) -> AuditLogEntry:
+        return AuditLogEntry(
+            id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"], action=row["action"],
+            actor=row["actor"], details=json.loads(row["details"]),
+            prev_hash=row["prev_hash"], entry_hash=row["entry_hash"], created_at=row["created_at"],
+        )
+
+    # --- Usage events (billing metering -- see app/billing.py) ------------
+    def record_usage_event(self, ev: UsageEvent) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO usage_events (id, tenant_id, domain, event_type, quantity, metadata, "
+                "created_at) VALUES (?,?,?,?,?,?,?)",
+                (ev.id, ev.tenant_id, ev.domain, ev.event_type, ev.quantity,
+                 json.dumps(ev.metadata), ev.created_at),
+            )
+
+    def list_usage_events(self, tenant_id: str, since: str | None = None) -> list[UsageEvent]:
+        with self._conn() as conn:
+            if since:
+                rows = conn.execute(
+                    "SELECT * FROM usage_events WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at",
+                    (tenant_id, since),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM usage_events WHERE tenant_id = ? ORDER BY created_at", (tenant_id,)
+                ).fetchall()
+        return [
+            UsageEvent(
+                id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"], event_type=r["event_type"],
+                quantity=r["quantity"], metadata=json.loads(r["metadata"]), created_at=r["created_at"],
             )
             for r in rows
         ]

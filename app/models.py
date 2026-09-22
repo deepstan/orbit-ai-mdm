@@ -113,6 +113,46 @@ class LineageEvent:
 
 
 @dataclass
+class ApiKeyRecord:
+    """Stored record for an API key -- only the hash is kept, never the
+    plaintext key. See app/auth.py for generation/verification."""
+    tenant_id: str
+    role: str
+    key_hash: str
+    label: str
+    id: str = field(default_factory=lambda: new_id("key_"))
+    allowed_domains: Optional[list[str]] = None  # None = all domains
+    created_at: str = field(default_factory=now_iso)
+    revoked_at: Optional[str] = None
+
+
+@dataclass
+class AuditLogEntry:
+    """One immutable, hash-chained audit log entry. See app/audit.py."""
+    tenant_id: str
+    action: str
+    actor: str  # API key label/id, or "system"
+    details: dict[str, Any]
+    prev_hash: str
+    entry_hash: str
+    id: str = field(default_factory=lambda: new_id("audit_"))
+    domain: Optional[str] = None
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
+class UsageEvent:
+    """One billing-relevant usage event. See app/billing.py."""
+    tenant_id: str
+    event_type: str  # e.g. "record_ingested", "api_call", "llm_adjudication_call"
+    id: str = field(default_factory=lambda: new_id("usage_"))
+    domain: Optional[str] = None
+    quantity: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=now_iso)
+
+
+@dataclass
 class Entity:
     """A golden record -- for whichever domain it belongs to."""
     id: str = field(default_factory=lambda: new_id("ent_"))
