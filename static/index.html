@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Customer MDM — Steward Console</title>
+<style>
+  :root {
+    --bg: #0F1720;
+    --panel: #16212C;
+    --panel-alt: #1C2833;
+    --border: #2A3A48;
+    --text: #E6EDF3;
+    --text-dim: #8B9AAB;
+    --accent: #3FA9F5;
+    --accent-dim: #1E5A82;
+    --good: #4CBB8A;
+    --warn: #E0A93E;
+    --bad: #D96C6C;
+    --mono: 'SF Mono', 'Consolas', 'Menlo', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  header {
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  header h1 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  header .sub { color: var(--text-dim); font-size: 13px; }
+  .stats { display: flex; gap: 22px; font-family: var(--mono); font-size: 13px; }
+  .stats span b { color: var(--text); font-weight: 600; }
+  .stats span { color: var(--text-dim); }
+  main {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 28px;
+  }
+  .empty {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--text-dim);
+  }
+  .empty .big { font-size: 15px; color: var(--text); margin-bottom: 6px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    background: var(--panel-alt);
+    border-bottom: 1px solid var(--border);
+  }
+  .score {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .score.high { background: rgba(224,169,62,0.15); color: var(--warn); }
+  .reasons {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    padding: 10px 18px 0 18px;
+  }
+  .reasons ul { margin: 4px 0 0 0; padding-left: 18px; }
+  .pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--border);
+    margin-top: 12px;
+  }
+  .rec {
+    background: var(--panel);
+    padding: 14px 18px;
+  }
+  .rec .src {
+    font-size: 11px;
+    text-transform: lowercase;
+    color: var(--accent);
+    font-family: var(--mono);
+    margin-bottom: 8px;
+  }
+  .rec .field { display: flex; gap: 8px; font-size: 13px; padding: 2px 0; }
+  .rec .field .k { color: var(--text-dim); width: 90px; flex-shrink: 0; }
+  .rec .field .v { color: var(--text); }
+  .actions {
+    display: flex;
+    gap: 10px;
+    padding: 14px 18px 18px 18px;
+  }
+  button {
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  .confirm { background: var(--good); color: #06241a; }
+  .confirm:hover { filter: brightness(1.08); }
+  .reject { background: transparent; border-color: var(--border); color: var(--text-dim); }
+  .reject:hover { color: var(--bad); border-color: var(--bad); }
+  section.golden { margin-top: 42px; }
+  section.golden h2 {
+    font-size: 13px;
+    color: var(--text-dim);
+    font-weight: 600;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 6px 10px; font-size: 12px; }
+  td { padding: 8px 10px; border-top: 1px solid var(--border); }
+  td.id { font-family: var(--mono); color: var(--text-dim); font-size: 11px; }
+  .toast {
+    position: fixed;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Customer MDM — Steward Console</h1>
+    <div class="sub">Phase 1 MVP · single domain</div>
+  </div>
+  <div class="stats">
+    <span>Pending review <b id="stat-pending">–</b></span>
+    <span>Golden records <b id="stat-entities">–</b></span>
+  </div>
+</header>
+
+<main>
+  <div id="queue"></div>
+
+  <section class="golden">
+    <h2>Golden records</h2>
+    <table id="entities-table">
+      <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>City</th><th>Sources</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+
+async function fetchJSON(url, opts) {
+  const res = await fetch(API + url, opts);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+function fieldRow(rec, key, label) {
+  const val = rec.attributes[key];
+  if (!val) return '';
+  return `<div class="field"><span class="k">${label}</span><span class="v">${val}</span></div>`;
+}
+
+function renderRecord(rec) {
+  if (!rec) return '<div class="rec"><span class="src">unknown</span></div>';
+  return `
+    <div class="rec">
+      <div class="src">${rec.source_system}</div>
+      ${fieldRow(rec, 'first_name', 'First')}
+      ${fieldRow(rec, 'last_name', 'Last')}
+      ${fieldRow(rec, 'email', 'Email')}
+      ${fieldRow(rec, 'phone', 'Phone')}
+      ${fieldRow(rec, 'address_line1', 'Address')}
+      ${fieldRow(rec, 'city', 'City')}
+    </div>`;
+}
+
+function renderCandidate(c) {
+  const reasonsHtml = c.reasons.map(r => `<li>${r}</li>`).join('');
+  return `
+    <div class="card" data-id="${c.candidate_id}">
+      <div class="card-head">
+        <div>Possible duplicate</div>
+        <div class="score high">${(c.score * 100).toFixed(0)}% match</div>
+      </div>
+      <div class="reasons">Why: <ul>${reasonsHtml}</ul></div>
+      <div class="pair">
+        ${renderRecord(c.record_a)}
+        ${renderRecord(c.record_b)}
+      </div>
+      <div class="actions">
+        <button class="confirm" onclick="resolve('${c.candidate_id}', 'confirm')">Confirm match &amp; merge</button>
+        <button class="reject" onclick="resolve('${c.candidate_id}', 'reject')">Not a match</button>
+      </div>
+    </div>`;
+}
+
+async function resolve(candidateId, decision) {
+  try {
+    await fetchJSON(`/v1/customer/review-queue/${candidateId}/resolve`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({decision, decided_by: 'steward:demo_user'})
+    });
+    showToast(decision === 'confirm' ? 'Merged into golden record' : 'Marked as not a match');
+    await loadAll();
+  } catch (e) {
+    showToast('Error: ' + e.message);
+  }
+}
+
+async function loadQueue() {
+  const items = await fetchJSON('/v1/customer/review-queue');
+  const queueEl = document.getElementById('queue');
+  document.getElementById('stat-pending').textContent = items.length;
+  if (items.length === 0) {
+    queueEl.innerHTML = `<div class="empty"><div class="big">Review queue is empty</div>All incoming records were either auto-merged or had no plausible match.</div>`;
+    return;
+  }
+  queueEl.innerHTML = items.map(renderCandidate).join('');
+}
+
+async function loadEntities() {
+  const entities = await fetchJSON('/v1/customer/entities?status=active');
+  document.getElementById('stat-entities').textContent = entities.length;
+  const tbody = document.querySelector('#entities-table tbody');
+  tbody.innerHTML = entities.map(e => `
+    <tr>
+      <td class="id">${e.entity_id.slice(0, 12)}…</td>
+      <td>${(e.attributes.first_name || '')} ${(e.attributes.last_name || '')}</td>
+      <td>${e.attributes.email || '—'}</td>
+      <td>${e.attributes.city || '—'}</td>
+      <td>${e.source_record_ids.length}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadAll() {
+  await Promise.all([loadQueue(), loadEntities()]);
+}
+
+loadAll();
+setInterval(loadAll, 8000);
+</script>
+
+</body>
+</html>

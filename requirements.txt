@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# Optional (Phase 2): only needed if you set EMBEDDING_PROVIDER=sentence_transformers
+# for real semantic embeddings instead of the built-in pure-Python fallback.
+# Requires network access to download the model on first use.
+#   sentence-transformers>=2.7
