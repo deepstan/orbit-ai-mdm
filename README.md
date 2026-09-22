@@ -187,6 +187,31 @@ GET    /v1/admin/usage
 python3 -m unittest discover -s tests -v
 ```
 
+## Validating everything the build sandbox couldn't
+
+```bash
+python3 validate_setup.py
+```
+
+Runs through every ⚠️/❌ item in the status table above, on your actual
+machine, and prints a clear PASS/FAIL/SKIP report:
+
+1. Environment (Python version, dependencies)
+2. Unit tests (re-confirms the 55 tests already proven in the build sandbox)
+3. **FastAPI HTTP layer** — starts a real `uvicorn` server, hits real endpoints, tears it down
+4. **RBAC over HTTP** — confirms 401 with no key, 200 with a valid key, 403 for a role that shouldn't be allowed to write
+5. **Postgres backend** — only if `TEST_DATABASE_URL` is set (SKIPs otherwise, doesn't fail)
+6. **Real LLM adjudication** — only if `ANTHROPIC_API_KEY` is set
+7. **Real semantic embeddings** — only if `sentence-transformers` is installed
+
+Sections 5–7 SKIP rather than FAIL by default, since they need optional
+setup you may not have done yet — pass `--all` once everything's
+provisioned (e.g. in CI) to make "not set up" a hard failure instead.
+
+Each server-starting section spins up an isolated SQLite file
+(`validate_test.db`, `validate_rbac_test.db`) and cleans it up
+afterward — your real `mdm.db` is never touched.
+
 ## Known gaps / honest limitations (cumulative)
 
 - Rejecting a match candidate doesn't immediately spin the still-unclustered record into its own entity in the same call.
