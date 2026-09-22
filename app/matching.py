@@ -1,23 +1,26 @@
 """
-Entity resolution engine for the Customer domain.
+Entity resolution engine -- domain-agnostic (Phase 2: Product domain).
 
 Design (matches Section 5.1 of the architecture doc):
   1. Blocking      — cheap candidate generation so we don't compare every
                       record to every other record (O(n^2) doesn't scale).
-  2. Deterministic  — exact match on a strong identifier (email or phone)
-                      is auto-high-confidence.
-  3. Fuzzy scoring  — weighted similarity across name/address fields using
-                      Jaro-Winkler string similarity.
+  2. Deterministic  — exact match on a strong identifier (whichever fields
+                      a domain marks `deterministic_fields`) is auto-high-confidence.
+  3. Fuzzy scoring  — weighted similarity across a domain's `fuzzy_weights`
+                      fields, plus a semantic-embedding signal over
+                      whichever fields the domain marks `semantic_fields`.
   4. Confidence bands — score routes to auto-merge / review queue / no-match.
 
-This module is pure stdlib on purpose (no rapidfuzz/numpy) so it can be
-unit-tested and demoed without any pip install. Swapping in rapidfuzz's
-`jaro_winkler_similarity` later is a one-line change if you want the C
-speedup at scale — see `similarity()` below.
+Nothing in this file mentions "first_name" or "sku" by name -- every
+domain-specific decision comes from the DomainConfig passed in (see
+app/domains.py). That's what let the Product domain plug in without
+touching this file.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .domains import DomainConfig
 
 # --- Confidence thresholds (tenant-configurable in a real deployment) ------
 AUTO_MERGE_THRESHOLD = 0.92
@@ -83,7 +86,8 @@ def _jaro(s1: str, s2: str) -> float:
 
 def jaro_winkler(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
     """Jaro-Winkler: Jaro similarity boosted for shared prefixes (common
-    for names/addresses where typos usually occur later in the string)."""
+    for names/addresses/product titles where typos usually occur later
+    in the string)."""
     jaro_sim = _jaro(s1, s2)
     prefix_len = 0
     for c1, c2 in zip(s1[:4], s2[:4]):
@@ -102,43 +106,32 @@ def similarity(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Blocking — generate a coarse key so only records that *could* match are
-# ever compared. In production this backs a DB index / vector ANN lookup;
-# here it's an in-memory dict keyed by blocking key.
+# Blocking — generate coarse keys from a domain's configured field groups so
+# only records that *could* match are ever compared. In production this
+# backs a DB index / vector ANN lookup; here it's an in-memory dict.
 # ---------------------------------------------------------------------------
-def blocking_keys(std: dict) -> set[str]:
+def blocking_keys(std: dict, config: DomainConfig) -> set[str]:
+    """Blocking is deliberately permissive -- a short prefix per field in
+    a multi-field group -- because the cost of over-blocking is just an
+    extra fuzzy-score comparison, while under-blocking silently drops a
+    genuine match before it's ever scored. 3 characters is short enough to
+    tolerate nicknames ('Jennifer' -> 'Jen') and still-close ZIP prefixes
+    ('73301' -> '73344' share a ZIP3), while still meaningfully narrowing
+    the candidate pool at scale."""
+    PREFIX_LEN = 3
     keys = set()
-    if std.get("last_name") and std.get("postal_code"):
-        keys.add(f"ln+zip:{std['last_name'][:4]}:{std['postal_code']}")
-    if std.get("phone"):
-        keys.add(f"phone:{std['phone']}")
-    if std.get("email"):
-        keys.add(f"email:{std['email']}")
-    if std.get("last_name") and std.get("first_name"):
-        keys.add(f"name:{std['last_name'][:3]}:{std['first_name'][:1]}")
+    for group_idx, group in enumerate(config.blocking_field_groups):
+        values = [std.get(f) for f in group]
+        if all(values):  # every field in the group must be present to form this key
+            key_body = ":".join(v[:PREFIX_LEN] if len(group) > 1 else v for v in values)
+            keys.add(f"g{group_idx}:{key_body}")
     return keys or {"__no_block__"}  # never silently drop unblockable records
 
-
-# ---------------------------------------------------------------------------
-# Field weights for the fuzzy scorer. Deterministic identifiers (email,
-# phone) are handled separately below and short-circuit to a high score.
-# ---------------------------------------------------------------------------
-_FUZZY_WEIGHTS = {
-    "first_name": 0.15,
-    "last_name": 0.20,
-    "address_line1": 0.20,
-    "city": 0.10,
-    "postal_code": 0.20,
-    "name_semantic": 0.15,  # embedding-based signal, see embeddings.py
-}
 
 _embedding_provider = None
 
 
 def _get_embedding_provider():
-    """Lazily instantiated singleton so we don't pay setup cost (or, for
-    the sentence-transformers backend, model load time) unless matching
-    actually runs."""
     global _embedding_provider
     if _embedding_provider is None:
         from .embeddings import get_provider
@@ -146,53 +139,49 @@ def _get_embedding_provider():
     return _embedding_provider
 
 
-def score_pair(std_a: dict, std_b: dict) -> ScoreBreakdown:
-    """Scores two *standardized* customer attribute dicts. Returns a
-    confidence score in [0, 1] plus human-readable reasons (for steward
-    explainability — never a black-box number alone)."""
+def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown:
+    """Scores two *standardized* attribute dicts for the given domain.
+    Returns a confidence score in [0, 1] plus human-readable reasons (for
+    steward explainability — never a black-box number alone)."""
     reasons: list[str] = []
 
     # --- 1. Deterministic checks first ---
-    if std_a.get("email") and std_a["email"] == std_b.get("email"):
-        reasons.append(f"exact email match ({std_a['email']})")
-        return ScoreBreakdown(0.99, "deterministic", reasons)
+    for det_field in config.deterministic_fields:
+        val_a = std_a.get(det_field)
+        if val_a and val_a == std_b.get(det_field):
+            reasons.append(f"exact {det_field} match ({val_a})")
+            return ScoreBreakdown(0.97, "deterministic", reasons)
 
-    if std_a.get("phone") and std_a["phone"] == std_b.get("phone"):
-        reasons.append(f"exact phone match ({std_a['phone']})")
-        return ScoreBreakdown(0.96, "deterministic", reasons)
-
-    # --- 2. Fuzzy weighted score across remaining fields ---
+    # --- 2. Fuzzy weighted score across configured fields ---
     total_weight = 0.0
     weighted_sum = 0.0
-    for field, weight in _FUZZY_WEIGHTS.items():
-        if field == "name_semantic":
-            name_a = f"{std_a.get('first_name', '')} {std_a.get('last_name', '')}".strip()
-            name_b = f"{std_b.get('first_name', '')} {std_b.get('last_name', '')}".strip()
-            if not name_a or not name_b:
-                continue
-            sim = _get_embedding_provider().similarity(name_a, name_b)
-            weighted_sum += sim * weight
-            total_weight += weight
-            if sim >= 0.6:
-                reasons.append(f"name semantically similar ({name_a!r} ~ {name_b!r}, {sim:.2f})")
-            continue
 
-        val_a, val_b = std_a.get(field, ""), std_b.get(field, "")
+    for f, weight in config.fuzzy_weights.items():
+        val_a, val_b = std_a.get(f, ""), std_b.get(f, "")
         if not val_a or not val_b:
-            continue  # no signal from this field either way
+            continue
         sim = similarity(val_a, val_b)
         weighted_sum += sim * weight
         total_weight += weight
         if sim >= 0.85:
-            reasons.append(f"{field} similar ({val_a!r} ~ {val_b!r}, {sim:.2f})")
+            reasons.append(f"{f} similar ({val_a!r} ~ {val_b!r}, {sim:.2f})")
+
+    # --- 3. Semantic embedding signal over the domain's configured fields ---
+    if config.semantic_fields:
+        text_a = " ".join(std_a.get(f, "") for f in config.semantic_fields).strip()
+        text_b = " ".join(std_b.get(f, "") for f in config.semantic_fields).strip()
+        if text_a and text_b:
+            sim = _get_embedding_provider().similarity(text_a, text_b)
+            weighted_sum += sim * config.semantic_weight
+            total_weight += config.semantic_weight
+            if sim >= 0.6:
+                reasons.append(f"semantically similar ({text_a!r} ~ {text_b!r}, {sim:.2f})")
 
     if total_weight == 0:
         return ScoreBreakdown(0.0, "fuzzy", ["insufficient overlapping fields"])
 
-    # Normalize by the weight actually available, but penalize sparse
-    # comparisons slightly so two records that only share one weak field
-    # don't score as confidently as ones with full field coverage.
-    coverage_penalty = total_weight / sum(_FUZZY_WEIGHTS.values())
+    ideal_weight_total = sum(config.fuzzy_weights.values()) + config.semantic_weight
+    coverage_penalty = total_weight / ideal_weight_total
     score = (weighted_sum / total_weight) * (0.5 + 0.5 * coverage_penalty)
 
     return ScoreBreakdown(round(score, 4), "fuzzy", reasons)
@@ -206,13 +195,13 @@ def classify(score: float) -> str:
     return "no_match"
 
 
-def find_candidate_pairs(records: list[tuple[str, dict]]) -> list[tuple[str, str]]:
+def find_candidate_pairs(records: list[tuple[str, dict]], config: DomainConfig) -> list[tuple[str, str]]:
     """records: list of (record_id, standardized_attrs).
     Returns deduplicated candidate (id_a, id_b) pairs sharing a blocking key —
     this is the step that keeps matching sub-quadratic at scale."""
     blocks: dict[str, list[str]] = {}
     for rec_id, std in records:
-        for key in blocking_keys(std):
+        for key in blocking_keys(std, config):
             blocks.setdefault(key, []).append(rec_id)
 
     seen: set[tuple[str, str]] = set()

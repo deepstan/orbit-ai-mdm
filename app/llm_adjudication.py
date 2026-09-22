@@ -62,24 +62,32 @@ def in_adjudication_band(score: float) -> bool:
     return lo <= score <= hi
 
 
-def _build_prompt(record_a: dict, record_b: dict, fuzzy_reasons: list[str]) -> str:
-    return f"""You are adjudicating whether two customer records from a master
-data management system refer to the same real person.
+_DOMAIN_FRAMING = {
+    "customer": "refer to the same real person",
+    "product": "refer to the same real-world product (e.g. the same item sold under "
+               "slightly different catalog data by different source systems)",
+}
+
+
+def _build_prompt(record_a: dict, record_b: dict, fuzzy_reasons: list[str], domain: str) -> str:
+    framing = _DOMAIN_FRAMING.get(domain, f"refer to the same '{domain}' entity")
+    return f"""You are adjudicating whether two {domain} records from a master
+data management system {framing}.
 
 Record A: {json.dumps(record_a, indent=2)}
 Record B: {json.dumps(record_b, indent=2)}
 
 Automated fuzzy matching found: {"; ".join(fuzzy_reasons) if fuzzy_reasons else "no strong signals"}
 
-Consider plausible real-world explanations (nicknames, maiden names, typos,
-someone moving address, a shared household) as well as reasons they might
-be different people (common name, coincidental address proximity).
+Consider plausible real-world explanations for why these might be the same
+{domain} entity recorded slightly differently by two systems, as well as
+reasons they might genuinely be different {domain} entities.
 
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {{"is_match": true or false, "confidence": a number 0.0-1.0, "explanation": "one sentence why"}}"""
 
 
-def adjudicate(record_a: dict, record_b: dict, fuzzy_reasons: list[str]) -> Optional[AdjudicationResult]:
+def adjudicate(record_a: dict, record_b: dict, fuzzy_reasons: list[str], domain: str = "customer") -> Optional[AdjudicationResult]:
     """Calls the Anthropic API to adjudicate an ambiguous match. Returns
     None on any failure (missing key, network error, malformed response)
     so the caller can safely fall back to the human review queue — this
@@ -91,7 +99,7 @@ def adjudicate(record_a: dict, record_b: dict, fuzzy_reasons: list[str]) -> Opti
     payload = {
         "model": MODEL,
         "max_tokens": 300,
-        "messages": [{"role": "user", "content": _build_prompt(record_a, record_b, fuzzy_reasons)}],
+        "messages": [{"role": "user", "content": _build_prompt(record_a, record_b, fuzzy_reasons, domain)}],
     }
 
     req = urllib.request.Request(

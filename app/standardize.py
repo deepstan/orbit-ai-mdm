@@ -99,3 +99,84 @@ def standardize_customer(raw: dict) -> dict:
         "postal_code": normalize_postal_code(raw.get("postal_code")),
         "country": clean_text(raw.get("country")).upper() or "US",
     }
+
+
+def normalize_sku(value: str | None) -> str:
+    """SKUs/UPCs are typically case- and whitespace/dash-insensitive
+    identifiers -- normalize aggressively since these are meant to be
+    exact-match keys, not fuzzy-compared."""
+    if not value:
+        return ""
+    return re.sub(r"[\s\-_]", "", clean_text(value)).upper()
+
+
+def normalize_product_name(value: str | None) -> str:
+    value = clean_text(value).lower()
+    # Common catalog abbreviations that shouldn't count as a real difference
+    replacements = {
+        r"\boz\b": "ounce",
+        r"\bpk\b": "pack",
+        r"\bct\b": "count",
+        r"\bin\b": "inch",
+    }
+    for pattern, repl in replacements.items():
+        value = re.sub(pattern, repl, value)
+    return _WS_RE.sub(" ", value).strip()
+
+
+def standardize_product(raw: dict) -> dict:
+    """Canonical, normalized product attribute dict used for matching.
+    Missing fields become empty strings, never raise -- same contract as
+    standardize_customer()."""
+    return {
+        "sku": normalize_sku(raw.get("sku")),
+        "upc": normalize_sku(raw.get("upc")),  # same normalization rules apply
+        "product_name": normalize_product_name(raw.get("product_name")),
+        "brand": normalize_name(raw.get("brand")),
+        "category": normalize_name(raw.get("category")),
+        "description": clean_text(raw.get("description")).lower(),
+        "price": clean_text(str(raw.get("price"))) if raw.get("price") is not None else "",
+    }
+
+
+def normalize_tax_id(value: str | None) -> str:
+    """Tax IDs / EINs / VAT numbers: strip formatting, keep alphanumerics
+    only, uppercase -- these are exact-match identifiers, like SKUs."""
+    if not value:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
+def standardize_vendor(raw: dict) -> dict:
+    """Canonical, normalized vendor/supplier attribute dict used for
+    matching. Missing fields become empty strings, never raise."""
+    return {
+        "company_name": normalize_name(raw.get("company_name")),
+        "tax_id": normalize_tax_id(raw.get("tax_id")),
+        "duns_number": normalize_sku(raw.get("duns_number")),  # same "strip separators" logic applies
+        "contact_email": normalize_email(raw.get("contact_email")),
+        "contact_phone": normalize_phone(raw.get("contact_phone")),
+        "address_line1": normalize_address_line(raw.get("address_line1")),
+        "city": normalize_name(raw.get("city")),
+        "state": clean_text(raw.get("state")).upper(),
+        "postal_code": normalize_postal_code(raw.get("postal_code")),
+        "country": clean_text(raw.get("country")).upper() or "US",
+    }
+
+
+STANDARDIZERS = {
+    "customer": standardize_customer,
+    "product": standardize_product,
+    "vendor": standardize_vendor,
+}
+
+
+def standardize(domain: str, raw: dict) -> dict:
+    """Dispatches to the right standardizer for a domain. Raises KeyError
+    with a clear message for an unregistered domain rather than silently
+    returning something wrong."""
+    try:
+        return STANDARDIZERS[domain](raw)
+    except KeyError:
+        raise KeyError(f"No standardizer registered for domain '{domain}'. "
+                        f"Known domains: {list(STANDARDIZERS)}") from None
