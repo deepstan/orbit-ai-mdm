@@ -33,6 +33,24 @@ GENESIS_HASH = "0" * 64  # the "previous hash" for a tenant's very first audit e
 
 def _compute_hash(prev_hash: str, tenant_id: str, domain: str | None, action: str,
                    actor: str, details: dict, created_at: str) -> str:
+    """Compute the SHA-256 hash of one audit entry, chained to the previous one.
+
+    All fields, including ``prev_hash``, are serialized as JSON with sorted
+    keys (so the result doesn't depend on dict order) and hashed. Changing
+    any field of any earlier entry changes this hash and every later one.
+
+    Args:
+        prev_hash: Hash of the tenant's previous entry, or ``GENESIS_HASH``.
+        tenant_id: Tenant ID.
+        domain: Domain, or ``None`` for tenant-wide actions.
+        action: Action name, e.g. ``"ingest"``.
+        actor: Who performed it.
+        details: Extra data. Must be JSON-serializable.
+        created_at: ISO timestamp.
+
+    Returns:
+        str: 64-character hex digest.
+    """
     payload = json.dumps(
         {"prev_hash": prev_hash, "tenant_id": tenant_id, "domain": domain, "action": action,
          "actor": actor, "details": details, "created_at": created_at},
@@ -47,7 +65,24 @@ def log_action(store: Store, tenant_id: str, action: str, actor: str,
     security/compliance-relevant action: ingest, review-queue resolution,
     API key lifecycle, retrain, purge. Not for routine reads -- this is
     an audit trail of changes and access-control-relevant events, not a
-    full request log."""
+    full request log.
+
+    Note: reading the last entry and writing the new one are two separate
+    steps. Two writes for the same tenant at the same moment can both chain
+    to the same previous entry, and ``verify_chain`` will then report a
+    break.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant whose chain to extend.
+        action: What happened, e.g. ``"ingest"``, ``"api_key_created"``.
+        actor: Who did it (API key label/ID, or ``"system"``).
+        details: Optional JSON-serializable extra data. Defaults to ``{}``.
+        domain: Optional domain the action relates to.
+
+    Returns:
+        AuditLogEntry: The stored entry, including its hashes.
+    """
     details = details or {}
     prev = store.get_last_audit_entry(tenant_id)
     prev_hash = prev.entry_hash if prev else GENESIS_HASH
@@ -66,7 +101,20 @@ def verify_chain(store: Store, tenant_id: str) -> tuple[bool, str | None]:
     """Recomputes every entry's hash from its content and checks it both
     (a) matches the stored hash and (b) correctly chains to the previous
     entry. Returns (True, None) if the whole chain is intact, or
-    (False, entry_id) naming the first entry where it breaks."""
+    (False, entry_id) naming the first entry where it breaks.
+
+    Entries are checked in ``created_at`` order. Two entries with the exact
+    same timestamp could come back in a different order than they were
+    written, which would show up as a (false) break.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant whose chain to check.
+
+    Returns:
+        tuple[bool, str | None]: ``(True, None)`` if intact, or
+        ``(False, entry_id)`` for the first broken entry.
+    """
     entries = store.list_audit_log(tenant_id, limit=10**9)  # full history for verification
     prev_hash = GENESIS_HASH
     for entry in entries:

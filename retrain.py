@@ -18,6 +18,22 @@ from app.store_factory import get_store
 
 
 def main():
+    """Command-line entry point: retrain the match model for one tenant and domain.
+
+    Options: ``--tenant`` (default ``"default"``), ``--domain`` (default
+    ``"customer"``) and ``--db`` (SQLite path or Postgres URL; defaults to
+    ``DATABASE_URL`` or ``mdm.db``).
+
+    Prints how many confirmed and rejected decisions are available. With
+    fewer than ``MIN_TRAINING_EXAMPLES`` (10) it stops without changing any
+    saved model. Otherwise it trains, saves the model under ``models/`` in
+    the current directory, and prints each learned feature weight and the
+    bias. The new model is used automatically by later ingests for that
+    tenant and domain.
+
+    Note: the training set is built twice (once for the counts here, once
+    inside ``retrain``).
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant", default="default", help="Tenant ID to retrain (default: 'default')")
     parser.add_argument("--domain", default="customer", choices=list(REGISTRY),

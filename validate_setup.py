@@ -42,12 +42,39 @@ PORT = 8931  # unlikely to collide with anything else running locally
 
 
 def report(section: str, status: str, detail: str = "") -> None:
+    """Record one check's result and print it straight away.
+
+    Results are also kept in the global ``RESULTS`` list so ``main`` can
+    print the summary at the end.
+
+    Args:
+        section: Name of the check, e.g. ``"GET /v1/domains"``.
+        status: ``"PASS"``, ``"FAIL"`` or ``"SKIP"``. Any other value raises
+            ``KeyError``.
+        detail: Optional extra text shown after the name.
+    """
     RESULTS.append((section, status, detail))
     icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️ "}[status]
     print(f"  {icon} {section}{': ' + detail if detail else ''}")
 
 
 def http_get(url: str, headers: dict | None = None) -> tuple[int, dict | str]:
+    """Send a GET request and return the status code and body.
+
+    HTTP error responses (4xx/5xx) are returned normally instead of raised,
+    so callers can check for expected errors such as 401 or 404. The body
+    is parsed as JSON when possible.
+
+    Args:
+        url: Full URL to request.
+        headers: Optional extra request headers.
+
+    Returns:
+        tuple[int, dict | str]: Status code and parsed JSON (or raw text).
+
+    Raises:
+        urllib.error.URLError: If the server can't be reached at all.
+    """
     req = urllib.request.Request(url, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -65,6 +92,21 @@ def http_get(url: str, headers: dict | None = None) -> tuple[int, dict | str]:
 
 
 def http_post(url: str, payload: dict, headers: dict | None = None) -> tuple[int, dict | str]:
+    """Send a JSON POST request and return the status code and body.
+
+    Same behaviour as ``http_get``, with ``payload`` sent as a JSON body.
+    One difference: a successful (2xx) response that isn't valid JSON
+    raises ``JSONDecodeError`` instead of returning the raw text.
+
+    Args:
+        url: Full URL to request.
+        payload: Dict to send as the JSON body.
+        headers: Optional extra headers (``Content-Type`` is set for you).
+
+    Returns:
+        tuple[int, dict | str]: Status code and parsed JSON (or raw text
+        for error responses).
+    """
     data = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json", **(headers or {})}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
@@ -83,7 +125,25 @@ def http_post(url: str, payload: dict, headers: dict | None = None) -> tuple[int
 def running_server(env_overrides: dict | None = None, db_path: str = "validate_test.db"):
     """Starts `uvicorn app.api:app` as a subprocess with the given env
     overrides, waits until it responds, yields, then kills it. Isolated
-    to its own SQLite file so it never touches your real mdm.db."""
+    to its own SQLite file so it never touches your real mdm.db.
+
+    Waits up to about 10 seconds for ``GET /v1/domains`` to return 200.
+    Always stops the server afterwards (terminate, then kill after 5
+    seconds) and deletes the test database file.
+
+    Args:
+        env_overrides: Extra environment variables for the server, e.g.
+            ``{"MDM_ENABLE_AUTH": "true"}``.
+        db_path: SQLite file the server should use. Defaults to
+            ``"validate_test.db"``; deleted at the end.
+
+    Yields:
+        str: Base URL of the running server, ``http://127.0.0.1:8931``.
+
+    Raises:
+        RuntimeError: If the server doesn't come up in time; includes the
+            last part of its output.
+    """
     env = os.environ.copy()
     env["DATABASE_URL"] = db_path  # plain path -> SQLite backend, isolated from real data
     env.update(env_overrides or {})
@@ -119,6 +179,11 @@ def running_server(env_overrides: dict | None = None, db_path: str = "validate_t
 
 # ---------------------------------------------------------------------------
 def section_environment():
+    """Section 1: check the Python version and required packages.
+
+    Reports PASS/FAIL for Python 3.10 or newer, and for whether
+    ``fastapi``, ``uvicorn`` and ``pydantic`` can be imported.
+    """
     print("\n1. Environment")
     if sys.version_info >= (3, 10):
         report("Python version", "PASS", f"{sys.version.split()[0]}")
@@ -134,6 +199,12 @@ def section_environment():
 
 
 def section_unit_tests():
+    """Section 2: run the whole unit test suite in a separate process.
+
+    Runs ``python -m unittest discover -s tests``. On success the "Ran N
+    tests" line is shown; on failure the last 2000 characters of output are
+    printed.
+    """
     print("\n2. Unit tests (core logic, already proven in the build sandbox)")
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
@@ -150,6 +221,18 @@ def section_unit_tests():
 
 
 def section_fastapi_http(require: bool):
+    """Section 3: start a real API server and call its main endpoints.
+
+    Uses dev mode (no auth) and a throwaway SQLite file. Checks: 3 domains
+    are listed; a customer record can be ingested and gets an entity; that
+    entity is listed; the product schema contains ``sku``; an unknown domain
+    returns 404. The first failed check stops the section and is reported
+    as FAIL.
+
+    Args:
+        require: If ``True``, missing FastAPI/uvicorn counts as FAIL instead
+            of SKIP.
+    """
     print("\n3. FastAPI HTTP layer (never run in the build sandbox -- this is the real test)")
     try:
         import fastapi, uvicorn  # noqa
@@ -186,6 +269,21 @@ def section_fastapi_http(require: bool):
 
 
 def section_rbac_http(require: bool):
+    """Section 4: check API-key authentication and role permissions over HTTP.
+
+    Creates a tenant_admin key and a read-only api_consumer key directly in
+    a throwaway database, then starts the server with auth on and checks:
+    no key gives 401; the admin key gives 200; the read-only key is denied
+    ingest with 403; and the audit log is reachable with a valid chain.
+
+    Note: with the current ``app/api.py``, the 403 check is expected to
+    fail, because ``AuthError`` from ``check_permission`` isn't turned into
+    a 403 response (the server returns 500).
+
+    Args:
+        require: If ``True``, missing FastAPI/uvicorn counts as FAIL instead
+            of SKIP.
+    """
     print("\n4. RBAC over HTTP (auth enforcement, never run in the build sandbox)")
     try:
         import fastapi, uvicorn  # noqa
@@ -239,6 +337,15 @@ def section_rbac_http(require: bool):
 
 
 def section_postgres(require: bool):
+    """Section 5: run the Postgres backend tests against a real database.
+
+    Only runs when ``TEST_DATABASE_URL`` is set (``DATABASE_URL`` alone is
+    not enough). Runs ``tests.test_postgres_backend`` in a separate process.
+
+    Args:
+        require: If ``True``, a missing ``TEST_DATABASE_URL`` counts as FAIL
+            instead of SKIP.
+    """
     print("\n5. Postgres backend (optional -- needs a real Postgres instance)")
     test_db_url = os.environ.get("TEST_DATABASE_URL")
     if not test_db_url:
@@ -257,6 +364,16 @@ def section_postgres(require: bool):
 
 
 def section_llm_adjudication(require: bool):
+    """Section 6: make one real call to the Anthropic API.
+
+    Only runs when ``ANTHROPIC_API_KEY`` is set. Sends the Jennifer / Jen
+    Nguyen example pair to ``adjudicate`` and passes if any verdict comes
+    back (it doesn't check whether the verdict is right). This makes a real,
+    billed API request.
+
+    Args:
+        require: If ``True``, a missing API key counts as FAIL instead of SKIP.
+    """
     print("\n6. Real LLM adjudication call (optional -- needs ANTHROPIC_API_KEY)")
     if not os.environ.get("ANTHROPIC_API_KEY"):
         report("LLM adjudication", "FAIL" if require else "SKIP", "set ANTHROPIC_API_KEY to run this")
@@ -279,6 +396,17 @@ def section_llm_adjudication(require: bool):
 
 
 def section_real_embeddings(require: bool):
+    """Section 7: check real semantic embeddings with sentence-transformers.
+
+    Only runs if ``sentence_transformers`` is installed. Temporarily sets
+    ``EMBEDDING_PROVIDER=sentence_transformers``, compares "Nike Air Max 90"
+    with "Air Max 90 by Nike" and prints the score (the model is downloaded
+    on first run). Passes if no error occurs; the score isn't checked
+    against a threshold.
+
+    Args:
+        require: If ``True``, a missing package counts as FAIL instead of SKIP.
+    """
     print("\n7. Real semantic embeddings (optional -- needs sentence-transformers)")
     try:
         import sentence_transformers  # noqa
@@ -298,6 +426,14 @@ def section_real_embeddings(require: bool):
 
 
 def main():
+    """Command-line entry point: run all seven sections and print a summary.
+
+    Every section runs even if an earlier one fails. ``--all`` turns SKIPs
+    for missing optional setup (Postgres, API key, sentence-transformers,
+    FastAPI) into FAILs, which is useful in CI.
+
+    Exits with code 1 if any check failed, otherwise 0.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--all", action="store_true",
                          help="Treat unavailable optional sections (Postgres/LLM/embeddings) as FAIL, not SKIP")

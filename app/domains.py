@@ -157,6 +157,22 @@ REGISTRY: dict[str, DomainConfig] = {
 
 
 def get_domain_config(domain: str) -> DomainConfig:
+    """Look up the configuration for a domain by name.
+
+    The config bundles everything domain-specific: schema fields,
+    standardizer, deterministic identity fields, fuzzy weights, semantic
+    fields, blocking groups and survivorship strategies.
+
+    Args:
+        domain: Domain name: ``"customer"``, ``"product"`` or ``"vendor"``.
+
+    Returns:
+        DomainConfig: The registered configuration for that domain.
+
+    Raises:
+        KeyError: If the domain isn't in ``REGISTRY``. The message lists the
+            known domains.
+    """
     try:
         return REGISTRY[domain]
     except KeyError:

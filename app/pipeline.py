@@ -19,7 +19,54 @@ def ingest_record(store: Store, tenant_id: str, domain: str, source_system: str,
                    source_record_id: str, attributes: dict) -> dict:
     """Ingests one raw record, runs it against this (tenant, domain)'s
     existing records for matches, and either auto-merges, queues for
-    steward review, or leaves it standalone."""
+    steward review, or leaves it standalone.
+
+    Steps:
+
+    1. Save the raw record.
+    2. Standardize it and every existing record in the same tenant and
+       domain, and find candidate pairs through blocking. Only pairs that
+       include the new record are scored.
+    3. Score each pair with ``score_pair``. If a learned model exists for
+       this tenant and domain, blend it in (``active_learning.blend_scores``)
+       and add a reason when the score changes by more than 0.01.
+    4. Route by score (``classify``):
+       ``no_match`` is skipped; ``auto_merge`` is confirmed and merged right
+       away; ``review`` goes to the steward queue.
+    5. For ``review`` pairs in the LLM band, when LLM adjudication is
+       enabled: a verdict with confidence >= 0.85 turns the pair into an
+       auto-merge (match) or an automatic rejection (no match). Lower
+       confidence, or a failed call, leaves it in review.
+    6. If nothing was merged or queued, the record gets its own new golden
+       record.
+
+    Note: a record that is only queued for review is NOT attached to any
+    golden record until a steward resolves the candidate (see
+    ``resolve_candidate``).
+
+    Performance note: every existing record in scope is loaded and
+    re-standardized on every ingest, so ingest time grows with the size of
+    the dataset.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant the record belongs to.
+        domain: Domain of the record (``"customer"``, ``"product"``...).
+        source_system: Name of the system the record came from (e.g.
+            ``"salesforce"``).
+        source_record_id: The record's ID in that source system.
+        attributes: The raw attribute payload.
+
+    Returns:
+        dict: ``record_id`` (new internal ID), ``auto_merged_with`` (list of
+        ``{record_id, score}``), ``queued_for_review`` (list of
+        ``{candidate_id, record_id, score, reasons}``) and
+        ``matched_entity_id`` (golden record ID, or ``None`` if the record
+        is only waiting in review).
+
+    Raises:
+        KeyError: If the domain is unknown.
+    """
     config = get_domain_config(domain)  # raises KeyError early for an unknown domain
     rec = SourceRecord(source_system=source_system, source_record_id=source_record_id,
                         attributes=attributes, tenant_id=tenant_id, domain=domain)
@@ -108,11 +155,49 @@ def ingest_record(store: Store, tenant_id: str, domain: str, source_system: str,
 
 
 def _entity_for_record(store: Store, record_id: str, tenant_id: str, domain: str) -> str | None:
+    """Return the golden record ID a source record is linked to.
+
+    Args:
+        store: Storage backend.
+        record_id: The source record's ID.
+        tenant_id: Tenant that owns it.
+        domain: Domain of the record.
+
+    Returns:
+        str | None: The entity ID, or ``None`` if the record doesn't exist or
+        isn't linked to any entity yet.
+    """
     rec = store.get_source_record(record_id, tenant_id, domain)
     return rec.entity_id if rec else None
 
 
 def merge_two_records(store: Store, tenant_id: str, domain: str, record_id_a: str, record_id_b: str, reason: str) -> str:
+    """Put two source records into the same golden record and rebuild it.
+
+    Cases:
+
+    - Both records already belong to DIFFERENT entities: entity A survives.
+      All of entity B's records are moved to A and B is marked
+      ``"merged"`` (kept, not deleted; its attributes are left as they
+      were).
+    - Only one record has an entity: the other record joins it.
+    - Neither has one: a new active entity is created for both.
+    - Both already in the same entity: nothing moves; it is just rebuilt.
+
+    Afterwards the target entity's golden attributes are recomputed with
+    survivorship and every changed field is written to lineage.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant that owns both records.
+        domain: Domain of both records.
+        record_id_a: First source record. Its entity wins when both have one.
+        record_id_b: Second source record.
+        reason: Text stored in the lineage events explaining the merge.
+
+    Returns:
+        str: ID of the entity both records now belong to.
+    """
     entity_a = _entity_for_record(store, record_id_a, tenant_id, domain)
     entity_b = _entity_for_record(store, record_id_b, tenant_id, domain)
 
@@ -143,6 +228,25 @@ def merge_two_records(store: Store, tenant_id: str, domain: str, record_id_a: st
 
 def rebuild_golden_record(store: Store, tenant_id: str, domain: str, entity_id: str,
                            reason: str = "recomputed after ingestion/merge") -> Entity:
+    """Recompute an entity's golden attributes from its source records.
+
+    Loads every source record linked to the entity, runs survivorship with
+    the domain's field strategies, and saves the result. For each field
+    whose value changed, a lineage event is written with the old value, new
+    value, winning source record and the reason.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant that owns the entity.
+        domain: Domain of the entity.
+        entity_id: The entity to rebuild. It must exist (otherwise this
+            fails with ``AttributeError``).
+        reason: Extra context appended to each lineage reason. Defaults to
+            ``"recomputed after ingestion/merge"``.
+
+    Returns:
+        Entity: The updated entity.
+    """
     config = get_domain_config(domain)
     records = store.list_source_records(tenant_id, domain, entity_id=entity_id)
     entity = store.get_entity(entity_id, tenant_id, domain)
@@ -169,6 +273,30 @@ def rebuild_golden_record(store: Store, tenant_id: str, domain: str, entity_id: 
 
 def resolve_candidate(store: Store, tenant_id: str, domain: str, candidate_id: str,
                        decision: str, decided_by: str) -> dict:
+    """Apply a data steward's decision on a pending match candidate.
+
+    The candidate's status is updated with who decided and when. If
+    confirmed, the two records are merged (see ``merge_two_records``). If
+    rejected, nothing else changes.
+
+    Args:
+        store: Storage backend.
+        tenant_id: Tenant that owns the candidate.
+        domain: Domain of the candidate.
+        candidate_id: The candidate to resolve.
+        decision: ``"confirm"`` or ``"reject"``.
+        decided_by: Who made the decision (stored on the candidate and in
+            lineage).
+
+    Returns:
+        dict: ``candidate_id``, ``status`` (``"confirmed"`` or
+        ``"rejected"``) and ``entity_id`` (the merged entity, or ``None``
+        when rejected).
+
+    Raises:
+        ValueError: If the candidate doesn't exist, isn't ``"pending"``, or
+            ``decision`` isn't ``"confirm"``/``"reject"``.
+    """
     candidate = store.get_candidate(candidate_id, tenant_id, domain)
     if not candidate:
         raise ValueError(f"No such candidate: {candidate_id}")

@@ -41,6 +41,19 @@ class FieldDecision:
 
 
 def _non_empty_candidates(records: list[SourceRecord], field: str):
+    """Yield ``(record, value)`` for every record with a value for ``field``.
+
+    Records are visited newest first (by ``ingested_at``). ``None`` and
+    ``""`` count as missing and are skipped; other falsy values such as
+    ``0`` or ``False`` are kept.
+
+    Args:
+        records: Source records in the cluster.
+        field: Attribute name to look up.
+
+    Yields:
+        tuple[SourceRecord, Any]: Each record that has a value, and that value.
+    """
     for rec in sorted(records, key=lambda r: r.ingested_at, reverse=True):
         val = rec.attributes.get(field)
         if val not in (None, ""):
@@ -49,6 +62,33 @@ def _non_empty_candidates(records: list[SourceRecord], field: str):
 
 def _resolve_field(field: str, records: list[SourceRecord], field_strategies: dict[str, FieldStrategy],
                     default_strategy: FieldStrategy) -> FieldDecision:
+    """Pick the winning value for one field of a golden record.
+
+    Looks up the strategy for ``field`` (or uses ``default_strategy``),
+    collects the non-empty values newest first, then:
+
+    - no values at all: returns value ``None``.
+    - ``most_recent``: takes the newest value.
+    - ``most_complete``: currently ALSO takes the newest value. Candidates
+      are already sorted newest first, so in practice this behaves exactly
+      like ``most_recent``; only the recorded reason text differs.
+    - ``source_priority`` (only when ``SOURCE_PRIORITY`` is not empty):
+      takes the value from the highest-priority source that has one; if
+      none of the priority sources has a value, falls back to the newest.
+    - anything else (including ``source_priority`` with an empty
+      ``SOURCE_PRIORITY`` list): falls back to the newest value, with
+      strategy recorded as ``"most_recent (fallback)"``.
+
+    Args:
+        field: The attribute being decided.
+        records: Source records in the cluster.
+        field_strategies: Per-field strategy overrides.
+        default_strategy: Strategy for fields not in ``field_strategies``.
+
+    Returns:
+        FieldDecision: The chosen value, the winning record's ID, the
+        strategy used and a readable reason (stored as lineage).
+    """
     strategy = field_strategies.get(field, default_strategy)
     candidates = list(_non_empty_candidates(records, field))  # already newest-first
 
@@ -98,7 +138,20 @@ def build_golden_attributes(
 
     schema_fields / field_strategies normally come straight from a
     DomainConfig (app/domains.py) -- see pipeline.py for how they're threaded
-    through."""
+    through.
+
+    Args:
+        records: All source records believed to be the same real-world entity.
+        schema_fields: The canonical fields to decide (one decision each).
+        field_strategies: Optional per-field strategy map. Fields not listed
+            use ``default_strategy``.
+        default_strategy: Strategy used when a field has no override.
+            Defaults to ``"most_recent"``.
+
+    Returns:
+        dict[str, FieldDecision]: One decision per schema field. Fields no
+        source provided get value ``None``.
+    """
     field_strategies = field_strategies or {}
     return {
         f: _resolve_field(f, records, field_strategies, default_strategy)

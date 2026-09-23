@@ -39,6 +39,12 @@ SKIP_REASON = (
 @unittest.skipUnless(PSYCOPG2_AVAILABLE and TEST_DB_URL, SKIP_REASON)
 class TestPostgresBackend(unittest.TestCase):
     def setUp(self):
+        """Connect to the test Postgres database and pick a unique tenant ID.
+
+        The tenant ID includes the process ID so test data never collides with
+        other runs or real data. Test rows are NOT deleted afterwards, so they
+        build up in the test database over time.
+        """
         from app.db_postgres import PostgresStore
         self.store = PostgresStore(TEST_DB_URL)
         # Clean slate: this tenant_id is unique to this test run so it
@@ -46,6 +52,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.tenant = f"pgtest_{os.getpid()}"
 
     def test_ingest_and_retrieve_round_trips_correctly(self):
+        """An ingested record produces a golden record that can be read back with the right email."""
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "customer", "crm", "PG-1", {
             "first_name": "Ada", "last_name": "Lovelace", "email": "ada@example.com",
@@ -55,6 +62,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(entity.attributes["email"], "ada@example.com")
 
     def test_auto_merge_works_identically_to_sqlite(self):
+        """Two records with the same email auto-merge into one entity on Postgres."""
         from app.pipeline import ingest_record
         r1 = ingest_record(self.store, self.tenant, "customer", "crm", "PG-2", {
             "first_name": "Grace", "last_name": "Hopper", "email": "grace@navy.mil",
@@ -65,6 +73,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(r1["matched_entity_id"], r2["matched_entity_id"])
 
     def test_tenant_and_domain_isolation_holds_on_postgres_too(self):
+        """The same record in two tenants produces two separate entities on Postgres."""
         from app.pipeline import ingest_record
         payload = {"first_name": "Alan", "last_name": "Turing", "email": "alan@example.com"}
         r_a = ingest_record(self.store, self.tenant, "customer", "crm", "PG-4", payload)
@@ -72,6 +81,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertNotEqual(r_a["matched_entity_id"], r_b["matched_entity_id"])
 
     def test_lineage_is_recorded(self):
+        """Ingesting a product writes at least one lineage event on Postgres."""
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "product", "erp", "PG-5", {
             "sku": "PGTEST-1", "product_name": "Test Widget",
@@ -80,6 +90,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertGreater(len(lineage), 0)
 
     def test_api_keys_round_trip(self):
+        """An API key saved on Postgres can be found again by its hash."""
         from app.auth import generate_api_key
         from app.models import ApiKeyRecord
         plaintext, key_hash = generate_api_key()
@@ -89,6 +100,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(fetched.label, "pg test key")
 
     def test_audit_chain_verifies_on_postgres(self):
+        """Two audit entries on Postgres form a valid chain."""
         from app.audit import log_action, verify_chain
         log_action(self.store, self.tenant, "ingest", "key:test", {"x": 1})
         log_action(self.store, self.tenant, "ingest", "key:test", {"x": 2})
@@ -96,6 +108,7 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_purge_works_on_postgres(self):
+        """Purging an entity on Postgres removes it."""
         from app.compliance import purge_entity
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "customer", "crm", "PG-6", {

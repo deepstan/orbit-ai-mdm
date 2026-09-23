@@ -135,6 +135,21 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_tenant ON usage_events(tenant_id, cr
 
 class PostgresStore:
     def __init__(self, database_url: str):
+        """Set up the PostgreSQL store: check psycopg2 is installed, then create the schema.
+
+        Fails early with a clear message if ``psycopg2`` isn't installed, then
+        runs the ``CREATE ... IF NOT EXISTS`` script so the tables and indexes
+        exist. Safe to call on an existing database.
+
+        Note: this backend has not been run in the original development sandbox;
+        see the module docstring.
+
+        Args:
+            database_url: A ``postgresql://`` or ``postgres://`` connection URL.
+
+        Raises:
+            ImportError: If ``psycopg2`` is not installed.
+        """
         try:
             import psycopg2  # noqa: F401
         except ImportError as e:
@@ -148,6 +163,16 @@ class PostgresStore:
 
     @contextmanager
     def _conn(self):
+        """Context manager that yields a short-lived PostgreSQL connection.
+
+        Opens a new connection per call with ``RealDictCursor`` (rows read by
+        column name). Commits if the ``with`` block succeeds; rolls back and
+        re-raises if it fails; always closes the connection. This matches the
+        SQLite ``Store._conn`` behaviour.
+
+        Yields:
+            psycopg2 connection: The open connection.
+        """
         import psycopg2
         import psycopg2.extras
 
@@ -162,12 +187,27 @@ class PostgresStore:
             conn.close()
 
     def _init_schema(self):
+        """Create all tables and indexes if they don't already exist.
+
+        Runs the module-level ``SCHEMA`` script in one statement. Called once
+        from ``__init__``.
+        """
         with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
 
     # --- source records -----------------------------------------------
     def save_source_record(self, rec: SourceRecord) -> None:
+        """Insert one raw source record.
+
+        The ``attributes`` dict is stored as a JSON string. This is a plain
+        INSERT, so saving a record whose ``id`` already exists raises
+        ``psycopg2.errors.UniqueViolation``.
+
+        Args:
+            rec: The record to store. Its own ``tenant_id`` and ``domain`` decide
+                where it lives.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, "
@@ -177,6 +217,20 @@ class PostgresStore:
             )
 
     def get_source_record(self, rec_id: str, tenant_id: str, domain: str) -> SourceRecord | None:
+        """Fetch one source record by ID.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            rec_id: The record's ``id`` (e.g. ``"rec_..."``).
+            tenant_id: Tenant that must own the record.
+            domain: Domain the record must belong to.
+
+        Returns:
+            SourceRecord | None: The record, or ``None`` if it doesn't exist in
+            this tenant and domain.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM source_records WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -186,6 +240,20 @@ class PostgresStore:
             return self._row_to_source_record(row) if row else None
 
     def list_source_records(self, tenant_id: str, domain: str, entity_id: str | None = None) -> list[SourceRecord]:
+        """List source records for a tenant and domain.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            tenant_id: Tenant to list records for.
+            domain: Domain to list records for.
+            entity_id: If given, return only the records clustered into this
+                golden record. If ``None``, return every record in scope.
+
+        Returns:
+            list[SourceRecord]: Matching records, in no guaranteed order.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             if entity_id:
                 cur.execute(
@@ -199,6 +267,16 @@ class PostgresStore:
             return [self._row_to_source_record(r) for r in cur.fetchall()]
 
     def set_record_entity(self, record_id: str, tenant_id: str, domain: str, entity_id: str) -> None:
+        """Link a source record to the golden record (entity) it was clustered into.
+
+        Args:
+            record_id: The source record to update.
+            tenant_id: Tenant that owns the record.
+            domain: Domain of the record.
+            entity_id: The golden record's ``id``.
+
+        Does nothing if no record matches the ID, tenant and domain.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE source_records SET entity_id = %s WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -206,6 +284,17 @@ class PostgresStore:
             )
 
     def delete_source_record(self, record_id: str, tenant_id: str, domain: str) -> None:
+        """Hard-delete one source record.
+
+        Used only by the right-to-be-forgotten purge (``app/compliance.py``).
+        Normal operations never delete source records. The purge itself is
+        logged separately in the audit log.
+
+        Args:
+            record_id: The source record to delete.
+            tenant_id: Tenant that owns the record.
+            domain: Domain of the record.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM source_records WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -214,6 +303,16 @@ class PostgresStore:
 
     @staticmethod
     def _row_to_source_record(row) -> SourceRecord:
+        """Convert a ``source_records`` row into a ``SourceRecord`` object.
+
+        Decodes the JSON ``attributes`` column back into a dict.
+
+        Args:
+            row: A psycopg2 ``RealDictRow`` from the ``source_records`` table.
+
+        Returns:
+            SourceRecord: The rebuilt record.
+        """
         return SourceRecord(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"],
             source_system=row["source_system"], source_record_id=row["source_record_id"],
@@ -223,6 +322,17 @@ class PostgresStore:
 
     # --- entities --------------------------------------------------------
     def save_entity(self, ent: Entity) -> None:
+        """Insert or update a golden record (entity).
+
+        Uses ``INSERT ... ON CONFLICT (id) DO UPDATE``. On update only
+        ``status``, ``attributes`` and ``updated_at`` change; ``tenant_id``,
+        ``domain`` and ``created_at`` keep their original values. (The SQLite
+        version replaces the whole row instead.) ``source_record_ids`` is not
+        stored here; see ``set_record_entity``.
+
+        Args:
+            ent: The entity to save.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO entities (id, tenant_id, domain, status, attributes, created_at, updated_at)
@@ -235,6 +345,22 @@ class PostgresStore:
             )
 
     def get_entity(self, entity_id: str, tenant_id: str, domain: str) -> Entity | None:
+        """Fetch one golden record by ID, including its source record IDs.
+
+        ``source_record_ids`` is rebuilt by looking up every source record whose
+        ``entity_id`` points at this entity.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            entity_id: The entity's ``id`` (e.g. ``"ent_..."``).
+            tenant_id: Tenant that must own the entity.
+            domain: Domain the entity must belong to.
+
+        Returns:
+            Entity | None: The entity, or ``None`` if it isn't found in scope.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -251,6 +377,21 @@ class PostgresStore:
             )
 
     def list_entities(self, tenant_id: str, domain: str, status: str | None = None) -> list[Entity]:
+        """List golden records for a tenant and domain.
+
+        Each entity is loaded with ``get_entity``, which means one extra query
+        per entity (plus one for its source records). Fine for small datasets,
+        slow for large ones.
+
+        Args:
+            tenant_id: Tenant to list entities for.
+            domain: Domain to list entities for.
+            status: If given, only entities with this status (e.g. ``"active"``,
+                ``"merged"``). If ``None``, all statuses.
+
+        Returns:
+            list[Entity]: The matching entities.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             if status:
                 cur.execute(
@@ -263,6 +404,17 @@ class PostgresStore:
         return [self.get_entity(i, tenant_id, domain) for i in ids]
 
     def delete_entity(self, entity_id: str, tenant_id: str, domain: str) -> None:
+        """Hard-delete one golden record (entity).
+
+        Used only by the right-to-be-forgotten purge (``app/compliance.py``).
+        Source records that pointed at this entity are not changed here; the
+        purge deletes those separately.
+
+        Args:
+            entity_id: The entity to delete.
+            tenant_id: Tenant that owns the entity.
+            domain: Domain of the entity.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -271,6 +423,14 @@ class PostgresStore:
 
     # --- match candidates --------------------------------------------------
     def save_candidate(self, c: MatchCandidate) -> None:
+        """Insert a new match candidate (a proposed pair awaiting review).
+
+        ``reasons`` is stored as a JSON list. Plain INSERT, so a duplicate
+        ``id`` raises ``psycopg2.errors.UniqueViolation``.
+
+        Args:
+            c: The candidate to store.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO match_candidates (id, tenant_id, domain, record_a_id, record_b_id, score, "
@@ -282,6 +442,18 @@ class PostgresStore:
 
     def update_candidate_status(self, cand_id: str, tenant_id: str, domain: str,
                                  status: str, decided_by: str, decided_at: str) -> None:
+        """Record a decision on a match candidate.
+
+        Args:
+            cand_id: The candidate's ``id``.
+            tenant_id: Tenant that owns the candidate.
+            domain: Domain of the candidate.
+            status: New status, normally ``"confirmed"`` or ``"rejected"``.
+            decided_by: Who decided (e.g. an API key label, or ``"system"``).
+            decided_at: ISO timestamp of the decision.
+
+        Does nothing if no candidate matches the ID, tenant and domain.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE match_candidates SET status = %s, decided_by = %s, decided_at = %s "
@@ -290,6 +462,20 @@ class PostgresStore:
             )
 
     def list_candidates(self, tenant_id: str, domain: str, status: str | None = "pending") -> list[MatchCandidate]:
+        """List match candidates, highest score first.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            tenant_id: Tenant to list candidates for.
+            domain: Domain to list candidates for.
+            status: Only candidates with this status. Defaults to ``"pending"``
+                (the review queue). Pass ``None`` to get every status.
+
+        Returns:
+            list[MatchCandidate]: Candidates sorted by ``score`` descending.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             if status:
                 cur.execute(
@@ -315,6 +501,19 @@ class PostgresStore:
         ]
 
     def get_candidate(self, cand_id: str, tenant_id: str, domain: str) -> MatchCandidate | None:
+        """Fetch one match candidate by ID.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            cand_id: The candidate's ``id`` (e.g. ``"cand_..."``).
+            tenant_id: Tenant that must own it.
+            domain: Domain it must belong to.
+
+        Returns:
+            MatchCandidate | None: The candidate, or ``None`` if not found in scope.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM match_candidates WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -333,6 +532,14 @@ class PostgresStore:
 
     # --- lineage -----------------------------------------------------------
     def add_lineage(self, ev: LineageEvent) -> None:
+        """Append one lineage event (a record of a field changing on an entity).
+
+        Lineage is append-only: events are never updated or deleted in normal
+        operation, so an entity's full history can be replayed.
+
+        Args:
+            ev: The lineage event to store.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO lineage (id, tenant_id, domain, entity_id, field, old_value, new_value, "
@@ -342,6 +549,19 @@ class PostgresStore:
             )
 
     def list_lineage(self, entity_id: str, tenant_id: str, domain: str) -> list[LineageEvent]:
+        """Return the change history of one entity, oldest first.
+
+        Every query is filtered by both ``tenant_id`` and ``domain``, so data
+        from another tenant or another domain is never returned or changed.
+
+        Args:
+            entity_id: The entity whose history to fetch.
+            tenant_id: Tenant that owns the entity.
+            domain: Domain of the entity.
+
+        Returns:
+            list[LineageEvent]: Events ordered by ``changed_at`` ascending.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM lineage WHERE entity_id = %s AND tenant_id = %s AND domain = %s ORDER BY changed_at",
@@ -359,6 +579,15 @@ class PostgresStore:
 
     # --- API keys (RBAC / auth) --------------------------------------------
     def save_api_key(self, key: ApiKeyRecord) -> None:
+        """Store a new API key record (hash only, never the plaintext key).
+
+        ``allowed_domains`` is stored as a JSON list, or NULL meaning "all
+        domains". ``key_hash`` is UNIQUE, so saving the same hash twice raises
+        ``psycopg2.errors.UniqueViolation``.
+
+        Args:
+            key: The key record to store.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO api_keys (id, tenant_id, role, key_hash, label, allowed_domains, "
@@ -369,18 +598,50 @@ class PostgresStore:
             )
 
     def get_api_key_by_hash(self, key_hash: str) -> ApiKeyRecord | None:
+        """Look up an API key by its hash.
+
+        Used on every authenticated request (see ``app/auth.py``). This lookup is
+        deliberately NOT tenant-scoped: the key itself is what tells us which
+        tenant the caller belongs to. Revoked keys are returned too; the caller
+        must check ``revoked_at``.
+
+        Args:
+            key_hash: SHA-256 hex digest of the presented key.
+
+        Returns:
+            ApiKeyRecord | None: The key record, or ``None`` if unknown.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM api_keys WHERE key_hash = %s", (key_hash,))
             row = cur.fetchone()
             return self._row_to_api_key(row) if row else None
 
     def list_api_keys(self, tenant_id: str) -> list[ApiKeyRecord]:
+        """List all API keys for a tenant, including revoked ones.
+
+        Args:
+            tenant_id: Tenant whose keys to list.
+
+        Returns:
+            list[ApiKeyRecord]: The tenant's key records (hashes only).
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM api_keys WHERE tenant_id = %s", (tenant_id,))
             rows = cur.fetchall()
         return [self._row_to_api_key(r) for r in rows]
 
     def revoke_api_key(self, key_id: str, tenant_id: str, revoked_at: str) -> None:
+        """Mark an API key as revoked.
+
+        The row is kept (for audit purposes); setting ``revoked_at`` is what
+        makes authentication reject it.
+
+        Args:
+            key_id: The key's ``id`` (e.g. ``"key_..."``).
+            tenant_id: Tenant that must own the key, so one tenant can't revoke
+                another tenant's key.
+            revoked_at: ISO timestamp of the revocation.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE api_keys SET revoked_at = %s WHERE id = %s AND tenant_id = %s",
@@ -389,6 +650,17 @@ class PostgresStore:
 
     @staticmethod
     def _row_to_api_key(row) -> ApiKeyRecord:
+        """Convert an ``api_keys`` row into an ``ApiKeyRecord`` object.
+
+        Decodes ``allowed_domains`` from JSON; NULL (or empty) becomes ``None``,
+        meaning "all domains".
+
+        Args:
+            row: A psycopg2 ``RealDictRow`` from the ``api_keys`` table.
+
+        Returns:
+            ApiKeyRecord: The rebuilt key record.
+        """
         return ApiKeyRecord(
             id=row["id"], tenant_id=row["tenant_id"], role=row["role"], key_hash=row["key_hash"],
             label=row["label"],
@@ -398,6 +670,14 @@ class PostgresStore:
 
     # --- Audit log -----------------------------------------------------------
     def append_audit_entry(self, entry: AuditLogEntry) -> None:
+        """Append one entry to the tenant's hash-chained audit log.
+
+        The entry's hashes must already be computed (see ``app/audit.py``). This
+        method only inserts; audit entries are never updated or deleted.
+
+        Args:
+            entry: The audit entry to store.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO audit_log (id, tenant_id, domain, action, actor, details, prev_hash, "
@@ -407,6 +687,20 @@ class PostgresStore:
             )
 
     def get_last_audit_entry(self, tenant_id: str) -> AuditLogEntry | None:
+        """Return the tenant's most recent audit entry.
+
+        Needed to chain the next entry's ``prev_hash``. Returns ``None`` when the
+        tenant has no audit history yet (the start of the chain).
+
+        Unlike the SQLite version, there is no tie-breaker when two entries have
+        the same ``created_at``, so the "last" entry is ambiguous in that case.
+
+        Args:
+            tenant_id: Tenant whose latest entry to fetch.
+
+        Returns:
+            AuditLogEntry | None: The newest entry, or ``None`` for a new tenant.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM audit_log WHERE tenant_id = %s ORDER BY created_at DESC LIMIT 1",
@@ -416,6 +710,18 @@ class PostgresStore:
             return self._row_to_audit_entry(row) if row else None
 
     def list_audit_log(self, tenant_id: str, domain: str | None = None, limit: int = 200) -> list[AuditLogEntry]:
+        """List a tenant's audit entries, oldest first.
+
+        Args:
+            tenant_id: Tenant whose log to read.
+            domain: If given, only entries for this domain. If ``None``, all
+                entries for the tenant.
+            limit: Maximum number of entries to return. Defaults to 200. Because
+                the order is oldest first, the limit keeps the OLDEST entries.
+
+        Returns:
+            list[AuditLogEntry]: Entries ordered by ``created_at`` ascending.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             if domain:
                 cur.execute(
@@ -433,6 +739,14 @@ class PostgresStore:
 
     @staticmethod
     def _row_to_audit_entry(row) -> AuditLogEntry:
+        """Convert an ``audit_log`` row into an ``AuditLogEntry`` object.
+
+        Args:
+            row: A psycopg2 ``RealDictRow`` from the ``audit_log`` table.
+
+        Returns:
+            AuditLogEntry: The rebuilt entry, with ``details`` decoded from JSON.
+        """
         return AuditLogEntry(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"], action=row["action"],
             actor=row["actor"], details=json.loads(row["details"]),
@@ -441,6 +755,11 @@ class PostgresStore:
 
     # --- Usage events (billing metering) -----------------------------------
     def record_usage_event(self, ev: UsageEvent) -> None:
+        """Insert one billing usage event.
+
+        Args:
+            ev: The usage event to store. ``metadata`` is stored as JSON.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO usage_events (id, tenant_id, domain, event_type, quantity, metadata, "
@@ -450,6 +769,17 @@ class PostgresStore:
             )
 
     def list_usage_events(self, tenant_id: str, since: str | None = None) -> list[UsageEvent]:
+        """List a tenant's usage events, oldest first.
+
+        Args:
+            tenant_id: Tenant whose usage to read.
+            since: Optional ISO timestamp; only events created at or after it are
+                returned. Compared as strings, which works because all timestamps
+                come from ``now_iso()`` in the same format.
+
+        Returns:
+            list[UsageEvent]: Events ordered by ``created_at`` ascending.
+        """
         with self._conn() as conn, conn.cursor() as cur:
             if since:
                 cur.execute(

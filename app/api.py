@@ -59,6 +59,12 @@ if STATIC_DIR.exists():
 
 @app.get("/")
 def root():
+    """``GET /`` -- serve the stewardship web UI.
+
+    Returns:
+        FileResponse | dict: ``static/index.html`` if it exists, otherwise a
+        small JSON message pointing to the interactive API docs at ``/docs``.
+    """
     index = STATIC_DIR / "index.html"
     if index.exists():
         return FileResponse(str(index))
@@ -66,6 +72,15 @@ def root():
 
 
 def _validate_domain(domain: str) -> None:
+    """Make sure a domain from the URL is registered.
+
+    Args:
+        domain: Domain name taken from the URL path.
+
+    Raises:
+        HTTPException: 404 if the domain isn't in ``REGISTRY``; the message
+            lists the known domains.
+    """
     if domain not in REGISTRY:
         raise HTTPException(404, f"Unknown domain '{domain}'. Known domains: {list(REGISTRY)}")
 
@@ -74,6 +89,14 @@ def _validate_domain(domain: str) -> None:
 # Auth dependency
 # ---------------------------------------------------------------------------
 def auth_enabled() -> bool:
+    """Check whether API-key authentication is switched on.
+
+    Read from the ``MDM_ENABLE_AUTH`` environment variable on every request;
+    ``"1"``, ``"true"`` or ``"yes"`` (any case) turn it on.
+
+    Returns:
+        bool: ``True`` if requests must carry an API key.
+    """
     return os.environ.get("MDM_ENABLE_AUTH", "").lower() in ("1", "true", "yes")
 
 
@@ -81,6 +104,29 @@ def get_principal(
     authorization: Optional[str] = Header(default=None),
     x_tenant_id: str = Header(default=DEFAULT_TENANT, alias="X-Tenant-Id"),
 ) -> Principal:
+    """FastAPI dependency: work out who is calling.
+
+    Dev mode (auth off): no key needed. The caller becomes a
+    ``tenant_admin`` of the tenant named in the ``X-Tenant-Id`` header
+    (default ``"default"``), with access to all domains. The header is
+    fully trusted, so never run dev mode where untrusted clients can reach
+    the API.
+
+    Auth mode: expects ``Authorization: Bearer <api_key>``. The key is
+    hashed and looked up; tenant, role and allowed domains come from the
+    stored key, never from request headers.
+
+    Args:
+        authorization: The ``Authorization`` header, if any.
+        x_tenant_id: The ``X-Tenant-Id`` header (used in dev mode only).
+
+    Returns:
+        Principal: The resolved caller identity.
+
+    Raises:
+        HTTPException: 401 if the header is missing or malformed, or the key
+            is unknown or revoked.
+    """
     if not auth_enabled():
         # Dev mode: full access, tenant from the (client-supplied, so not
         # security-meaningful in this mode -- see module docstring) header.
@@ -101,8 +147,32 @@ def require(action: str, domain: Optional[str] = None):
     """FastAPI dependency factory: require(action) checks the resolved
     Principal can perform `action`, raising 403 if not. Use as:
         principal: Principal = Depends(require("ingest"))
+
+    Note: no route in this module uses it yet; the routes call
+    ``check_permission`` directly instead.
+
+    Args:
+        action: Action name from ``auth.PERMISSIONS``.
+        domain: Optional fixed domain to check. (Routes whose domain comes
+            from the URL can't use this, since the value is fixed when the
+            dependency is created.)
+
+    Returns:
+        Callable: A dependency that returns the ``Principal`` if allowed.
     """
     def _check(principal: Principal = Depends(get_principal)) -> Principal:
+        """The dependency returned by ``require``: resolve the caller and check it.
+
+        Args:
+            principal: Injected by FastAPI from ``get_principal``.
+
+        Returns:
+            Principal: The caller, if permitted.
+
+        Raises:
+            HTTPException: 403 if the role or domain scope doesn't allow the
+                action.
+        """
         try:
             check_permission(principal, action, domain=domain)
         except AuthError as e:
@@ -136,11 +206,31 @@ class CreateApiKeyRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/v1/domains", tags=["meta"])
 def list_domains():
+    """``GET /v1/domains`` -- list every supported domain and its fields.
+
+    Public: no authentication or permission check.
+
+    Returns:
+        list[dict]: ``[{"domain": name, "fields": [...]}, ...]``.
+    """
     return [{"domain": name, "fields": cfg.schema_fields} for name, cfg in REGISTRY.items()]
 
 
 @app.get("/v1/{domain}/schema", tags=["meta"])
 def schema(domain: str):
+    """``GET /v1/{domain}/schema`` -- canonical field names for one domain.
+
+    Public: no authentication or permission check.
+
+    Args:
+        domain: Domain name from the URL.
+
+    Returns:
+        dict: ``{"domain": domain, "fields": [...]}``.
+
+    Raises:
+        HTTPException: 404 for an unknown domain.
+    """
     _validate_domain(domain)
     return {"domain": domain, "fields": get_domain_config(domain).schema_fields}
 
@@ -150,6 +240,33 @@ def schema(domain: str):
 # ---------------------------------------------------------------------------
 @app.post("/v1/{domain}/records", tags=["ingestion"])
 def ingest(domain: str, req: IngestRequest, principal: Principal = Depends(get_principal)):
+    """``POST /v1/{domain}/records`` -- ingest one source record.
+
+    Needs the ``ingest`` permission for this domain. Runs the full matching
+    pipeline (``pipeline.ingest_record``), then records one
+    ``record_ingested`` usage event for billing and writes an ``ingest``
+    entry to the audit log.
+
+    The ``try/except Exception: raise`` around the pipeline call has no
+    effect; errors propagate as usual (HTTP 500).
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        req: Body with ``source_system``, ``source_record_id`` and
+            ``attributes``.
+        principal: The caller (injected).
+
+    Returns:
+        dict: The ``ingest_record`` result (record ID, auto-merges, review
+        queue entries, matched entity ID).
+
+    Raises:
+        HTTPException: 404 for an unknown domain; 401 without valid auth.
+    """
     _validate_domain(domain)
     check_permission(principal, "ingest", domain=domain)  # raises AuthError -> handled below via except
 
@@ -173,6 +290,24 @@ def ingest(domain: str, req: IngestRequest, principal: Principal = Depends(get_p
 # ---------------------------------------------------------------------------
 @app.get("/v1/{domain}/entities", tags=["entities"])
 def list_entities(domain: str, status: Optional[str] = None, principal: Principal = Depends(get_principal)):
+    """``GET /v1/{domain}/entities`` -- list the caller's golden records.
+
+    Needs the ``view`` permission for this domain. Only the caller's own
+    tenant is returned. There is no paging, so this returns every entity.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        status: Optional status filter (query string), e.g. ``active``.
+        principal: The caller (injected).
+
+    Returns:
+        list[dict]: ``entity_id``, ``status``, ``attributes``,
+        ``source_record_ids`` and ``updated_at`` per entity.
+    """
     _validate_domain(domain)
     check_permission(principal, "view", domain=domain)
     return [
@@ -184,6 +319,27 @@ def list_entities(domain: str, status: Optional[str] = None, principal: Principa
 
 @app.get("/v1/{domain}/entities/{entity_id}", tags=["entities"])
 def get_entity(domain: str, entity_id: str, principal: Principal = Depends(get_principal)):
+    """``GET /v1/{domain}/entities/{entity_id}`` -- one golden record plus its sources.
+
+    Needs the ``view`` permission for this domain.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        entity_id: The entity to fetch.
+        principal: The caller (injected).
+
+    Returns:
+        dict: The entity's ``entity_id``, ``status``, ``attributes``,
+        ``updated_at`` and full ``source_records`` (ID, source system,
+        source ID, raw attributes, ingest time).
+
+    Raises:
+        HTTPException: 404 if the domain or entity isn't found for this tenant.
+    """
     _validate_domain(domain)
     check_permission(principal, "view", domain=domain)
     e = store.get_entity(entity_id, principal.tenant_id, domain)
@@ -200,6 +356,26 @@ def get_entity(domain: str, entity_id: str, principal: Principal = Depends(get_p
 
 @app.get("/v1/{domain}/entities/{entity_id}/lineage", tags=["entities"])
 def get_lineage(domain: str, entity_id: str, principal: Principal = Depends(get_principal)):
+    """``GET /v1/{domain}/entities/{entity_id}/lineage`` -- field change history.
+
+    Needs the ``view`` permission for this domain.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        entity_id: The entity whose history to fetch.
+        principal: The caller (injected).
+
+    Returns:
+        list[dict]: Oldest-first events with ``field``, ``old_value``,
+        ``new_value``, ``source_record_id``, ``reason`` and ``changed_at``.
+
+    Raises:
+        HTTPException: 404 if the domain or entity isn't found.
+    """
     _validate_domain(domain)
     check_permission(principal, "view", domain=domain)
     if not store.get_entity(entity_id, principal.tenant_id, domain):
@@ -214,7 +390,29 @@ def get_lineage(domain: str, entity_id: str, principal: Principal = Depends(get_
 @app.delete("/v1/{domain}/entities/{entity_id}", tags=["compliance"])
 def delete_entity(domain: str, entity_id: str, principal: Principal = Depends(get_principal)):
     """Right-to-be-forgotten: permanently purges a golden record and all
-    its source records. tenant_admin only. See app/compliance.py."""
+    its source records. tenant_admin only. See app/compliance.py.
+
+    ``DELETE /v1/{domain}/entities/{entity_id}``. Needs the ``purge``
+    permission for this domain. The purge is recorded in the audit log by
+    ``purge_entity``. Lineage history is not removed (see
+    ``compliance.purge_entity``).
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        entity_id: The golden record to erase.
+        principal: The caller (injected); recorded as the requester.
+
+    Returns:
+        dict: ``entity_id``, ``source_records_deleted`` and
+        ``match_candidates_affected``.
+
+    Raises:
+        HTTPException: 404 if the domain or entity isn't found.
+    """
     _validate_domain(domain)
     check_permission(principal, "purge", domain=domain)
     try:
@@ -232,6 +430,25 @@ def delete_entity(domain: str, entity_id: str, principal: Principal = Depends(ge
 # ---------------------------------------------------------------------------
 @app.get("/v1/{domain}/review-queue", tags=["stewardship"])
 def review_queue(domain: str, principal: Principal = Depends(get_principal)):
+    """``GET /v1/{domain}/review-queue`` -- pending match candidates for stewards.
+
+    Needs the ``view`` permission (read-only keys can see the queue but not
+    resolve it). Sorted by score, highest first. Each candidate includes
+    both source records; a record that no longer exists (e.g. purged) is
+    returned as ``null``. Makes two extra queries per candidate.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        principal: The caller (injected).
+
+    Returns:
+        list[dict]: ``candidate_id``, ``score``, ``match_type``,
+        ``reasons``, ``record_a``, ``record_b`` and ``created_at``.
+    """
     _validate_domain(domain)
     check_permission(principal, "view", domain=domain)
     candidates = store.list_candidates(principal.tenant_id, domain, status="pending")
@@ -251,6 +468,35 @@ def review_queue(domain: str, principal: Principal = Depends(get_principal)):
 @app.post("/v1/{domain}/review-queue/{candidate_id}/resolve", tags=["stewardship"])
 def resolve(domain: str, candidate_id: str, req: ResolveCandidateRequest,
             principal: Principal = Depends(get_principal)):
+    """``POST /v1/{domain}/review-queue/{candidate_id}/resolve`` -- confirm or reject a match.
+
+    Needs the ``resolve_review_queue`` permission for this domain. On
+    confirm, the two records are merged into one golden record. The
+    decision is written to the audit log.
+
+    Note: ``decided_by`` comes from the request body and is stored as
+    given; it is not checked against the caller's identity. The audit
+    entry's ``actor`` is the real caller.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Domain name from the URL.
+        candidate_id: The candidate to resolve.
+        req: Body with ``decision`` (``"confirm"``/``"reject"``) and
+            ``decided_by``.
+        principal: The caller (injected).
+
+    Returns:
+        dict: ``candidate_id``, ``status`` and ``entity_id`` (``None`` when
+        rejected).
+
+    Raises:
+        HTTPException: 400 if the candidate doesn't exist or is already
+            resolved; 422 if ``decision`` is invalid.
+    """
     _validate_domain(domain)
     check_permission(principal, "resolve_review_queue", domain=domain)
     try:
@@ -268,6 +514,31 @@ def resolve(domain: str, candidate_id: str, req: ResolveCandidateRequest,
 # ---------------------------------------------------------------------------
 @app.post("/v1/admin/api-keys", tags=["admin"])
 def create_api_key(req: CreateApiKeyRequest, principal: Principal = Depends(get_principal)):
+    """``POST /v1/admin/api-keys`` -- create a new API key for the caller's tenant.
+
+    Needs the ``manage_api_keys`` permission (tenant_admin). The plaintext
+    key is returned in this response only; just its hash is stored. The
+    creation is written to the audit log.
+
+    ``allowed_domains`` is stored as given and not checked against the
+    known domains, so a typo creates a key that can't access anything.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        req: Body with ``role``, ``label`` and optional ``allowed_domains``
+            (``null`` = all domains).
+        principal: The caller (injected).
+
+    Returns:
+        dict: ``api_key`` (plaintext, shown once), ``key_id``, ``role``,
+        ``label`` and a warning to store the key securely.
+
+    Raises:
+        HTTPException: 400 for an unknown role.
+    """
     check_permission(principal, "manage_api_keys")
     if req.role not in ("tenant_admin", "domain_admin", "data_steward", "api_consumer"):
         raise HTTPException(400, f"Unknown role '{req.role}'")
@@ -287,6 +558,21 @@ def create_api_key(req: CreateApiKeyRequest, principal: Principal = Depends(get_
 
 @app.get("/v1/admin/api-keys", tags=["admin"])
 def list_api_keys(principal: Principal = Depends(get_principal)):
+    """``GET /v1/admin/api-keys`` -- list the tenant's API keys (never the keys themselves).
+
+    Needs the ``manage_api_keys`` permission. Revoked keys are included.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        principal: The caller (injected).
+
+    Returns:
+        list[dict]: ``key_id``, ``role``, ``label``, ``allowed_domains``,
+        ``created_at`` and ``revoked_at`` per key.
+    """
     check_permission(principal, "manage_api_keys")
     return [
         {"key_id": k.id, "role": k.role, "label": k.label, "allowed_domains": k.allowed_domains,
@@ -297,6 +583,26 @@ def list_api_keys(principal: Principal = Depends(get_principal)):
 
 @app.delete("/v1/admin/api-keys/{key_id}", tags=["admin"])
 def revoke_api_key(key_id: str, principal: Principal = Depends(get_principal)):
+    """``DELETE /v1/admin/api-keys/{key_id}`` -- revoke an API key.
+
+    Needs the ``manage_api_keys`` permission. Only keys in the caller's own
+    tenant are affected. The key stops working on its next use. Written to
+    the audit log.
+
+    Note: the response says ``revoked: true`` even if no key with that ID
+    exists in the tenant.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        key_id: The key to revoke.
+        principal: The caller (injected).
+
+    Returns:
+        dict: ``{"key_id": key_id, "revoked": True}``.
+    """
     check_permission(principal, "manage_api_keys")
     from .models import now_iso
     store.revoke_api_key(key_id, principal.tenant_id, now_iso())
@@ -310,6 +616,25 @@ def revoke_api_key(key_id: str, principal: Principal = Depends(get_principal)):
 # ---------------------------------------------------------------------------
 @app.get("/v1/admin/audit-log", tags=["admin"])
 def get_audit_log(domain: Optional[str] = None, principal: Principal = Depends(get_principal)):
+    """``GET /v1/admin/audit-log`` -- read the audit log and check it hasn't been tampered with.
+
+    Needs the ``view_audit_log`` permission. Returns the oldest 200 entries
+    (the ``list_audit_log`` default), optionally for one domain, and
+    re-verifies the tenant's whole hash chain on every call, so this gets
+    slower as the log grows.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        domain: Optional domain filter (query string).
+        principal: The caller (injected).
+
+    Returns:
+        dict: ``chain_valid`` (bool), ``broke_at_entry_id`` (first bad entry
+        or ``None``) and ``entries``.
+    """
     check_permission(principal, "view_audit_log")
     entries = store.list_audit_log(principal.tenant_id, domain=domain)
     chain_ok, broke_at = audit.verify_chain(store, principal.tenant_id)
@@ -325,6 +650,24 @@ def get_audit_log(domain: Optional[str] = None, principal: Principal = Depends(g
 
 @app.get("/v1/admin/usage", tags=["admin"])
 def get_usage(since: Optional[str] = None, principal: Principal = Depends(get_principal)):
+    """``GET /v1/admin/usage`` -- usage counts and estimated cost for the caller's tenant.
+
+    Needs the ``view_usage`` permission (tenant_admin). Currently only
+    ``record_ingested`` events are recorded anywhere in the code (by
+    ``ingest``), so the other priced event types always show zero.
+
+    Permission failures: ``check_permission`` raises ``AuthError``, and this
+    module does not register an exception handler for it, so a denied
+    request currently returns HTTP 500 instead of 403.
+
+    Args:
+        since: Optional ISO timestamp (query string); only usage from then on.
+        principal: The caller (injected).
+
+    Returns:
+        dict: ``tenant_id``, ``since``, ``counts_by_event_type`` and
+        ``estimated_cost_usd``.
+    """
     check_permission(principal, "view_usage")
     summary = billing.get_usage_summary(store, principal.tenant_id, since=since)
     return {"tenant_id": summary.tenant_id, "since": summary.since,

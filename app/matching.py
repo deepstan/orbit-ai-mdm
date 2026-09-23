@@ -38,6 +38,20 @@ class ScoreBreakdown:
 # Jaro-Winkler similarity (pure Python implementation, 0.0-1.0)
 # ---------------------------------------------------------------------------
 def _jaro(s1: str, s2: str) -> float:
+    """Jaro string similarity between two strings, from 0.0 to 1.0.
+
+    Counts characters that appear in both strings within a sliding window
+    (half the longer length, minus one) and how many of those are out of
+    order (transpositions). 1.0 means identical; 0.0 means nothing in common
+    or one string is empty. Used by ``jaro_winkler``.
+
+    Args:
+        s1: First string.
+        s2: Second string.
+
+    Returns:
+        float: Similarity in ``[0.0, 1.0]``.
+    """
     if s1 == s2:
         return 1.0
     len1, len2 = len(s1), len(s2)
@@ -87,7 +101,25 @@ def _jaro(s1: str, s2: str) -> float:
 def jaro_winkler(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
     """Jaro-Winkler: Jaro similarity boosted for shared prefixes (common
     for names/addresses/product titles where typos usually occur later
-    in the string)."""
+    in the string).
+
+    The boost is ``prefix_len * prefix_weight * (1 - jaro)``, where
+    ``prefix_len`` is the length of the shared prefix, capped at 4
+    characters.
+
+    Args:
+        s1: First string.
+        s2: Second string.
+        prefix_weight: How much each shared prefix character adds. Defaults
+            to 0.1, the standard value; keep it at or below 0.25 so the
+            result stays within 1.0.
+
+    Returns:
+        float: Similarity in ``[0.0, 1.0]``.
+
+    Example:
+        ``jaro_winkler("martha", "marhta")`` -> about ``0.961``
+    """
     jaro_sim = _jaro(s1, s2)
     prefix_len = 0
     for c1, c2 in zip(s1[:4], s2[:4]):
@@ -99,7 +131,16 @@ def jaro_winkler(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
 
 def similarity(a: str, b: str) -> float:
     """Similarity used throughout the matcher. Empty-vs-empty is treated as
-    'no signal' (0.0), not a false match."""
+    'no signal' (0.0), not a false match.
+
+    Args:
+        a: First (standardized) value.
+        b: Second (standardized) value.
+
+    Returns:
+        float: Jaro-Winkler similarity in ``[0.0, 1.0]``, or ``0.0`` if
+        either value is empty.
+    """
     if not a or not b:
         return 0.0
     return jaro_winkler(a, b)
@@ -117,7 +158,30 @@ def blocking_keys(std: dict, config: DomainConfig) -> set[str]:
     genuine match before it's ever scored. 3 characters is short enough to
     tolerate nicknames ('Jennifer' -> 'Jen') and still-close ZIP prefixes
     ('73301' -> '73344' share a ZIP3), while still meaningfully narrowing
-    the candidate pool at scale."""
+    the candidate pool at scale.
+
+    How keys are built: for each field group in
+    ``config.blocking_field_groups`` where EVERY field has a value, one key
+    is made. Single-field groups use the full value (e.g. the whole email);
+    multi-field groups join a 3-character prefix of each value. Keys are
+    prefixed with the group number (``"g0:"``, ``"g1:"``...) so values from
+    different groups never collide.
+
+    If no group can be built, the record gets the special key
+    ``"__no_block__"``. All such records land in one shared block and are
+    compared with each other, so they are never silently dropped.
+
+    Args:
+        std: Standardized attributes of one record.
+        config: The domain's configuration.
+
+    Returns:
+        set[str]: One or more blocking keys.
+
+    Example:
+        Customer with last_name ``"smith"`` and postal_code ``"94107"`` gets
+        ``"g0:smi:941"`` among its keys.
+    """
     PREFIX_LEN = 3
     keys = set()
     for group_idx, group in enumerate(config.blocking_field_groups):
@@ -132,6 +196,15 @@ _embedding_provider = None
 
 
 def _get_embedding_provider():
+    """Return the shared embedding provider, creating it on first use.
+
+    The provider is cached in a module-level variable, so it's built only
+    once per process. ``embeddings`` is imported lazily here so importing
+    ``matching`` stays cheap.
+
+    Returns:
+        The provider returned by ``embeddings.get_provider()``.
+    """
     global _embedding_provider
     if _embedding_provider is None:
         from .embeddings import get_provider
@@ -142,7 +215,35 @@ def _get_embedding_provider():
 def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown:
     """Scores two *standardized* attribute dicts for the given domain.
     Returns a confidence score in [0, 1] plus human-readable reasons (for
-    steward explainability — never a black-box number alone)."""
+    steward explainability — never a black-box number alone).
+
+    Scoring steps:
+
+    1. Deterministic: for each field in ``config.deterministic_fields``,
+       if both records have the same non-empty value, return immediately
+       with score 0.97 and match_type ``"deterministic"``.
+    2. Fuzzy: for each field in ``config.fuzzy_weights`` where BOTH sides
+       have a value, add ``similarity * weight``. Fields with similarity
+       0.85 or higher are listed in the reasons.
+    3. Semantic: if the domain has ``semantic_fields``, join those fields
+       into one text per record and add the embedding similarity times
+       ``config.semantic_weight``. Listed in reasons if 0.6 or higher.
+    4. Final score = weighted average of the fields compared, multiplied by
+       ``0.5 + 0.5 * coverage``, where coverage is the share of the total
+       possible weight that could actually be compared. Records that share
+       few filled-in fields are pulled down, by at most half.
+
+    Args:
+        std_a: Standardized attributes of the first record.
+        std_b: Standardized attributes of the second record.
+        config: The domain's configuration (fields and weights).
+
+    Returns:
+        ScoreBreakdown: ``score`` (0-1, rounded to 4 places), ``match_type``
+        (``"deterministic"`` or ``"fuzzy"``) and ``reasons``. If no field
+        could be compared, the score is 0.0 with reason
+        ``"insufficient overlapping fields"``.
+    """
     reasons: list[str] = []
 
     # --- 1. Deterministic checks first ---
@@ -188,6 +289,16 @@ def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown
 
 
 def classify(score: float) -> str:
+    """Turn a match score into a routing decision.
+
+    Args:
+        score: Match score from ``score_pair`` (0-1).
+
+    Returns:
+        str: ``"auto_merge"`` if score >= ``AUTO_MERGE_THRESHOLD`` (0.92),
+        ``"review"`` if score >= ``REVIEW_THRESHOLD`` (0.55), otherwise
+        ``"no_match"``.
+    """
     if score >= AUTO_MERGE_THRESHOLD:
         return "auto_merge"
     if score >= REVIEW_THRESHOLD:
@@ -198,7 +309,25 @@ def classify(score: float) -> str:
 def find_candidate_pairs(records: list[tuple[str, dict]], config: DomainConfig) -> list[tuple[str, str]]:
     """records: list of (record_id, standardized_attrs).
     Returns deduplicated candidate (id_a, id_b) pairs sharing a blocking key —
-    this is the step that keeps matching sub-quadratic at scale."""
+    this is the step that keeps matching sub-quadratic at scale.
+
+    Every record is put into a bucket for each of its blocking keys; within
+    each bucket, every pair of records is produced. A pair that shares
+    several keys is only returned once. Each pair is sorted by ID, so
+    ``(a, b)`` and ``(b, a)`` count as the same pair.
+
+    Args:
+        records: List of ``(record_id, standardized_attrs)`` tuples.
+        config: The domain's configuration (used for blocking keys).
+
+    Returns:
+        list[tuple[str, str]]: Unique ``(id_a, id_b)`` pairs with
+        ``id_a < id_b``, in first-seen order.
+
+    Note:
+        A very common blocking key (a big bucket) still produces every pair
+        inside it, so the worst case is still quadratic within that bucket.
+    """
     blocks: dict[str, list[str]] = {}
     for rec_id, std in records:
         for key in blocking_keys(std, config):

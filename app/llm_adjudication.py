@@ -51,6 +51,16 @@ class AdjudicationResult:
 
 
 def is_enabled() -> bool:
+    """Check whether LLM adjudication is switched on.
+
+    Both conditions must hold: ``ENABLE_LLM_ADJUDICATION`` is ``"1"``,
+    ``"true"`` or ``"yes"`` (any case), AND ``ANTHROPIC_API_KEY`` is set to a
+    non-empty value. Read from the environment on every call, so changes
+    take effect without a restart.
+
+    Returns:
+        bool: ``True`` if the pipeline should send ambiguous pairs to the LLM.
+    """
     return (
         os.environ.get("ENABLE_LLM_ADJUDICATION", "").lower() in ("1", "true", "yes")
         and bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -58,6 +68,16 @@ def is_enabled() -> bool:
 
 
 def in_adjudication_band(score: float) -> bool:
+    """Check whether a match score is in the ambiguous range sent to the LLM.
+
+    Args:
+        score: Match score from ``matching.score_pair`` (0-1).
+
+    Returns:
+        bool: ``True`` if ``0.55 <= score <= 0.85`` (both ends included; see
+        ``ADJUDICATION_SCORE_RANGE``). Scores above 0.85 but below the
+        auto-merge threshold (0.92) go to human review without an LLM call.
+    """
     lo, hi = ADJUDICATION_SCORE_RANGE
     return lo <= score <= hi
 
@@ -70,6 +90,24 @@ _DOMAIN_FRAMING = {
 
 
 def _build_prompt(record_a: dict, record_b: dict, fuzzy_reasons: list[str], domain: str) -> str:
+    """Build the prompt text asking the model whether two records match.
+
+    The prompt includes both records as pretty-printed JSON, the fuzzy
+    matcher's reasons, a domain-specific description of what "the same"
+    means (customer and product have custom wording; any other domain, e.g.
+    vendor, gets a generic one), and an instruction to reply with ONLY a
+    JSON object: ``{"is_match": ..., "confidence": ..., "explanation": ...}``.
+
+    Args:
+        record_a: Standardized attributes of the first record.
+        record_b: Standardized attributes of the second record.
+        fuzzy_reasons: Reasons from ``score_pair``; "no strong signals" is
+            used if empty.
+        domain: Domain name, used in the wording.
+
+    Returns:
+        str: The full user message to send.
+    """
     framing = _DOMAIN_FRAMING.get(domain, f"refer to the same '{domain}' entity")
     return f"""You are adjudicating whether two {domain} records from a master
 data management system {framing}.
@@ -91,7 +129,33 @@ def adjudicate(record_a: dict, record_b: dict, fuzzy_reasons: list[str], domain:
     """Calls the Anthropic API to adjudicate an ambiguous match. Returns
     None on any failure (missing key, network error, malformed response)
     so the caller can safely fall back to the human review queue — this
-    function is intentionally designed to never raise."""
+    function is intentionally designed to never raise.
+
+    Sends one request to the Messages API (model ``MODEL``, max 300 output
+    tokens, 15-second timeout), joins the text blocks of the reply, and
+    parses them as JSON.
+
+    Caveats in the current code:
+
+    - If the model wraps its JSON in a Markdown code fence or adds any
+      other text, parsing fails and ``None`` is returned.
+    - Only ``URLError``, ``HTTPError``, ``KeyError``, ``ValueError`` and
+      ``JSONDecodeError`` are caught. A socket timeout while reading the
+      response (``TimeoutError``), or a reply that is valid JSON but not an
+      object (``TypeError``), would still raise.
+
+    Args:
+        record_a: Standardized attributes of the first record.
+        record_b: Standardized attributes of the second record.
+        fuzzy_reasons: Reasons from the fuzzy matcher, passed to the model
+            as context.
+        domain: Domain of the records. Defaults to ``"customer"``.
+
+    Returns:
+        AdjudicationResult | None: ``is_match``, ``confidence`` (0-1 as
+        reported by the model) and a one-sentence ``explanation``; or
+        ``None`` if there is no API key or the call/parse failed.
+    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
