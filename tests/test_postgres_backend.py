@@ -22,7 +22,7 @@ itself is already fully covered against SQLite).
 import os
 import unittest
 
-TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
+TEST_DB_URL = os.environ.get("DATABASE_URL")
 
 try:
     import psycopg2

@@ -114,6 +114,61 @@ class CSVConnector(BaseConnector):
                 yield record_id, attributes
 
 
+class JSONConnector(BaseConnector):
+    """Reads a local JSON file containing an array of objects (the
+    common shape for an API export or a data dump), mapping each
+    object's keys to canonical field names the same way CSVConnector
+    maps columns. Supports dotted paths for nested fields (e.g.
+    "contact.email" reaches into {"contact": {"email": "..."}})."""
+
+    def __init__(self, json_path: str, field_mapping: dict[str, str],
+                 source_record_id_field: str | None = None, source_system: str = "json_import"):
+        """
+        json_path: path to a JSON file whose top level is an array of objects.
+        field_mapping: {json_field_path: canonical_field_name}, e.g.
+            {"contact.email": "email", "given_name": "first_name"}
+        source_record_id_field: which field to use as source_record_id
+            (dotted paths supported same as field_mapping). If omitted,
+            uses the item's 0-based index in the array.
+        """
+        self.json_path = json_path
+        self.field_mapping = field_mapping
+        self.source_record_id_field = source_record_id_field
+        self.source_system = source_system
+
+    @staticmethod
+    def _get_path(obj: dict, dotted_path: str):
+        value = obj
+        for part in dotted_path.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    def fetch_records(self) -> Iterator[tuple[str, dict]]:
+        import json
+
+        path = Path(self.json_path)
+        if not path.exists():
+            raise FileNotFoundError(f"JSON file not found: {self.json_path}")
+
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"{self.json_path}: expected a top-level JSON array of objects, "
+                              f"got {type(data).__name__}")
+
+        for i, item in enumerate(data):
+            record_id = (
+                str(self._get_path(item, self.source_record_id_field))
+                if self.source_record_id_field else str(i)
+            )
+            attributes = {}
+            for json_path_key, canonical_field in self.field_mapping.items():
+                value = self._get_path(item, json_path_key)
+                attributes[canonical_field] = str(value).strip() if value is not None else ""
+            yield record_id, attributes
+
 def ingest_from_connector(store, tenant_id: str, domain: str, connector: BaseConnector) -> list[dict]:
     """Convenience wrapper: pulls every record from a connector and runs
     it through the normal ingest pipeline. Returns the list of
