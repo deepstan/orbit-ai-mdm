@@ -14,16 +14,6 @@ TENANT = "default"
 
 
 def seed_customer(store):
-    """Ingest five demo customer records into the ``"default"`` tenant.
-
-    Designed to show each outcome: Robert/Bob Smith share an email, so they
-    auto-merge; Jennifer/Jen Nguyen have similar names and addresses but no
-    shared identifier, so they land in the review queue; Maria Garcia stays
-    on her own. Each ingest result is printed.
-
-    Args:
-        store: Storage backend.
-    """
     print("--- Customer domain ---")
     print(ingest_record(store, TENANT, "customer", "salesforce", "SF-1001", {
         "first_name": "Robert", "last_name": "Smith", "email": "bob.smith@acme.com",
@@ -50,16 +40,6 @@ def seed_customer(store):
 
 
 def seed_product(store):
-    """Ingest five demo product records into the ``"default"`` tenant.
-
-    The two Nike Air Max 90 records have the same SKU in different case, so
-    they auto-merge; the two Widget Pro 3000 records have different SKUs but
-    similar details, so they're scored fuzzily (review or no match); the
-    Adidas record stays on its own. Each ingest result is printed.
-
-    Args:
-        store: Storage backend.
-    """
     print("\n--- Product domain ---")
     print(ingest_record(store, TENANT, "product", "erp", "SKU-1001", {
         "sku": "NK-AM90-BLK-10", "product_name": "Nike Air Max 90", "brand": "Nike",
@@ -84,16 +64,6 @@ def seed_product(store):
 
 
 def seed_vendor(store):
-    """Ingest five demo vendor records into the ``"default"`` tenant.
-
-    Acme Supply has the same tax ID (after formatting is removed) and email
-    in two systems, so it auto-merges; the two Northwind records share only
-    a phone number (not a deterministic field for vendors), so they're
-    scored fuzzily; Globex stays on its own. Each ingest result is printed.
-
-    Args:
-        store: Storage backend.
-    """
     print("\n--- Vendor domain ---")
     print(ingest_record(store, TENANT, "vendor", "erp", "VEND-1", {
         "company_name": "Acme Supply Co", "tax_id": "12-3456789",
@@ -120,24 +90,6 @@ def seed_vendor(store):
 def main():
     # Uses DATABASE_URL if set (e.g. postgresql://...), else SQLite's mdm.db
     # in the current directory -- see app/store_factory.py.
-    """Seed demo data for all three domains, then show Phase 3 features.
-
-    Steps: seed customers, products and vendors; ingest one more product to
-    show that records are only compared within their own domain; write one
-    audit entry, record 15 ``record_ingested`` usage events, verify the
-    audit chain and print a usage summary; print next-step instructions.
-
-    Notes:
-
-    - Uses ``DATABASE_URL`` if set, otherwise ``mdm.db`` in the current
-      directory.
-    - Not idempotent: running it again ingests every record again, which
-      creates duplicates and auto-merges or review items against the first
-      run.
-    - The 15 usage events are demo numbers; they don't match the 16 records
-      actually ingested, because ``ingest_record`` itself doesn't record
-      usage (only the API route does).
-    """
     store = get_store()
     seed_customer(store)
     seed_product(store)

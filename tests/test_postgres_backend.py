@@ -22,7 +22,7 @@ itself is already fully covered against SQLite).
 import os
 import unittest
 
-TEST_DB_URL = os.environ.get("DATABASE_URL")
+TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
 
 try:
     import psycopg2
@@ -39,12 +39,6 @@ SKIP_REASON = (
 @unittest.skipUnless(PSYCOPG2_AVAILABLE and TEST_DB_URL, SKIP_REASON)
 class TestPostgresBackend(unittest.TestCase):
     def setUp(self):
-        """Connect to the test Postgres database and pick a unique tenant ID.
-
-        The tenant ID includes the process ID so test data never collides with
-        other runs or real data. Test rows are NOT deleted afterwards, so they
-        build up in the test database over time.
-        """
         from app.db_postgres import PostgresStore
         self.store = PostgresStore(TEST_DB_URL)
         # Clean slate: this tenant_id is unique to this test run so it
@@ -52,7 +46,6 @@ class TestPostgresBackend(unittest.TestCase):
         self.tenant = f"pgtest_{os.getpid()}"
 
     def test_ingest_and_retrieve_round_trips_correctly(self):
-        """An ingested record produces a golden record that can be read back with the right email."""
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "customer", "crm", "PG-1", {
             "first_name": "Ada", "last_name": "Lovelace", "email": "ada@example.com",
@@ -62,7 +55,6 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(entity.attributes["email"], "ada@example.com")
 
     def test_auto_merge_works_identically_to_sqlite(self):
-        """Two records with the same email auto-merge into one entity on Postgres."""
         from app.pipeline import ingest_record
         r1 = ingest_record(self.store, self.tenant, "customer", "crm", "PG-2", {
             "first_name": "Grace", "last_name": "Hopper", "email": "grace@navy.mil",
@@ -73,7 +65,6 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(r1["matched_entity_id"], r2["matched_entity_id"])
 
     def test_tenant_and_domain_isolation_holds_on_postgres_too(self):
-        """The same record in two tenants produces two separate entities on Postgres."""
         from app.pipeline import ingest_record
         payload = {"first_name": "Alan", "last_name": "Turing", "email": "alan@example.com"}
         r_a = ingest_record(self.store, self.tenant, "customer", "crm", "PG-4", payload)
@@ -81,7 +72,6 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertNotEqual(r_a["matched_entity_id"], r_b["matched_entity_id"])
 
     def test_lineage_is_recorded(self):
-        """Ingesting a product writes at least one lineage event on Postgres."""
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "product", "erp", "PG-5", {
             "sku": "PGTEST-1", "product_name": "Test Widget",
@@ -90,7 +80,6 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertGreater(len(lineage), 0)
 
     def test_api_keys_round_trip(self):
-        """An API key saved on Postgres can be found again by its hash."""
         from app.auth import generate_api_key
         from app.models import ApiKeyRecord
         plaintext, key_hash = generate_api_key()
@@ -100,15 +89,79 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(fetched.label, "pg test key")
 
     def test_audit_chain_verifies_on_postgres(self):
-        """Two audit entries on Postgres form a valid chain."""
         from app.audit import log_action, verify_chain
         log_action(self.store, self.tenant, "ingest", "key:test", {"x": 1})
         log_action(self.store, self.tenant, "ingest", "key:test", {"x": 2})
         ok, _ = verify_chain(self.store, self.tenant)
         self.assertTrue(ok)
 
+    def test_blocking_key_index_works_on_postgres(self):
+        self.store.save_blocking_keys(self.tenant, "customer", "rec_a", {"g0:smith:94107"})
+        self.store.save_blocking_keys(self.tenant, "customer", "rec_b", {"g0:smith:94107"})
+        found = self.store.find_candidate_record_ids(self.tenant, "customer", {"g0:smith:94107"}, exclude_record_id="rec_a")
+        self.assertEqual(found, {"rec_b"})
+
+    def test_jsonb_attributes_round_trip_as_dict_not_string(self):
+        """The core JSONB migration guarantee: attributes come back as
+        a real dict (via psycopg2's jsonb auto-adaptation), not a JSON
+        string needing json.loads()."""
+        from app.pipeline import ingest_record
+        result = ingest_record(self.store, self.tenant, "customer", "crm", "PG-JSONB", {
+            "first_name": "Grace", "last_name": "Hopper", "email": "grace@navy.mil",
+        })
+        entity = self.store.get_entity(result["matched_entity_id"], self.tenant, "customer")
+        self.assertIsInstance(entity.attributes, dict)
+        self.assertEqual(entity.attributes["email"], "grace@navy.mil")
+
+    def test_find_entities_by_attribute_queries_into_jsonb(self):
+        """The payoff the JSONB migration unlocks: querying by attribute
+        value directly in SQL via the ->> operator, Postgres-only."""
+        from app.pipeline import ingest_record
+        ingest_record(self.store, self.tenant, "customer", "crm", "PG-JSONB2", {
+            "first_name": "Katherine", "last_name": "Johnson", "email": "katherine@nasa.gov",
+        })
+        found = self.store.find_entities_by_attribute(self.tenant, "customer", "email", "katherine@nasa.gov")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].attributes["last_name"], "Johnson")
+
+    def test_rls_policies_apply_without_breaking_normal_queries(self):
+        """Applies RLS policies (idempotent -- safe to re-run), then
+        confirms normal ingest/query operations still work through the
+        SAME connection this test suite already uses.
+
+        ⚠️ THIS TEST DOES NOT PROVE RLS ACTUALLY ISOLATES TENANTS. The
+        connection used throughout this test file is whatever role
+        TEST_DATABASE_URL specifies -- if that's a superuser (the
+        common case for a local dev Postgres), RLS policies are
+        invisible to it by design (see app/rls_policies.py), so this
+        only proves "enabling RLS doesn't break queries for a role
+        that's exempt from it anyway." That's still worth knowing (a
+        broken policy could break ALL queries, exempt or not), but it
+        is NOT a security validation.
+
+        To actually validate isolation: run `python3 setup_rls.py
+        create-role --role-name mdm_test_restricted --password test123`,
+        then `python3 setup_rls.py verify` while connected AS that role,
+        then manually confirm two different tenant_ids' rows are
+        genuinely invisible to each other through that restricted
+        connection. That's a real security test; this one is a smoke
+        test that the policies don't break anything.
+        """
+        from app.rls_policies import generate_rls_sql
+        with self.store._conn() as conn, conn.cursor() as cur:
+            cur.execute(generate_rls_sql())
+
+        # Normal operations should still work identically after RLS is applied
+        # (whether or not it's actually restricting THIS role).
+        from app.pipeline import ingest_record
+        result = ingest_record(self.store, self.tenant, "customer", "crm", "RLS-1", {
+            "first_name": "Test", "last_name": "AfterRLS", "email": "rls@test.local",
+        })
+        entity = self.store.get_entity(result["matched_entity_id"], self.tenant, "customer")
+        self.assertIsNotNone(entity)
+        self.assertEqual(entity.attributes["last_name"], "AfterRLS")
+
     def test_purge_works_on_postgres(self):
-        """Purging an entity on Postgres removes it."""
         from app.compliance import purge_entity
         from app.pipeline import ingest_record
         result = ingest_record(self.store, self.tenant, "customer", "crm", "PG-6", {

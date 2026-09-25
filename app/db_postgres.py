@@ -23,21 +23,47 @@ Differences from the SQLite version, all handled below:
     autocommit by default (good -- matches the SQLite context manager's
     "commit on success, nothing persisted on exception" behavior)
 
-Deliberately NOT using JSONB for the `attributes` column, even though
-that's the more idiomatic Postgres choice (native JSON querying, indexing
-into fields) -- kept as TEXT + json.dumps/loads to stay byte-for-byte
-consistent with the SQLite schema and minimize what's different between
-the two backends while this is unvalidated. Switching to JSONB later is
-a reasonable follow-up once this backend is confirmed working, and would
-unlock querying entities by attribute value directly in SQL.
+JSON-holding columns (`attributes`, `reasons`, `details`, `metadata`,
+`allowed_domains`) are native `JSONB`, not `TEXT`. This unlocks querying
+INTO individual attribute fields directly in SQL (e.g.
+`WHERE attributes->>'email' = 'x@y.com'`) instead of only ever loading
+the whole blob into Python -- something SQLite's schema can't offer the
+same way. Two consequences of this, both handled below:
+
+  - WRITES pass a `psycopg2.extras.Json(...)`-wrapped value (see the
+    `_j()` helper), not `json.dumps(...)` -- the idiomatic, unambiguous
+    way to hand psycopg2 a Python dict/list for a jsonb column.
+  - READS get the value back as an already-parsed Python dict/list --
+    psycopg2 registers default adapters for the json/jsonb PostgreSQL
+    types, so `row["attributes"]` is a dict already, not a JSON string.
+    Calling `json.loads()` on it would raise a TypeError. Every
+    `_row_to_X()` method below reflects this: no `json.loads()` calls
+    remain for these columns.
+
+⚠️ Like the rest of this file, the JSONB read/write round trip has NOT
+been run against a real Postgres server (no network in the build
+sandbox) -- it's written against psycopg2's documented default
+adaptation behavior, not verified live. Validate with
+`tests/test_postgres_backend.py` on your own machine.
 """
 from __future__ import annotations
 
-import json
 import threading
 from contextlib import contextmanager
 
 from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent
+
+
+def _j(value):
+    """Wraps a Python dict/list for a JSONB column parameter. None stays
+    None (for nullable JSONB columns like api_keys.allowed_domains) --
+    Json(None) would otherwise write the JSON literal `null` instead of
+    a real SQL NULL, which would break the `IS NULL` checks callers do
+    to mean 'no domain restriction'."""
+    if value is None:
+        return None
+    from psycopg2.extras import Json
+    return Json(value)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_records (
@@ -46,7 +72,7 @@ CREATE TABLE IF NOT EXISTS source_records (
     domain TEXT NOT NULL,
     source_system TEXT NOT NULL,
     source_record_id TEXT NOT NULL,
-    attributes TEXT NOT NULL,
+    attributes JSONB NOT NULL,
     ingested_at TEXT NOT NULL,
     entity_id TEXT
 );
@@ -56,7 +82,7 @@ CREATE TABLE IF NOT EXISTS entities (
     tenant_id TEXT NOT NULL,
     domain TEXT NOT NULL,
     status TEXT NOT NULL,
-    attributes TEXT NOT NULL,
+    attributes JSONB NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -69,7 +95,7 @@ CREATE TABLE IF NOT EXISTS match_candidates (
     record_b_id TEXT NOT NULL,
     score DOUBLE PRECISION NOT NULL,
     match_type TEXT NOT NULL,
-    reasons TEXT NOT NULL,
+    reasons JSONB NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     decided_at TEXT,
@@ -89,13 +115,20 @@ CREATE TABLE IF NOT EXISTS lineage (
     changed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS blocking_keys (
+    tenant_id TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    blocking_key TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     role TEXT NOT NULL,
     key_hash TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL,
-    allowed_domains TEXT,
+    allowed_domains JSONB,
     created_at TEXT NOT NULL,
     revoked_at TEXT
 );
@@ -106,7 +139,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     domain TEXT,
     action TEXT NOT NULL,
     actor TEXT NOT NULL,
-    details TEXT NOT NULL,
+    details JSONB NOT NULL,
     prev_hash TEXT NOT NULL,
     entry_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -118,7 +151,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     domain TEXT,
     event_type TEXT NOT NULL,
     quantity INTEGER NOT NULL,
-    metadata TEXT NOT NULL,
+    metadata JSONB NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -127,6 +160,8 @@ CREATE INDEX IF NOT EXISTS idx_source_records_scope ON source_records(tenant_id,
 CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(tenant_id, domain);
 CREATE INDEX IF NOT EXISTS idx_match_candidates_scope_status ON match_candidates(tenant_id, domain, status);
 CREATE INDEX IF NOT EXISTS idx_lineage_scope_entity ON lineage(tenant_id, domain, entity_id);
+CREATE INDEX IF NOT EXISTS idx_blocking_keys_lookup ON blocking_keys(tenant_id, domain, blocking_key);
+CREATE INDEX IF NOT EXISTS idx_blocking_keys_record ON blocking_keys(tenant_id, domain, record_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log(tenant_id, created_at);
@@ -195,10 +230,29 @@ class PostgresStore:
         return self._connection
 
     @contextmanager
-    def _conn(self):
+    def _conn(self, tenant_id: str | None = None):
+        """When `tenant_id` is given, sets the Postgres session variable
+        `app.current_tenant_id` via SET LOCAL before yielding -- this is
+        what RLS policies (see app/rls_policies.py) check to decide
+        which rows a query can see. SET LOCAL's effect lasts only for
+        the current transaction, matching this method's own
+        commit-per-call boundary, so it never leaks into a later call.
+
+        This runs unconditionally whenever tenant_id is passed, whether
+        or not RLS policies are actually enabled on the tables --
+        setting an unused Postgres custom session variable is harmless
+        overhead (no pre-declaration required), so there's no separate
+        "is RLS on" flag to keep in sync here. The policies themselves
+        are opt-in, applied separately -- see setup_rls.py. Without
+        them, this SET LOCAL does nothing observable; WITH them, it's
+        the enforcement mechanism.
+        """
         with self._lock:
             conn = self._get_connection()
             try:
+                if tenant_id is not None:
+                    with conn.cursor() as cur:
+                        cur.execute("SET LOCAL app.current_tenant_id = %s", (tenant_id,))
                 yield conn
                 conn.commit()
             except Exception:
@@ -212,16 +266,27 @@ class PostgresStore:
 
     # --- source records -----------------------------------------------
     def save_source_record(self, rec: SourceRecord) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=rec.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, "
                 "attributes, ingested_at, entity_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 (rec.id, rec.tenant_id, rec.domain, rec.source_system, rec.source_record_id,
-                 json.dumps(rec.attributes), rec.ingested_at, rec.entity_id),
+                 _j(rec.attributes), rec.ingested_at, rec.entity_id),
+            )
+
+    def save_source_records_batch(self, records: list[SourceRecord]) -> None:
+        if not records:
+            return
+        with self._conn(tenant_id=records[0].tenant_id if records else None) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, "
+                "attributes, ingested_at, entity_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                [(r.id, r.tenant_id, r.domain, r.source_system, r.source_record_id,
+                  _j(r.attributes), r.ingested_at, r.entity_id) for r in records],
             )
 
     def get_source_record(self, rec_id: str, tenant_id: str, domain: str) -> SourceRecord | None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM source_records WHERE id = %s AND tenant_id = %s AND domain = %s",
                 (rec_id, tenant_id, domain),
@@ -230,7 +295,7 @@ class PostgresStore:
             return self._row_to_source_record(row) if row else None
 
     def list_source_records(self, tenant_id: str, domain: str, entity_id: str | None = None) -> list[SourceRecord]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             if entity_id:
                 cur.execute(
                     "SELECT * FROM source_records WHERE tenant_id = %s AND domain = %s AND entity_id = %s",
@@ -243,16 +308,63 @@ class PostgresStore:
             return [self._row_to_source_record(r) for r in cur.fetchall()]
 
     def set_record_entity(self, record_id: str, tenant_id: str, domain: str, entity_id: str) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE source_records SET entity_id = %s WHERE id = %s AND tenant_id = %s AND domain = %s",
                 (entity_id, record_id, tenant_id, domain),
             )
 
     def delete_source_record(self, record_id: str, tenant_id: str, domain: str) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM source_records WHERE id = %s AND tenant_id = %s AND domain = %s",
+                (record_id, tenant_id, domain),
+            )
+
+    # --- Blocking keys (indexed candidate lookup for matching) ------------
+    def save_blocking_keys(self, tenant_id: str, domain: str, record_id: str, keys: set[str]) -> None:
+        if not keys:
+            return
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)",
+                [(tenant_id, domain, record_id, k) for k in keys],
+            )
+
+    def save_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]]) -> None:
+        rows = [
+            (tenant_id, domain, record_id, key)
+            for tenant_id, domain, record_id, keys in entries
+            for key in keys
+        ]
+        if not rows:
+            return
+        with self._conn(tenant_id=entries[0][0] if entries else None) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)",
+                rows,
+            )
+
+    def find_candidate_record_ids(self, tenant_id: str, domain: str, keys: set[str],
+                                   exclude_record_id: str) -> set[str]:
+        if not keys:
+            return set()
+        keys_list = list(keys)
+        placeholders = ",".join("%s" for _ in keys_list)
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT record_id FROM blocking_keys "
+                f"WHERE tenant_id = %s AND domain = %s AND blocking_key IN ({placeholders}) "
+                f"AND record_id != %s",
+                (tenant_id, domain, *keys_list, exclude_record_id),
+            )
+            rows = cur.fetchall()
+        return {r["record_id"] for r in rows}
+
+    def delete_blocking_keys(self, record_id: str, tenant_id: str, domain: str) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM blocking_keys WHERE record_id = %s AND tenant_id = %s AND domain = %s",
                 (record_id, tenant_id, domain),
             )
 
@@ -261,25 +373,25 @@ class PostgresStore:
         return SourceRecord(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"],
             source_system=row["source_system"], source_record_id=row["source_record_id"],
-            attributes=json.loads(row["attributes"]),
+            attributes=row["attributes"],
             ingested_at=row["ingested_at"], entity_id=row["entity_id"],
         )
 
     # --- entities --------------------------------------------------------
     def save_entity(self, ent: Entity) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=ent.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO entities (id, tenant_id, domain, status, attributes, created_at, updated_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (id) DO UPDATE SET
                      status = EXCLUDED.status, attributes = EXCLUDED.attributes,
                      updated_at = EXCLUDED.updated_at""",
-                (ent.id, ent.tenant_id, ent.domain, ent.status, json.dumps(ent.attributes),
+                (ent.id, ent.tenant_id, ent.domain, ent.status, _j(ent.attributes),
                  ent.created_at, ent.updated_at),
             )
 
     def get_entity(self, entity_id: str, tenant_id: str, domain: str) -> Entity | None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
                 (entity_id, tenant_id, domain),
@@ -290,12 +402,12 @@ class PostgresStore:
             source_ids = [r.id for r in self.list_source_records(tenant_id, domain, entity_id=entity_id)]
             return Entity(
                 id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"], status=row["status"],
-                attributes=json.loads(row["attributes"]), source_record_ids=source_ids,
+                attributes=row["attributes"], source_record_ids=source_ids,
                 created_at=row["created_at"], updated_at=row["updated_at"],
             )
 
     def list_entities(self, tenant_id: str, domain: str, status: str | None = None) -> list[Entity]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             if status:
                 cur.execute(
                     "SELECT id FROM entities WHERE tenant_id = %s AND domain = %s AND status = %s",
@@ -306,8 +418,28 @@ class PostgresStore:
             ids = [r["id"] for r in cur.fetchall()]
         return [self.get_entity(i, tenant_id, domain) for i in ids]
 
+    def find_entities_by_attribute(self, tenant_id: str, domain: str, field: str, value: str) -> list[Entity]:
+        """Postgres-only bonus this JSONB migration unlocks: query
+        entities by an attribute VALUE directly in SQL (using jsonb's
+        ->> operator), instead of fetching every entity into Python and
+        filtering there. SQLite's `Store` has no equivalent method --
+        its TEXT-column attributes can only be filtered in Python after
+        loading the whole row, which is the exact limitation this
+        method exists to route around on Postgres. For serious use at
+        scale, this should be paired with a GIN or expression index on
+        `entities ((attributes->>'field'))` -- not created automatically
+        here, since which fields are worth indexing is data-dependent."""
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM entities WHERE tenant_id = %s AND domain = %s "
+                "AND attributes->>%s = %s",
+                (tenant_id, domain, field, value),
+            )
+            ids = [r["id"] for r in cur.fetchall()]
+        return [self.get_entity(i, tenant_id, domain) for i in ids]
+
     def delete_entity(self, entity_id: str, tenant_id: str, domain: str) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
                 (entity_id, tenant_id, domain),
@@ -315,18 +447,18 @@ class PostgresStore:
 
     # --- match candidates --------------------------------------------------
     def save_candidate(self, c: MatchCandidate) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=c.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO match_candidates (id, tenant_id, domain, record_a_id, record_b_id, score, "
                 "match_type, reasons, status, created_at, decided_at, decided_by) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (c.id, c.tenant_id, c.domain, c.record_a_id, c.record_b_id, c.score, c.match_type,
-                 json.dumps(c.reasons), c.status, c.created_at, c.decided_at, c.decided_by),
+                 _j(c.reasons), c.status, c.created_at, c.decided_at, c.decided_by),
             )
 
     def update_candidate_status(self, cand_id: str, tenant_id: str, domain: str,
                                  status: str, decided_by: str, decided_at: str) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE match_candidates SET status = %s, decided_by = %s, decided_at = %s "
                 "WHERE id = %s AND tenant_id = %s AND domain = %s",
@@ -334,7 +466,7 @@ class PostgresStore:
             )
 
     def list_candidates(self, tenant_id: str, domain: str, status: str | None = "pending") -> list[MatchCandidate]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             if status:
                 cur.execute(
                     "SELECT * FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = %s "
@@ -351,7 +483,7 @@ class PostgresStore:
             MatchCandidate(
                 id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"],
                 record_a_id=r["record_a_id"], record_b_id=r["record_b_id"],
-                score=r["score"], match_type=r["match_type"], reasons=json.loads(r["reasons"]),
+                score=r["score"], match_type=r["match_type"], reasons=r["reasons"],
                 status=r["status"], created_at=r["created_at"],
                 decided_at=r["decided_at"], decided_by=r["decided_by"],
             )
@@ -359,7 +491,7 @@ class PostgresStore:
         ]
 
     def get_candidate(self, cand_id: str, tenant_id: str, domain: str) -> MatchCandidate | None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM match_candidates WHERE id = %s AND tenant_id = %s AND domain = %s",
                 (cand_id, tenant_id, domain),
@@ -370,14 +502,14 @@ class PostgresStore:
         return MatchCandidate(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"],
             record_a_id=row["record_a_id"], record_b_id=row["record_b_id"],
-            score=row["score"], match_type=row["match_type"], reasons=json.loads(row["reasons"]),
+            score=row["score"], match_type=row["match_type"], reasons=row["reasons"],
             status=row["status"], created_at=row["created_at"],
             decided_at=row["decided_at"], decided_by=row["decided_by"],
         )
 
     # --- lineage -----------------------------------------------------------
     def add_lineage(self, ev: LineageEvent) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=ev.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO lineage (id, tenant_id, domain, entity_id, field, old_value, new_value, "
                 "source_record_id, reason, changed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
@@ -386,7 +518,7 @@ class PostgresStore:
             )
 
     def list_lineage(self, entity_id: str, tenant_id: str, domain: str) -> list[LineageEvent]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM lineage WHERE entity_id = %s AND tenant_id = %s AND domain = %s ORDER BY changed_at",
                 (entity_id, tenant_id, domain),
@@ -403,29 +535,42 @@ class PostgresStore:
 
     # --- API keys (RBAC / auth) --------------------------------------------
     def save_api_key(self, key: ApiKeyRecord) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=key.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO api_keys (id, tenant_id, role, key_hash, label, allowed_domains, "
                 "created_at, revoked_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (key.id, key.tenant_id, key.role, key.key_hash, key.label,
-                 json.dumps(key.allowed_domains) if key.allowed_domains is not None else None,
+                 _j(key.allowed_domains),
                  key.created_at, key.revoked_at),
             )
 
     def get_api_key_by_hash(self, key_hash: str) -> ApiKeyRecord | None:
+        """Deliberately NOT tenant-scoped via _conn(tenant_id=...), unlike
+        every other method in this class -- this is the one place that
+        genuinely can't be: it's the authentication entry point, called
+        BEFORE the caller's tenant is known. The row this query finds is
+        what TELLS you the tenant, so there's no tenant_id to set as
+        session context ahead of time. If RLS policies are applied to
+        the api_keys table with the same tenant-isolation pattern as
+        every other table, this specific query would need to run as a
+        role that bypasses RLS for this one lookup (or the api_keys
+        table gets excluded from RLS entirely and relies on this being
+        the only unscoped read path into it, with every other api_keys
+        method already tenant-scoped normally). See app/rls_policies.py
+        for how this is actually handled."""
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM api_keys WHERE key_hash = %s", (key_hash,))
             row = cur.fetchone()
             return self._row_to_api_key(row) if row else None
 
     def list_api_keys(self, tenant_id: str) -> list[ApiKeyRecord]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM api_keys WHERE tenant_id = %s", (tenant_id,))
             rows = cur.fetchall()
         return [self._row_to_api_key(r) for r in rows]
 
     def revoke_api_key(self, key_id: str, tenant_id: str, revoked_at: str) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "UPDATE api_keys SET revoked_at = %s WHERE id = %s AND tenant_id = %s",
                 (revoked_at, key_id, tenant_id),
@@ -436,22 +581,22 @@ class PostgresStore:
         return ApiKeyRecord(
             id=row["id"], tenant_id=row["tenant_id"], role=row["role"], key_hash=row["key_hash"],
             label=row["label"],
-            allowed_domains=json.loads(row["allowed_domains"]) if row["allowed_domains"] else None,
+            allowed_domains=row["allowed_domains"],
             created_at=row["created_at"], revoked_at=row["revoked_at"],
         )
 
     # --- Audit log -----------------------------------------------------------
     def append_audit_entry(self, entry: AuditLogEntry) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=entry.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO audit_log (id, tenant_id, domain, action, actor, details, prev_hash, "
                 "entry_hash, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (entry.id, entry.tenant_id, entry.domain, entry.action, entry.actor,
-                 json.dumps(entry.details), entry.prev_hash, entry.entry_hash, entry.created_at),
+                 _j(entry.details), entry.prev_hash, entry.entry_hash, entry.created_at),
             )
 
     def get_last_audit_entry(self, tenant_id: str) -> AuditLogEntry | None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM audit_log WHERE tenant_id = %s ORDER BY created_at DESC LIMIT 1",
                 (tenant_id,),
@@ -460,7 +605,7 @@ class PostgresStore:
             return self._row_to_audit_entry(row) if row else None
 
     def list_audit_log(self, tenant_id: str, domain: str | None = None, limit: int = 200) -> list[AuditLogEntry]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             if domain:
                 cur.execute(
                     "SELECT * FROM audit_log WHERE tenant_id = %s AND domain = %s "
@@ -479,22 +624,22 @@ class PostgresStore:
     def _row_to_audit_entry(row) -> AuditLogEntry:
         return AuditLogEntry(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"], action=row["action"],
-            actor=row["actor"], details=json.loads(row["details"]),
+            actor=row["actor"], details=row["details"],
             prev_hash=row["prev_hash"], entry_hash=row["entry_hash"], created_at=row["created_at"],
         )
 
     # --- Usage events (billing metering) -----------------------------------
     def record_usage_event(self, ev: UsageEvent) -> None:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=ev.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO usage_events (id, tenant_id, domain, event_type, quantity, metadata, "
                 "created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
                 (ev.id, ev.tenant_id, ev.domain, ev.event_type, ev.quantity,
-                 json.dumps(ev.metadata), ev.created_at),
+                 _j(ev.metadata), ev.created_at),
             )
 
     def list_usage_events(self, tenant_id: str, since: str | None = None) -> list[UsageEvent]:
-        with self._conn() as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             if since:
                 cur.execute(
                     "SELECT * FROM usage_events WHERE tenant_id = %s AND created_at >= %s ORDER BY created_at",
@@ -508,7 +653,7 @@ class PostgresStore:
         return [
             UsageEvent(
                 id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"], event_type=r["event_type"],
-                quantity=r["quantity"], metadata=json.loads(r["metadata"]), created_at=r["created_at"],
+                quantity=r["quantity"], metadata=r["metadata"], created_at=r["created_at"],
             )
             for r in rows
         ]

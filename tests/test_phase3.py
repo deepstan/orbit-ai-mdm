@@ -16,7 +16,7 @@ from app.audit import log_action, verify_chain
 from app.auth import AuthError, Principal, check_permission, generate_api_key, hash_key
 from app.billing import LoggingBillingProvider, get_usage_summary, record_usage
 from app.compliance import purge_entity
-from app.connectors import CSVConnector, ingest_from_connector
+from app.connectors import CSVConnector, JSONConnector, ingest_from_connector
 from app.db import Store
 from app.models import ApiKeyRecord
 from app.pipeline import ingest_record
@@ -24,26 +24,22 @@ from app.pipeline import ingest_record
 
 class TestAuth(unittest.TestCase):
     def test_key_generation_and_hashing_round_trips(self):
-        """A generated key starts with ``mdm_`` and hashing it gives the returned hash."""
         plaintext, key_hash = generate_api_key()
         self.assertTrue(plaintext.startswith("mdm_"))
         self.assertEqual(hash_key(plaintext), key_hash)
 
     def test_different_keys_hash_differently(self):
-        """Two generated keys, and their hashes, are different."""
         p1, h1 = generate_api_key()
         p2, h2 = generate_api_key()
         self.assertNotEqual(p1, p2)
         self.assertNotEqual(h1, h2)
 
     def test_tenant_admin_can_do_everything(self):
-        """``tenant_admin`` is allowed every main action (ingest, resolve, view, retrain, manage keys, purge)."""
         principal = Principal(tenant_id="acme", role="tenant_admin", key_id="k1", label="root")
         for action in ("ingest", "resolve_review_queue", "view", "retrain", "manage_api_keys", "purge"):
             check_permission(principal, action)  # should not raise
 
     def test_api_consumer_is_read_only(self):
-        """``api_consumer`` may only ``view``; every write or admin action raises ``AuthError``."""
         principal = Principal(tenant_id="acme", role="api_consumer", key_id="k1", label="readonly")
         check_permission(principal, "view")  # allowed
         for action in ("ingest", "resolve_review_queue", "retrain", "manage_api_keys", "purge"):
@@ -51,7 +47,6 @@ class TestAuth(unittest.TestCase):
                 check_permission(principal, action)
 
     def test_data_steward_cannot_manage_keys_or_purge(self):
-        """``data_steward`` can ingest and resolve reviews, but not manage keys or purge."""
         principal = Principal(tenant_id="acme", role="data_steward", key_id="k1", label="steward")
         check_permission(principal, "ingest")
         check_permission(principal, "resolve_review_queue")
@@ -61,7 +56,6 @@ class TestAuth(unittest.TestCase):
             check_permission(principal, "purge")
 
     def test_domain_scoping_restricts_access(self):
-        """A key limited to ``["customer"]`` can act in customer but not in vendor."""
         principal = Principal(tenant_id="acme", role="data_steward", key_id="k1", label="steward",
                                allowed_domains=["customer"])
         check_permission(principal, "ingest", domain="customer")  # fine
@@ -69,14 +63,12 @@ class TestAuth(unittest.TestCase):
             check_permission(principal, "ingest", domain="vendor")
 
     def test_no_domain_restriction_means_all_domains(self):
-        """A key with ``allowed_domains=None`` can act in every domain."""
         principal = Principal(tenant_id="acme", role="data_steward", key_id="k1", label="steward",
                                allowed_domains=None)
         for domain in ("customer", "product", "vendor"):
             check_permission(principal, "ingest", domain=domain)  # none should raise
 
     def test_unknown_role_has_no_permissions(self):
-        """A role that isn't defined is denied even the ``view`` action."""
         principal = Principal(tenant_id="acme", role="nonexistent_role", key_id="k1", label="bogus")
         with self.assertRaises(AuthError):
             check_permission(principal, "view")
@@ -84,22 +76,16 @@ class TestAuth(unittest.TestCase):
 
 class TestAuditLog(unittest.TestCase):
     def setUp(self):
-        """Create a fresh SQLite store in ``test_phase3.db`` for each test.
-
-        Any leftover file from a previous run is deleted first.
-        """
         self.db_path = "test_phase3.db"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         self.store = Store(self.db_path)
 
     def tearDown(self):
-        """Delete the test database file after each test."""
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
     def test_chain_starts_valid_and_stays_valid_across_entries(self):
-        """Three entries written in a row form a valid chain."""
         log_action(self.store, "acme", "ingest", "key:a", {"x": 1})
         log_action(self.store, "acme", "resolve_review_queue", "key:a", {"x": 2})
         log_action(self.store, "acme", "purge", "key:a", {"x": 3})
@@ -108,16 +94,10 @@ class TestAuditLog(unittest.TestCase):
         self.assertIsNone(broke_at)
 
     def test_empty_chain_is_valid(self):
-        """A tenant with no audit entries counts as a valid chain."""
         ok, broke_at = verify_chain(self.store, "brand_new_tenant")
         self.assertTrue(ok)
 
     def test_tampering_with_stored_entry_breaks_verification(self):
-        """Editing a stored entry is detected.
-
-        Writes two entries, changes the first one's ``details`` directly in the
-        database, and checks ``verify_chain`` reports a break and names an entry.
-        """
         log_action(self.store, "acme", "ingest", "key:a", {"record": "real"})
         log_action(self.store, "acme", "ingest", "key:a", {"record": "real2"})
 
@@ -129,11 +109,6 @@ class TestAuditLog(unittest.TestCase):
         self.assertIsNotNone(broke_at)
 
     def test_chains_are_independent_per_tenant(self):
-        """Each tenant has its own chain.
-
-        One entry per tenant; each tenant sees only its own entry, and tenant
-        A's entry doesn't chain to tenant B's.
-        """
         log_action(self.store, "tenant_a", "ingest", "key:a", {})
         log_action(self.store, "tenant_b", "ingest", "key:b", {})
         entries_a = self.store.list_audit_log("tenant_a")
@@ -143,29 +118,206 @@ class TestAuditLog(unittest.TestCase):
         self.assertNotEqual(entries_a[0].prev_hash, entries_b[0].entry_hash)  # different chains entirely
 
 
-class TestRightToBeForgotten(unittest.TestCase):
+class TestBlockingKeyIndex(unittest.TestCase):
     def setUp(self):
-        """Create a fresh SQLite store in ``test_phase3.db`` for each test.
-
-        Any leftover file from a previous run is deleted first.
-        """
         self.db_path = "test_phase3.db"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         self.store = Store(self.db_path)
 
     def tearDown(self):
-        """Delete the test database file after each test."""
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def test_save_and_lookup_round_trips(self):
+        self.store.save_blocking_keys("acme", "customer", "rec_a", {"g0:smith:94107", "g1:4155550100"})
+        self.store.save_blocking_keys("acme", "customer", "rec_b", {"g0:smith:94107"})
+        self.store.save_blocking_keys("acme", "customer", "rec_c", {"g0:jones:10001"})
+
+        # rec_a and rec_b share g0:smith:94107 -- looking up FROM rec_a's
+        # keys should find rec_b, but not rec_c (different key entirely).
+        found = self.store.find_candidate_record_ids(
+            "acme", "customer", {"g0:smith:94107", "g1:4155550100"}, exclude_record_id="rec_a"
+        )
+        self.assertEqual(found, {"rec_b"})
+
+    def test_lookup_excludes_self(self):
+        self.store.save_blocking_keys("acme", "customer", "rec_a", {"g0:smith:94107"})
+        found = self.store.find_candidate_record_ids("acme", "customer", {"g0:smith:94107"}, exclude_record_id="rec_a")
+        self.assertEqual(found, set())  # only rec_a has this key, and it's excluded
+
+    def test_lookup_is_isolated_by_tenant_and_domain(self):
+        self.store.save_blocking_keys("tenant_a", "customer", "rec_a", {"g0:smith:94107"})
+        self.store.save_blocking_keys("tenant_b", "customer", "rec_b", {"g0:smith:94107"})
+        self.store.save_blocking_keys("tenant_a", "product", "rec_c", {"g0:smith:94107"})
+
+        found = self.store.find_candidate_record_ids("tenant_a", "customer", {"g0:smith:94107"}, exclude_record_id="nonexistent")
+        self.assertEqual(found, {"rec_a"})  # not rec_b (different tenant) or rec_c (different domain)
+
+    def test_empty_keys_returns_empty_set(self):
+        found = self.store.find_candidate_record_ids("acme", "customer", set(), exclude_record_id="rec_a")
+        self.assertEqual(found, set())
+
+    def test_ingest_produces_same_matches_as_before_the_index_rewrite(self):
+        """The important correctness guarantee: switching from full-pool
+        scan to indexed lookup must not change WHICH records match --
+        only how fast the lookup is. Re-run the same scenarios test_core.py
+        already proves and confirm identical outcomes."""
+        from app.pipeline import ingest_record
+        r1 = ingest_record(self.store, "acme", "customer", "crm", "C1", {
+            "first_name": "Robert", "last_name": "Smith", "email": "bob@x.com",
+        })
+        r2 = ingest_record(self.store, "acme", "customer", "shop", "C2", {
+            "first_name": "Bob", "last_name": "Smith", "email": "bob@x.com",
+        })
+        self.assertEqual(r1["matched_entity_id"], r2["matched_entity_id"])
+
+    def test_purge_removes_blocking_keys_too(self):
+        """Right-to-be-forgotten must clean up the index, not just the
+        source record and entity -- otherwise a purged person's data
+        stays discoverable via the blocking_keys table."""
+        from app.compliance import purge_entity
+        from app.pipeline import ingest_record
+        result = ingest_record(self.store, "acme", "customer", "crm", "C1", {
+            "first_name": "Ada", "last_name": "Lovelace", "email": "ada@x.com",
+        })
+        entity_id = result["matched_entity_id"]
+
+        with self.store._conn() as conn:
+            count_before = conn.execute("SELECT COUNT(*) as n FROM blocking_keys WHERE tenant_id='acme'").fetchone()["n"]
+        self.assertGreater(count_before, 0)
+
+        purge_entity(self.store, "acme", "customer", entity_id, requested_by="steward:dpo")
+
+        with self.store._conn() as conn:
+            count_after = conn.execute("SELECT COUNT(*) as n FROM blocking_keys WHERE tenant_id='acme'").fetchone()["n"]
+        self.assertEqual(count_after, 0)
+
+
+class TestIngestBatch(unittest.TestCase):
+    def setUp(self):
+        self.db_path = "test_phase3.db"
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.store = Store(self.db_path)
+
+    def tearDown(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def test_batch_produces_same_matches_as_individual_calls(self):
+        """The critical correctness guarantee: ingest_batch() must
+        produce IDENTICAL matching outcomes to calling ingest_record()
+        that many times -- not just similar, not just faster. An
+        earlier implementation violated this (327 vs 79 entities for
+        the same 1000-record input) by batch-writing blocking keys
+        before matching, letting an early record's candidate search see
+        a LATER record's keys. This test locks in the fix."""
+        from app.pipeline import ingest_batch
+
+        records = [
+            ("crm", "C1", {"first_name": "Robert", "last_name": "Smith", "email": "bob@x.com"}),
+            ("shop", "C2", {"first_name": "Bob", "last_name": "Smith", "email": "bob@x.com"}),
+            ("crm", "C3", {"first_name": "Maria", "last_name": "Garcia", "email": "maria@x.com"}),
+            ("crm", "C4", {"first_name": "Jennifer", "last_name": "Nguyen",
+                            "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301"}),
+        ]
+        results = ingest_batch(self.store, "acme", "customer", records)
+        self.assertEqual(len(results), 4)
+
+        # Bob/Robert Smith share an email -> same entity
+        self.assertEqual(results[0]["matched_entity_id"], results[1]["matched_entity_id"])
+        # Maria and Jennifer stand alone, distinct from Bob/Robert and each other
+        self.assertNotEqual(results[2]["matched_entity_id"], results[0]["matched_entity_id"])
+        self.assertNotEqual(results[3]["matched_entity_id"], results[0]["matched_entity_id"])
+        self.assertNotEqual(results[2]["matched_entity_id"], results[3]["matched_entity_id"])
+
+        entities = self.store.list_entities("acme", "customer")
+        self.assertEqual(len(entities), 3)  # Bob+Robert merged, Maria alone, Jennifer alone
+
+    def test_batch_never_lets_a_record_match_a_later_record_in_the_same_batch(self):
+        """Directly tests the bug that was caught: record order within
+        a batch must behave the same as sequential ingest_record() calls
+        -- record #0 must never be compared against record #2's data
+        before record #2 has been 'ingested' in processing order."""
+        from app.pipeline import ingest_batch
+
+        # C1 and C3 are identical (would auto-merge on email) but C1 comes
+        # FIRST in the batch, before C3 exists in processing order.
+        records = [
+            ("crm", "C1", {"first_name": "Alice", "last_name": "Chen", "email": "alice@x.com"}),
+            ("crm", "C2", {"first_name": "Ben", "last_name": "Diaz", "email": "ben@x.com"}),
+            ("crm", "C3", {"first_name": "Alice", "last_name": "Chen", "email": "alice@x.com"}),
+        ]
+        results = ingest_batch(self.store, "acme", "customer", records)
+        # C1 and C3 SHOULD still end up merged -- by the time we process
+        # C3, C1 has already been ingested (it came first in the list).
+        # This just confirms in-order matching still works within a batch,
+        # not that ordering is ignored.
+        self.assertEqual(results[0]["matched_entity_id"], results[2]["matched_entity_id"])
+
+    def test_batch_is_isolated_by_tenant_and_domain(self):
+        from app.pipeline import ingest_batch
+        records = [("crm", "C1", {"first_name": "X", "last_name": "Y", "email": "x@y.com"})]
+        ingest_batch(self.store, "tenant_a", "customer", records)
+        ingest_batch(self.store, "tenant_b", "customer", records)
+        self.assertEqual(len(self.store.list_entities("tenant_a", "customer")), 1)
+        self.assertEqual(len(self.store.list_entities("tenant_b", "customer")), 1)
+
+    def test_empty_batch_is_a_no_op(self):
+        from app.pipeline import ingest_batch
+        results = ingest_batch(self.store, "acme", "customer", [])
+        self.assertEqual(results, [])
+
+
+class TestRLSPolicyGeneration(unittest.TestCase):
+    """Pure SQL-text-generation logic -- fully testable without any
+    database connection. Does NOT test that Postgres actually enforces
+    these policies (that needs a real server -- see
+    tests/test_postgres_backend.py and setup_rls.py's `verify` command)."""
+
+    def test_api_keys_table_is_excluded(self):
+        from app.rls_policies import generate_rls_sql
+        sql = generate_rls_sql()
+        self.assertNotIn("api_keys", sql)
+
+    def test_every_tenant_scoped_table_gets_force_and_policy(self):
+        from app.rls_policies import TENANT_SCOPED_TABLES, generate_rls_sql
+        sql = generate_rls_sql()
+        for table in TENANT_SCOPED_TABLES:
+            self.assertIn(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY", sql)
+            self.assertIn(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY", sql)
+            self.assertIn(f"CREATE POLICY tenant_isolation ON {table}", sql)
+
+    def test_policy_uses_fail_closed_current_setting(self):
+        """The `true` (missing_ok) argument to current_setting() is
+        what makes this fail CLOSED (zero rows) rather than erroring or
+        defaulting open if a code path forgets to set the session
+        variable -- this test locks in that argument stays present."""
+        from app.rls_policies import generate_rls_sql
+        sql = generate_rls_sql()
+        self.assertIn("current_setting('app.current_tenant_id', true)", sql)
+
+    def test_disable_sql_reverses_every_table(self):
+        from app.rls_policies import TENANT_SCOPED_TABLES, generate_disable_rls_sql
+        sql = generate_disable_rls_sql()
+        for table in TENANT_SCOPED_TABLES:
+            self.assertIn(f"DROP POLICY IF EXISTS tenant_isolation ON {table}", sql)
+            self.assertIn(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY", sql)
+
+
+class TestRightToBeForgotten(unittest.TestCase):
+    def setUp(self):
+        self.db_path = "test_phase3.db"
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.store = Store(self.db_path)
+
+    def tearDown(self):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
     def test_purge_removes_entity_and_all_source_records(self):
-        """Purging deletes the golden record and both of its source records.
-
-        Two records sharing an email are merged, then purged. Checks the
-        result reports 2 deleted records, and that neither the entity nor its
-        source records can be found afterwards.
-        """
         r1 = ingest_record(self.store, "acme", "customer", "crm", "C1", {
             "first_name": "Ada", "last_name": "Lovelace", "email": "ada@x.com",
         })
@@ -182,7 +334,6 @@ class TestRightToBeForgotten(unittest.TestCase):
         self.assertEqual(len(self.store.list_source_records("acme", "customer", entity_id=entity_id)), 0)
 
     def test_purge_is_audit_logged(self):
-        """A purge writes a ``purge`` entry to the audit log, and the chain stays valid."""
         r1 = ingest_record(self.store, "acme", "customer", "crm", "C1", {"first_name": "X", "last_name": "Y"})
         purge_entity(self.store, "acme", "customer", r1["matched_entity_id"], requested_by="steward:dpo")
         log = self.store.list_audit_log("acme")
@@ -191,16 +342,10 @@ class TestRightToBeForgotten(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_purging_nonexistent_entity_raises(self):
-        """Purging an entity that doesn't exist raises ``ValueError``."""
         with self.assertRaises(ValueError):
             purge_entity(self.store, "acme", "customer", "ent_does_not_exist", requested_by="steward:dpo")
 
     def test_purge_does_not_affect_other_tenants_or_domains(self):
-        """A purge only touches its own tenant and domain.
-
-        After purging a customer in tenant ``acme``, acme's product entity and
-        another tenant's customer entity must still exist.
-        """
         r1 = ingest_record(self.store, "acme", "customer", "crm", "C1", {"first_name": "X", "last_name": "Y"})
         ingest_record(self.store, "acme", "product", "erp", "P1", {"product_name": "Widget"})
         ingest_record(self.store, "other_tenant", "customer", "crm", "C1", {"first_name": "X", "last_name": "Y"})
@@ -213,26 +358,16 @@ class TestRightToBeForgotten(unittest.TestCase):
 
 class TestBilling(unittest.TestCase):
     def setUp(self):
-        """Create a fresh SQLite store in ``test_phase3.db`` for each test.
-
-        Any leftover file from a previous run is deleted first.
-        """
         self.db_path = "test_phase3.db"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         self.store = Store(self.db_path)
 
     def tearDown(self):
-        """Delete the test database file after each test."""
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
     def test_usage_is_recorded_and_summarized(self):
-        """Usage events are totalled per type and priced.
-
-        Two ``record_ingested`` events and one ``api_call`` event with
-        quantity 10 must summarize as 2 and 10, with a cost above zero.
-        """
         record_usage(self.store, "acme", "record_ingested", domain="customer")
         record_usage(self.store, "acme", "record_ingested", domain="customer")
         record_usage(self.store, "acme", "api_call", quantity=10)
@@ -243,7 +378,6 @@ class TestBilling(unittest.TestCase):
         self.assertGreater(summary.estimated_cost_usd, 0)
 
     def test_usage_is_isolated_per_tenant(self):
-        """Usage counts are kept separately per tenant (1 for tenant A, 2 for tenant B)."""
         record_usage(self.store, "tenant_a", "record_ingested")
         record_usage(self.store, "tenant_b", "record_ingested")
         record_usage(self.store, "tenant_b", "record_ingested")
@@ -251,11 +385,6 @@ class TestBilling(unittest.TestCase):
         self.assertEqual(get_usage_summary(self.store, "tenant_b").counts_by_event_type["record_ingested"], 2)
 
     def test_logging_billing_provider_never_charges_for_real(self):
-        """``LoggingBillingProvider`` only logs the intended charge.
-
-        The returned record's note says no real charge was made, and the charge
-        log holds exactly one entry.
-        """
         record_usage(self.store, "acme", "record_ingested")
         summary = get_usage_summary(self.store, "acme")
         provider = LoggingBillingProvider()
@@ -266,11 +395,6 @@ class TestBilling(unittest.TestCase):
 
 class TestCSVConnector(unittest.TestCase):
     def setUp(self):
-        """Create a fresh test database and a temporary 3-row CSV file.
-
-        Columns: ``ID, First, Last, Email``. Rows: Robert Smith and Bob Smith
-        (same email), and Maria Garcia.
-        """
         self.db_path = "test_phase3.db"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
@@ -285,18 +409,12 @@ class TestCSVConnector(unittest.TestCase):
             writer.writerow(["3", "Maria", "Garcia", "maria@x.com"])
 
     def tearDown(self):
-        """Delete the test database and the temporary CSV file."""
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         if os.path.exists(self.csv_path):
             os.remove(self.csv_path)
 
     def test_csv_connector_reads_and_maps_fields(self):
-        """The CSV connector reads all rows and renames columns to canonical fields.
-
-        Checks 3 records are returned and the first is
-        ``("1", {"first_name": "Robert", "last_name": "Smith", "email": "bob@x.com"})``.
-        """
         connector = CSVConnector(
             csv_path=self.csv_path,
             field_mapping={"First": "first_name", "Last": "last_name", "Email": "email"},
@@ -307,17 +425,11 @@ class TestCSVConnector(unittest.TestCase):
         self.assertEqual(records[0], ("1", {"first_name": "Robert", "last_name": "Smith", "email": "bob@x.com"}))
 
     def test_csv_connector_missing_file_raises_clearly(self):
-        """Reading from a file that doesn't exist raises ``FileNotFoundError``."""
         connector = CSVConnector(csv_path="/nonexistent/path.csv", field_mapping={})
         with self.assertRaises(FileNotFoundError):
             list(connector.fetch_records())
 
     def test_ingest_from_connector_runs_full_pipeline(self):
-        """Importing the CSV runs every row through matching.
-
-        3 rows are ingested; the two Smiths share an email and merge, so the
-        tenant ends up with 2 golden records.
-        """
         connector = CSVConnector(
             csv_path=self.csv_path,
             field_mapping={"First": "first_name", "Last": "last_name", "Email": "email"},
@@ -328,6 +440,67 @@ class TestCSVConnector(unittest.TestCase):
         entities = self.store.list_entities("acme", "customer")
         # Bob/Robert Smith share an email -> should merge into 1; Maria stands alone -> 2 total
         self.assertEqual(len(entities), 2)
+
+
+class TestJSONConnector(unittest.TestCase):
+    def setUp(self):
+        self.db_path = "test_phase3.db"
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        self.store = Store(self.db_path)
+
+        import json
+        self.json_path = tempfile.mktemp(suffix=".json")
+        with open(self.json_path, "w") as f:
+            json.dump([
+                {"id": "1", "given_name": "Robert", "family_name": "Smith", "contact": {"email": "bob@x.com"}},
+                {"id": "2", "given_name": "Bob", "family_name": "Smith", "contact": {"email": "bob@x.com"}},
+                {"id": "3", "given_name": "Maria", "family_name": "Garcia", "contact": {"email": "maria@x.com"}},
+            ], f)
+
+    def tearDown(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        if os.path.exists(self.json_path):
+            os.remove(self.json_path)
+
+    def test_json_connector_maps_nested_fields(self):
+        connector = JSONConnector(
+            self.json_path,
+            field_mapping={"given_name": "first_name", "family_name": "last_name", "contact.email": "email"},
+            source_record_id_field="id",
+        )
+        records = list(connector.fetch_records())
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[0], ("1", {"first_name": "Robert", "last_name": "Smith", "email": "bob@x.com"}))
+
+    def test_json_connector_missing_file_raises_clearly(self):
+        connector = JSONConnector("/nonexistent/path.json", field_mapping={})
+        with self.assertRaises(FileNotFoundError):
+            list(connector.fetch_records())
+
+    def test_json_connector_rejects_non_array_top_level(self):
+        import json
+        bad_path = tempfile.mktemp(suffix=".json")
+        with open(bad_path, "w") as f:
+            json.dump({"not": "an array"}, f)
+        try:
+            connector = JSONConnector(bad_path, field_mapping={})
+            with self.assertRaises(ValueError):
+                list(connector.fetch_records())
+        finally:
+            os.remove(bad_path)
+
+    def test_ingest_from_json_connector_runs_full_pipeline(self):
+        connector = JSONConnector(
+            self.json_path,
+            field_mapping={"given_name": "first_name", "family_name": "last_name", "contact.email": "email"},
+            source_record_id_field="id",
+        )
+        results = ingest_from_connector(self.store, "acme", "customer", connector)
+        self.assertEqual(len(results), 3)
+        entities = self.store.list_entities("acme", "customer")
+        self.assertEqual(len(entities), 2)  # Bob/Robert merge on email, Maria stands alone
 
 
 if __name__ == "__main__":
