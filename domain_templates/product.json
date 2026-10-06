@@ -1,0 +1,81 @@
+{
+  "name": "product",
+  "override": true,
+  "fields": {
+    "sku": {
+      "normalize": [
+        "identifier"
+      ]
+    },
+    "upc": {
+      "normalize": [
+        "identifier"
+      ]
+    },
+    "product_name": {
+      "normalize": [
+        "product_name"
+      ]
+    },
+    "brand": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "category": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "description": {
+      "normalize": [
+        "lower"
+      ]
+    },
+    "price": {
+      "normalize": [
+        "text"
+      ]
+    }
+  },
+  "deterministic_fields": [
+    "sku",
+    "upc"
+  ],
+  "fuzzy_weights": {
+    "brand": 0.2,
+    "category": 0.15,
+    "description": 0.1
+  },
+  "semantic": {
+    "fields": [
+      "brand",
+      "product_name"
+    ],
+    "weight": 0.35
+  },
+  "blocking": [
+    [
+      "sku"
+    ],
+    [
+      "upc"
+    ],
+    [
+      "brand",
+      "category"
+    ]
+  ],
+  "survivorship": {
+    "default": "most_recent",
+    "fields": {
+      "sku": "most_recent",
+      "upc": "most_recent",
+      "product_name": "most_complete",
+      "brand": "most_complete",
+      "category": "most_complete",
+      "description": "most_recent",
+      "price": "most_recent"
+    }
+  }
+}

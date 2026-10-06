@@ -9,6 +9,7 @@ from __future__ import annotations
 from . import active_learning, llm_adjudication
 from .db import Store
 from .domains import get_domain_config
+from .indexing import ensure_index_ready
 from .matching import blocking_keys, classify, score_pair
 from .models import Entity, LineageEvent, MatchCandidate, SourceRecord, now_iso
 from .standardize import standardize
@@ -37,6 +38,7 @@ def ingest_record(store: Store, tenant_id: str, domain: str, source_system: str,
     #2, but only because of what #2 became earlier in the same run).
     """
     config = get_domain_config(domain)  # raises KeyError early for an unknown domain
+    ensure_index_ready(store, domain, config)  # refuses if the domain's config changed and the index wasn't rebuilt
     rec = SourceRecord(source_system=source_system, source_record_id=source_record_id,
                         attributes=attributes, tenant_id=tenant_id, domain=domain)
     store.save_source_record(rec)
@@ -77,6 +79,7 @@ def ingest_batch(store: Store, tenant_id: str, domain: str,
     one -- and isn't what's built here.
     """
     config = get_domain_config(domain)  # raises KeyError early for an unknown domain
+    ensure_index_ready(store, domain, config)
 
     recs = [
         SourceRecord(source_system=ss, source_record_id=srid, attributes=attrs,

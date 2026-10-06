@@ -219,11 +219,7 @@
 
 <script>
 const API = '';
-const DOMAINS = [
-  { id: 'customer', label: 'Customer' },
-  { id: 'product',  label: 'Product' },
-  { id: 'vendor',   label: 'Vendor' },
-];
+let DOMAINS = [];   // filled from /v1/domains at startup, so customer-defined domains get tabs too
 // Which attributes to show as the "identity" columns in the golden-records
 // table per domain -- everything else still shows in the review-queue
 // record cards (which render ALL attributes generically), this is just
@@ -235,6 +231,21 @@ const SUMMARY_FIELDS = {
 };
 
 let currentDomain = 'customer';
+
+// Everything that comes from ingested data (values, field names, source names, match reasons) is
+// untrusted: it is whatever a source system sent. It must never reach innerHTML unescaped.
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function loadDomains() {
+  const list = await fetchJSON('/v1/domains');
+  DOMAINS = list.map(d => ({
+    id: d.domain,
+    label: d.domain.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    fields: d.fields,
+  }));
+  if (!DOMAINS.some(d => d.id === currentDomain) && DOMAINS.length) currentDomain = DOMAINS[0].id;
+}
 
 async function fetchJSON(url, opts) {
   const res = await fetch(API + url, opts);
@@ -253,7 +264,7 @@ function renderTabs(counts) {
   const tabsEl = document.getElementById('tabs');
   tabsEl.innerHTML = DOMAINS.map(d => `
     <button class="tab ${d.id === currentDomain ? 'active' : ''}" onclick="switchDomain('${d.id}')">
-      ${d.label}<span class="count">${counts[d.id] ?? ''}</span>
+      ${esc(d.label)}<span class="count">${counts[d.id] ?? ''}</span>
     </button>
   `).join('');
 }
@@ -270,21 +281,21 @@ function renderRecord(rec) {
   if (!rec) return '<div class="rec"><span class="src">unknown</span></div>';
   const fields = Object.entries(rec.attributes || {})
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
-    .map(([k, v]) => `<div class="field"><span class="k">${k.replace(/_/g, ' ')}</span><span class="v">${v}</span></div>`)
+    .map(([k, v]) => `<div class="field"><span class="k">${esc(k.replace(/_/g, ' '))}</span><span class="v">${esc(v)}</span></div>`)
     .join('');
   return `
     <div class="rec">
-      <div class="src">${rec.source_system}</div>
+      <div class="src">${esc(rec.source_system)}</div>
       ${fields}
     </div>`;
 }
 
 function renderCandidate(c) {
-  const reasonsHtml = c.reasons.map(r => `<li>${r}</li>`).join('');
+  const reasonsHtml = c.reasons.map(r => `<li>${esc(r)}</li>`).join('');
   return `
     <div class="card" data-id="${c.candidate_id}">
       <div class="card-head">
-        <div>Possible duplicate<span class="match-type">${c.match_type}</span></div>
+        <div>Possible duplicate<span class="match-type">${esc(c.match_type)}</span></div>
         <div class="score high">${(c.score * 100).toFixed(0)}% match</div>
       </div>
       <div class="reasons">Why: <ul>${reasonsHtml}</ul></div>
@@ -329,16 +340,18 @@ async function loadEntities() {
   const entities = await fetchJSON(`/v1/${currentDomain}/entities?status=active`);
   document.getElementById('stat-entities').textContent = entities.length;
   const container = document.getElementById('entities-container');
-  const summaryFields = SUMMARY_FIELDS[currentDomain] || Object.keys(entities[0]?.attributes || {}).slice(0, 4);
+  const domainFields = (DOMAINS.find(d => d.id === currentDomain) || { fields: [] }).fields;
+  const preferred = (SUMMARY_FIELDS[currentDomain] || []).filter(f => domainFields.includes(f));
+  const summaryFields = preferred.length ? preferred : domainFields.slice(0, 4);
 
   if (entities.length === 0) {
     container.innerHTML = `<div class="empty">No ${currentDomain} golden records yet.</div>`;
     return;
   }
 
-  const headerRow = summaryFields.map(f => `<th>${f.replace(/_/g, ' ')}</th>`).join('');
+  const headerRow = summaryFields.map(f => `<th>${esc(f.replace(/_/g, ' '))}</th>`).join('');
   const rows = entities.map(e => {
-    const cells = summaryFields.map(f => `<td>${e.attributes[f] || '—'}</td>`).join('');
+    const cells = summaryFields.map(f => `<td>${esc(e.attributes[f] || '—')}</td>`).join('');
     return `<tr><td class="id">${e.entity_id.slice(0, 12)}…</td>${cells}<td>${e.source_record_ids.length}</td></tr>`;
   }).join('');
 
@@ -368,7 +381,7 @@ async function loadAll() {
 }
 
 renderTabs({});
-loadAll();
+loadDomains().then(loadAll).catch(e => showToast('Error: ' + e.message));
 setInterval(loadAll, 8000);
 </script>
 

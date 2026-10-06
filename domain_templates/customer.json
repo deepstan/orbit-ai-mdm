@@ -1,0 +1,102 @@
+{
+  "name": "customer",
+  "override": true,
+  "fields": {
+    "first_name": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "last_name": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "email": {
+      "normalize": [
+        "email"
+      ]
+    },
+    "phone": {
+      "normalize": [
+        "phone"
+      ]
+    },
+    "address_line1": {
+      "normalize": [
+        "address_line"
+      ]
+    },
+    "city": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "state": {
+      "normalize": [
+        "text",
+        "upper"
+      ]
+    },
+    "postal_code": {
+      "normalize": [
+        "postal_code"
+      ]
+    },
+    "country": {
+      "normalize": [
+        "text",
+        "upper"
+      ],
+      "default": "US"
+    }
+  },
+  "deterministic_fields": [
+    "email",
+    "phone"
+  ],
+  "fuzzy_weights": {
+    "first_name": 0.15,
+    "last_name": 0.2,
+    "address_line1": 0.2,
+    "city": 0.1,
+    "postal_code": 0.2
+  },
+  "semantic": {
+    "fields": [
+      "first_name",
+      "last_name"
+    ],
+    "weight": 0.15
+  },
+  "blocking": [
+    [
+      "last_name",
+      "postal_code"
+    ],
+    [
+      "phone"
+    ],
+    [
+      "email"
+    ],
+    [
+      "last_name",
+      "first_name"
+    ]
+  ],
+  "survivorship": {
+    "default": "most_recent",
+    "fields": {
+      "email": "most_recent",
+      "phone": "most_recent",
+      "address_line1": "most_recent",
+      "city": "most_recent",
+      "state": "most_recent",
+      "postal_code": "most_recent",
+      "country": "most_complete",
+      "first_name": "most_complete",
+      "last_name": "most_complete"
+    }
+  }
+}

@@ -56,29 +56,9 @@ class Principal:
     allowed_domains: Optional[list[str]] = field(default=None)  # None = all domains
 
     def can_access_domain(self, domain: str) -> bool:
-        """Check whether this key may work in the given domain.
-
-        Args:
-            domain: Domain name, e.g. ``"customer"``.
-
-        Returns:
-            bool: ``True`` if the key has no domain restriction
-            (``allowed_domains`` is ``None``) or the domain is in its list.
-        """
         return self.allowed_domains is None or domain in self.allowed_domains
 
     def has_permission(self, action: str) -> bool:
-        """Check whether this principal's role may perform an action.
-
-        Looks the action up in ``PERMISSIONS``. Unknown actions are denied.
-        Domain scope is NOT checked here; use ``check_permission`` to check both.
-
-        Args:
-            action: Action name, e.g. ``"ingest"``, ``"purge"``.
-
-        Returns:
-            bool: ``True`` if the role is allowed.
-        """
         return self.role in PERMISSIONS.get(action, ())
 
 
@@ -94,14 +74,7 @@ def hash_key(plaintext_key: str) -> str:
     us, never user-chosen passwords -- so a fast hash (SHA-256) is
     appropriate here, unlike for passwords, where a deliberately slow
     hash (bcrypt/argon2) matters because passwords are often
-    low-entropy and guessable. We never store the plaintext key.
-
-    Args:
-        plaintext_key: The full API key as presented by the caller.
-
-    Returns:
-        str: 64-character lowercase SHA-256 hex digest.
-    """
+    low-entropy and guessable. We never store the plaintext key."""
     return hashlib.sha256(plaintext_key.encode("utf-8")).hexdigest()
 
 
@@ -109,15 +82,7 @@ def generate_api_key() -> tuple[str, str]:
     """Returns (plaintext_key, key_hash). The plaintext is shown to the
     caller exactly once (at creation time) and never persisted -- only
     the hash is stored, so a database leak alone can't be used to
-    authenticate.
-
-    The key looks like ``"mdm_<43 random URL-safe characters>"``; the
-    ``mdm_`` prefix makes leaked keys easy to recognize (e.g. by secret
-    scanners). The key is not saved here; the caller stores the hash.
-
-    Returns:
-        tuple[str, str]: ``(plaintext_key, key_hash)``.
-    """
+    authenticate."""
     plaintext = f"mdm_{secrets.token_urlsafe(32)}"
     return plaintext, hash_key(plaintext)
 
@@ -125,21 +90,7 @@ def generate_api_key() -> tuple[str, str]:
 def check_permission(principal: Principal, action: str, domain: Optional[str] = None) -> None:
     """Raises AuthError if the principal can't perform `action` (and, if
     `domain` is given, can't perform it in that domain). Returns None
-    (doesn't raise) on success -- call it for its side effect.
-
-    The role check happens first, so a key missing the role gets the role
-    error even if the domain is also wrong.
-
-    Args:
-        principal: The authenticated caller.
-        action: Action name from ``PERMISSIONS``.
-        domain: Optional domain the action targets. If ``None``, only the
-            role is checked.
-
-    Raises:
-        AuthError: If the role lacks the permission, or the key isn't scoped
-            to ``domain``.
-    """
+    (doesn't raise) on success -- call it for its side effect."""
     if not principal.has_permission(action):
         raise AuthError(f"Role '{principal.role}' is not permitted to perform '{action}'")
     if domain is not None and not principal.can_access_domain(domain):

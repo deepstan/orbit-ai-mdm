@@ -24,18 +24,6 @@ from app.store_factory import get_store
 
 
 def cmd_create(args, store):
-    """Handle ``manage_api_keys.py create``: make a new API key and print it once.
-
-    Only the hash is saved. The plaintext key is printed to the terminal and
-    can't be retrieved later. The role check here is a second safety net;
-    argparse already limits ``--role`` to the valid roles.
-
-    Args:
-        args: Parsed arguments with ``tenant``, ``role``, ``label`` and
-            optional ``domains`` (comma-separated, e.g. ``"customer,product"``;
-            omitted means all domains). Domain names aren't validated.
-        store: Storage backend.
-    """
     if args.role not in ROLES:
         print(f"Unknown role '{args.role}'. Valid roles: {ROLES}")
         return
@@ -51,16 +39,6 @@ def cmd_create(args, store):
 
 
 def cmd_list(args, store):
-    """Handle ``manage_api_keys.py list``: print every key for a tenant.
-
-    One line per key with its ID, role, label, allowed domains and whether
-    it is active or revoked (with the revocation time). Plaintext keys are
-    never shown because they aren't stored.
-
-    Args:
-        args: Parsed arguments with ``tenant``.
-        store: Storage backend.
-    """
     keys = store.list_api_keys(args.tenant)
     if not keys:
         print(f"No API keys found for tenant '{args.tenant}'.")
@@ -72,28 +50,11 @@ def cmd_list(args, store):
 
 
 def cmd_revoke(args, store):
-    """Handle ``manage_api_keys.py revoke``: revoke one key.
-
-    Prints a success message even if no key with that ID exists for the
-    tenant, so check with ``list`` if unsure.
-
-    Args:
-        args: Parsed arguments with ``tenant`` and ``key_id``.
-        store: Storage backend.
-    """
     store.revoke_api_key(args.key_id, args.tenant, now_iso())
     print(f"Revoked key_id={args.key_id} for tenant '{args.tenant}'.")
 
 
 def main():
-    """Command-line entry point: parse arguments and run the chosen command.
-
-    Sub-commands: ``create``, ``list`` and ``revoke``. ``--db`` (before the
-    sub-command) picks the database: a SQLite path or ``postgresql://``
-    URL; otherwise ``DATABASE_URL`` or ``mdm.db``. Talks to the database
-    directly, so it works even when API authentication is on and no key
-    exists yet.
-    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default=None, help="SQLite path or postgresql:// URL (default: DATABASE_URL env or mdm.db)")
     sub = parser.add_subparsers(dest="command", required=True)

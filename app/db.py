@@ -16,119 +16,18 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent
+from .migrations import SQLiteMigrationBackend, apply_or_verify
+from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent, now_iso
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS source_records (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    source_system TEXT NOT NULL,
-    source_record_id TEXT NOT NULL,
-    attributes TEXT NOT NULL,
-    ingested_at TEXT NOT NULL,
-    entity_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS entities (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    status TEXT NOT NULL,
-    attributes TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS match_candidates (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    record_a_id TEXT NOT NULL,
-    record_b_id TEXT NOT NULL,
-    score REAL NOT NULL,
-    match_type TEXT NOT NULL,
-    reasons TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    decided_at TEXT,
-    decided_by TEXT
-);
-
-CREATE TABLE IF NOT EXISTS lineage (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    field TEXT NOT NULL,
-    old_value TEXT,
-    new_value TEXT,
-    source_record_id TEXT,
-    reason TEXT NOT NULL,
-    changed_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS blocking_keys (
-    tenant_id TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    blocking_key TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS api_keys (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    key_hash TEXT NOT NULL UNIQUE,
-    label TEXT NOT NULL,
-    allowed_domains TEXT,
-    created_at TEXT NOT NULL,
-    revoked_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT,
-    action TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    details TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS usage_events (
-    id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    domain TEXT,
-    event_type TEXT NOT NULL,
-    quantity INTEGER NOT NULL,
-    metadata TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_records_entity ON source_records(tenant_id, domain, entity_id);
-CREATE INDEX IF NOT EXISTS idx_source_records_scope ON source_records(tenant_id, domain);
-CREATE INDEX IF NOT EXISTS idx_entities_scope ON entities(tenant_id, domain);
-CREATE INDEX IF NOT EXISTS idx_match_candidates_scope_status ON match_candidates(tenant_id, domain, status);
-CREATE INDEX IF NOT EXISTS idx_lineage_scope_entity ON lineage(tenant_id, domain, entity_id);
-CREATE INDEX IF NOT EXISTS idx_blocking_keys_lookup ON blocking_keys(tenant_id, domain, blocking_key);
-CREATE INDEX IF NOT EXISTS idx_blocking_keys_record ON blocking_keys(tenant_id, domain, record_id);
-CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
-CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log(tenant_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_usage_events_tenant ON usage_events(tenant_id, created_at);
-"""
 
 
 class Store:
-    def __init__(self, path: str = "mdm.db"):
+    def __init__(self, path: str = "mdm.db", auto_migrate: bool | None = None):
         self.path = path
         parent = Path(path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self._init_schema(auto_migrate)
 
     @contextmanager
     def _conn(self):
@@ -140,9 +39,12 @@ class Store:
         finally:
             conn.close()
 
-    def _init_schema(self):
-        with self._conn() as conn:
-            conn.executescript(SCHEMA)
+    def _init_schema(self, auto_migrate: bool | None = None) -> None:
+        """The schema is owned by app/migrations (versioned, upgradable).
+        By default this brings the database up to date; with
+        MDM_AUTO_MIGRATE=false (or auto_migrate=False) it only verifies
+        that it already is, and refuses to start otherwise."""
+        apply_or_verify(SQLiteMigrationBackend(self.path), auto_migrate)
 
     # --- source records -----------------------------------------------
     def save_source_record(self, rec: SourceRecord) -> None:
@@ -525,3 +427,55 @@ class Store:
             )
             for r in rows
         ]
+
+    # --- Blocking-index state and reindexing (see app/indexing.py) --------
+    def get_index_state(self, domain: str):
+        """(fingerprint, status) of a domain's blocking index, or None if never recorded."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT fingerprint, status FROM blocking_index_state WHERE domain = ?", (domain,)
+            ).fetchone()
+        return (row["fingerprint"], row["status"]) if row else None
+
+    def set_index_state(self, domain: str, fingerprint: str, status: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO blocking_index_state (domain, fingerprint, status, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(domain) DO UPDATE SET fingerprint = excluded.fingerprint, "
+                "status = excluded.status, updated_at = excluded.updated_at",
+                (domain, fingerprint, status, now_iso()),
+            )
+
+    def domain_has_index_entries(self, domain: str) -> bool:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM blocking_keys WHERE domain = ? LIMIT 1", (domain,)
+            ).fetchone() is not None
+
+    def count_source_records(self, domain: str) -> int:
+        """All tenants: domain configuration is deployment-wide."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM source_records WHERE domain = ?", (domain,)
+            ).fetchone()["n"]
+
+    def list_source_records_page(self, domain: str, after_id: str, limit: int) -> list[SourceRecord]:
+        """Keyset-paginated, across ALL tenants, for reindexing."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM source_records WHERE domain = ? AND id > ? ORDER BY id LIMIT ?",
+                (domain, after_id, limit),
+            ).fetchall()
+        return [self._row_to_source_record(r) for r in rows]
+
+    def replace_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]]) -> None:
+        """entries: [(tenant_id, domain, record_id, keys), ...]. Swaps each
+        record's keys for the new set; the whole batch is one transaction,
+        so a record is never left half-indexed."""
+        deletes = [(t, d, rid) for t, d, rid, _ in entries]
+        inserts = [(t, d, rid, k) for t, d, rid, keys in entries for k in keys]
+        with self._conn() as conn:
+            conn.executemany(
+                "DELETE FROM blocking_keys WHERE tenant_id = ? AND domain = ? AND record_id = ?", deletes)
+            conn.executemany(
+                "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (?, ?, ?, ?)", inserts)

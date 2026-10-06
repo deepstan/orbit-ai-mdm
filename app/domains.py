@@ -16,7 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .models import CUSTOMER_SCHEMA_FIELDS, PRODUCT_SCHEMA_FIELDS, VENDOR_SCHEMA_FIELDS
-from .standardize import standardize_customer, standardize_product, standardize_vendor
+from .normalizers import FieldSpec
+from .standardize import STANDARDIZERS, standardize_customer, standardize_product, standardize_vendor
 from .survivorship import FieldStrategy
 
 
@@ -51,6 +52,16 @@ class DomainConfig:
     # survivorship.FIELD_STRATEGIES, just scoped per domain now.
     field_strategies: dict[str, FieldStrategy] = field(default_factory=dict)
     default_strategy: FieldStrategy = "most_recent"
+
+    # Declarative description of how each field is standardized (see
+    # app/normalizers.py). For a customer-defined domain this IS the
+    # standardizer. For the built-ins it describes their Python
+    # standardizer, and a test proves the two agree. It feeds the blocking
+    # fingerprint in app/indexing.py.
+    field_specs: dict = field(default_factory=dict)
+    source: str = "builtin"      # "builtin", or the config file it was loaded from
+    description: str = ""
+    override: bool = False        # only meaningful on a loaded config: replaces a built-in
 
 
 CUSTOMER_CONFIG = DomainConfig(
@@ -149,30 +160,62 @@ VENDOR_CONFIG = DomainConfig(
     },
 )
 
-REGISTRY: dict[str, DomainConfig] = {
+def _spec(*steps, default=None) -> FieldSpec:
+    return FieldSpec(tuple(steps), default)
+
+
+# How each built-in standardizer is built from the vocabulary in
+# app/normalizers.py. tests/test_domain_config.py proves these reproduce
+# standardize_customer/product/vendor exactly, so they can't silently drift.
+CUSTOMER_CONFIG.field_specs = {
+    "first_name": _spec("name"), "last_name": _spec("name"), "email": _spec("email"),
+    "phone": _spec("phone"), "address_line1": _spec("address_line"), "city": _spec("name"),
+    "state": _spec("text", "upper"), "postal_code": _spec("postal_code"),
+    "country": _spec("text", "upper", default="US"),
+}
+PRODUCT_CONFIG.field_specs = {
+    "sku": _spec("identifier"), "upc": _spec("identifier"), "product_name": _spec("product_name"),
+    "brand": _spec("name"), "category": _spec("name"), "description": _spec("lower"), "price": _spec("text"),
+}
+VENDOR_CONFIG.field_specs = {
+    "company_name": _spec("name"), "tax_id": _spec("alnum_id"), "duns_number": _spec("identifier"),
+    "contact_email": _spec("email"), "contact_phone": _spec("phone"), "address_line1": _spec("address_line"),
+    "city": _spec("name"), "state": _spec("text", "upper"), "postal_code": _spec("postal_code"),
+    "country": _spec("text", "upper", default="US"),
+}
+
+# The shipped domains. Never mutated; REGISTRY below is the live, editable view.
+BUILTIN_DOMAINS: dict[str, DomainConfig] = {
     "customer": CUSTOMER_CONFIG,
     "product": PRODUCT_CONFIG,
     "vendor": VENDOR_CONFIG,
 }
 
+# Live registry: the built-ins plus whatever app/domain_config.py loads from
+# customer config files (which may also replace a built-in, explicitly).
+REGISTRY: dict[str, DomainConfig] = dict(BUILTIN_DOMAINS)
+
+
+def register_domain(config: DomainConfig, replace: bool = False) -> None:
+    """Adds a domain to the live registry and to the standardizer dispatch
+    that pipeline.py and active_learning.py use."""
+    if config.name in REGISTRY and not replace:
+        raise KeyError(f"Domain '{config.name}' is already defined")
+    REGISTRY[config.name] = config
+    STANDARDIZERS[config.name] = config.standardizer
+
+
+def reset_registry() -> None:
+    """Back to the built-in domains only (tests; domain_config.reset())."""
+    for name in [n for n in REGISTRY if n not in BUILTIN_DOMAINS]:
+        del REGISTRY[name]
+        STANDARDIZERS.pop(name, None)
+    for name, cfg in BUILTIN_DOMAINS.items():
+        REGISTRY[name] = cfg
+        STANDARDIZERS[name] = cfg.standardizer
+
 
 def get_domain_config(domain: str) -> DomainConfig:
-    """Look up the configuration for a domain by name.
-
-    The config bundles everything domain-specific: schema fields,
-    standardizer, deterministic identity fields, fuzzy weights, semantic
-    fields, blocking groups and survivorship strategies.
-
-    Args:
-        domain: Domain name: ``"customer"``, ``"product"`` or ``"vendor"``.
-
-    Returns:
-        DomainConfig: The registered configuration for that domain.
-
-    Raises:
-        KeyError: If the domain isn't in ``REGISTRY``. The message lists the
-            known domains.
-    """
     try:
         return REGISTRY[domain]
     except KeyError:

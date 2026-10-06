@@ -161,6 +161,49 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertIsNotNone(entity)
         self.assertEqual(entity.attributes["last_name"], "AfterRLS")
 
+    def test_migrations_are_applied_and_json_columns_are_jsonb(self):
+        """PostgresStore() has already run the migrations in setUp. Confirms
+        the history is recorded, nothing is pending, and migration 004's
+        TEXT -> JSONB conversion actually took effect on a real server --
+        the one thing the mocked tests in test_migrations.py can't show."""
+        from app.migrations import PostgresMigrationBackend, get_status
+        self.assertTrue(get_status(PostgresMigrationBackend(TEST_DB_URL)).ok)
+        with self.store._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name, column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND (table_name, column_name) IN "
+                "(('source_records','attributes'), ('entities','attributes'), ('match_candidates','reasons'), "
+                "('audit_log','details'), ('usage_events','metadata'), ('api_keys','allowed_domains'))")
+            types = {(r["table_name"], r["column_name"]): r["data_type"] for r in cur.fetchall()}
+        self.assertEqual(len(types), 6)
+        self.assertEqual(set(types.values()), {"jsonb"})
+
+    def test_index_state_and_reindex_primitives_work_on_postgres(self):
+        """The Postgres side of customer-defined domains: the index-state upsert, and swapping a
+        record's blocking keys. Uses a throwaway domain name with raw store calls, so no registry
+        setup is needed."""
+        domain = f"pgdomain_{os.getpid()}"
+
+        def cleanup():
+            with self.store._conn() as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM blocking_index_state WHERE domain = %s", (domain,))
+                cur.execute("DELETE FROM blocking_keys WHERE domain = %s", (domain,))
+        self.addCleanup(cleanup)
+
+        self.assertIsNone(self.store.get_index_state(domain))
+        self.store.set_index_state(domain, "fp1", "ready")
+        self.assertEqual(self.store.get_index_state(domain), ("fp1", "ready"))
+        self.store.set_index_state(domain, "fp2", "reindexing")  # must upsert, not raise a duplicate-key error
+        self.assertEqual(self.store.get_index_state(domain), ("fp2", "reindexing"))
+
+        self.store.replace_blocking_keys_batch([(self.tenant, domain, "rec1", {"k1", "k2"})])
+        self.assertTrue(self.store.domain_has_index_entries(domain))
+        self.store.replace_blocking_keys_batch([(self.tenant, domain, "rec1", {"k3"})])
+        self.assertEqual(self.store.find_candidate_record_ids(self.tenant, domain, {"k1"}, exclude_record_id="x"), set())
+        self.assertEqual(self.store.find_candidate_record_ids(self.tenant, domain, {"k3"}, exclude_record_id="x"), {"rec1"})
+        self.assertEqual(self.store.count_source_records(domain), 0)
+        self.assertEqual(self.store.list_source_records_page(domain, "", 10), [])
+
     def test_purge_works_on_postgres(self):
         from app.compliance import purge_entity
         from app.pipeline import ingest_record

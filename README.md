@@ -38,11 +38,17 @@ forgotten, usage metering, and a connector interface** on top.
 | LLM adjudication integration logic | ✅ Fully tested (API call itself mocked) |
 | LLM adjudication **real API call** | ⚠️ Not tested — no network here |
 | **FastAPI HTTP layer, including auth wiring** | ⚠️ **Not tested** — FastAPI isn't installable in this sandbox. The RBAC/audit/billing *logic* is tested directly (bypassing HTTP); the `api.py` wiring that calls it has not been run |
+| **Schema migrations — SQLite** | ✅ Fully tested (fresh, legacy adoption, backfill, rollback, tamper detection, concurrency) |
+| **Schema migrations — Postgres** | ⚠️ Control flow verified against a fake psycopg2; the SQL itself has not run on a live server |
+| **Customer-defined domains** (config, validation, registry) | ✅ Fully tested; the built-ins are expressible in the same format with proven-identical output |
+| **Stale-index guard + reindex job** (SQLite) | ✅ Fully tested (interruption, multi-tenant, upgrading old databases); the tests were checked by breaking the logic 8 ways |
+| Stale-index guard / reindex SQL (Postgres) | ⚠️ Written, never run on a live server — covered by `test_postgres_backend.py` when `TEST_DATABASE_URL` is set |
+| Console UI: output escaping, dynamic domain tabs | ✅ Escaping tested in Node against hostile input · ⚠️ not exercised in a real browser |
 | Postgres backend (incl. Phase 3 tables) | ⚠️ Written, not run — see the Postgres section |
 | **Row-Level Security (RLS)** | ⚠️⚠️ **The least-verified piece in this project** — SQL generation and the `SET LOCAL` mechanism are tested; actual cross-tenant denial by a live Postgres server has NOT been confirmed. See the RLS section — this needs two real database roles to validate meaningfully, which no mock can substitute for |
 | **Salesforce / Shopify connectors** | ❌ **Not implemented** — scaffolds only. Real integrations need live API credentials this sandbox can't reach; unlike the LLM/Postgres code, there's no stable public contract to write against without a real account, so nothing was written to "validate later" here |
 
-Run `python3 -m unittest discover -s tests -v` — 66 tests pass, 11 skip (Postgres-only).
+Run `python3 -m unittest discover -s tests -v` — 147 tests pass, 13 skip (Postgres-only).
 
 ## Setup
 
@@ -194,6 +200,96 @@ genuinely shares the same blocking key, no index changes how many rows
 match that key. Real-world data (more distinct names/addresses) looks
 like the first table, not the second.
 
+## Customer-defined domains
+
+A domain is described by a config file, not code. You can define a new one (Location, Policy, Claim, ...) or change a built-in, with **no code change and no database change** — records are stored as JSON and every table is keyed by a `domain` string.
+
+```yaml
+# domains/location.yaml   (JSON works too; YAML needs `pip install pyyaml`)
+name: location
+fields:                                   # every field, and how it's standardized
+  location_code: identifier               # shorthand for one step
+  name: name
+  postal_code: postal_code
+  state: [text, upper]                    # steps run in order
+  country: {normalize: [text, upper], default: US}
+deterministic_fields: [location_code]     # exact match on any of these = same record
+fuzzy_weights: {name: 0.4, postal_code: 0.3}
+semantic: {fields: [name], weight: 0.3}   # meaning-based similarity
+blocking: [[location_code], [postal_code, name]]   # how candidate pairs are found
+survivorship: {default: most_recent, fields: {name: most_complete}}
+```
+
+`domain_templates/` has a fully commented example (`location.yaml`) and the three built-ins as editable JSON. Files go in `./domains` or `$MDM_DOMAINS_DIR`, are read **at startup** (restart after editing), and an invalid file stops startup with every problem listed — never a half-applied set.
+
+```bash
+python3 domains_cli.py validate           # check config; reports every problem at once, suggests fixes for typos
+python3 domains_cli.py list               # every domain served, and where each came from
+python3 domains_cli.py export customer > domains/customer.json   # dump a built-in to edit (override already set)
+python3 domains_cli.py normalizers        # the standardization steps a config may use
+python3 domains_cli.py status             # is each domain's blocking index current?
+python3 domains_cli.py reindex location   # rebuild one after a config change
+```
+
+**Standardization is a fixed vocabulary of 12 steps**, not code (`app/normalizers.py`) — a config file that could run code would be a security hole. They are the same functions the built-in standardizers are made of, and a test proves the three built-in domains are expressible in this format with byte-identical output, so a custom domain behaves exactly like a built-in one for the same step.
+
+**Changing a built-in** needs `"override": true` (the `export` output has it); without it the file is rejected, so a typo can't silently replace `customer`. Copying a template *unchanged* changes nothing and needs no reindex.
+
+### Why a reindex exists, and why you can't forget it
+
+Candidate lookup trusts the blocking keys stored when each record was ingested. If an edit changes what those keys *would be*, the stored ones are stale and lookups quietly miss real duplicates — nothing errors. So instead of relying on someone remembering, each domain's index records a **fingerprint** of the configuration it was built under, and every ingest checks it. On a mismatch, ingestion into that domain stops (`IndexStaleError`; HTTP **409** from the API; a clear message from `bulk_ingest.py`) until `domains_cli.py reindex <domain>` runs.
+
+| You change | Reindex needed? |
+|---|---|
+| `blocking` groups | **Yes** |
+| How a field *used in blocking* is standardized | **Yes** |
+| The blocking key layout in `matching.py` (prefix length / format) | **Yes** — detected automatically |
+| Fuzzy weights, semantic settings, deterministic fields, survivorship | No — take effect on restart |
+| Standardization of a field *not* used in blocking | No |
+
+A reindex pauses ingestion into that domain while it runs, and **stays paused if interrupted** so a half-rebuilt index can never be used; re-run it to finish. Existing databases upgrade cleanly: migration 006 stamps the built-in fingerprint on domains that already hold data, so upgrading doesn't force a pointless reindex — but an override already in place at upgrade time is correctly flagged stale.
+
+### What this does NOT do (read before relying on it)
+
+- **A reindex rebuilds the candidate index only. It does not re-run matching over existing records.** Matching is incremental — each record is compared once, when it arrives — so duplicates your new rules would have caught earlier stay unmerged until a new record matches them. Re-resolving history is a separate job and isn't built.
+- **Existing golden records aren't rebuilt** when you change survivorship or add fields; each updates the next time that entity changes.
+- **Config is deployment-wide, not per-tenant.** Every tenant shares one definition of each domain.
+- **The validator catches structural mistakes, not bad matching design.** It can't tell that your blocking fields are too common (huge candidate sets) or too rare (misses everything) — that takes real data. Try changes on a copy first.
+- Under Postgres row-level security with `FORCE`, run `reindex` as a role that bypasses it: with no tenant set it would see no rows and report a successful, empty reindex.
+
+**What's verified:** parsing/validation, the registry, built-in equivalence, the guard, and the reindex job are fully tested on SQLite (57 tests, plus the end-to-end `edit config → status → reindex → ingest` flow through the real CLIs), and I confirmed the tests can fail by breaking the logic eight ways. **Not verified:** the new Postgres statements (index-state upsert, key swap) have never run on a live server — `tests/test_postgres_backend.py` covers them when `TEST_DATABASE_URL` is set. The `api.py` changes were exercised only with a stubbed FastAPI. The console's JavaScript was syntax-checked and tested in Node against hostile input, not in a real browser.
+
+**Security fix in the same change:** the stewardship console previously inserted ingested values, field names, source names and match reasons into the page unescaped — a stored XSS (a record containing `<img src=x onerror=…>` would run in a steward's browser). It now escapes everything that comes from data; `tests/test_ui_escaping.py` runs the real script against hostile input, and fails on the previous version.
+
+## Schema migrations
+
+The database schema is owned by `app/migrations/` — a numbered, **append-only** history of changes. The app brings its database up to date on startup, **preserving existing data**. This replaces the old "`CREATE TABLE IF NOT EXISTS` on every start" approach, which could never change a table that already existed (a database from an older release silently kept its old structure — that is the `no such column: domain` error — and the only fix was deleting it).
+
+```bash
+python3 migrate.py status                  # what's applied, what's pending (exit 1 if not current)
+python3 migrate.py upgrade --dry-run       # print the SQL that would run, change nothing
+python3 migrate.py upgrade                 # apply pending migrations
+```
+
+**Guarantees** (each one is covered by a test in `tests/test_migrations.py`):
+
+- **Atomic.** Each migration — its SQL, its optional Python data step, and the row recording it — commits as one transaction. A failure partway leaves the database exactly as it was.
+- **One at a time.** A Postgres advisory lock (SQLite: `BEGIN IMMEDIATE`) means two app instances starting together can't both apply the same migration.
+- **Tamper-evident history.** Each applied migration's checksum is stored; editing a shipped migration makes startup refuse with a clear message. The shipped checksums are also pinned in the test suite, so an accidental edit fails CI before it ships.
+- **Fail-fast on "database newer than code"** (e.g. rolling back the app without the database).
+- **No DDL when already current.** An up-to-date database starts with no schema changes at all, so an app role without CREATE/ALTER privileges can still boot.
+- **Forward-only, on purpose.** There are no "down" migrations; rolling back means restoring a backup.
+
+**Adopting databases created before this system existed.** The migrations are idempotent, so a database built by the multi-tenant/multi-domain-era code is adopted as-is and its data kept. Migration 005 backfills blocking keys for records that predate the index — without it, new records could never match those old ones. A database from *before* multi-tenant/multi-domain support (no `tenant_id`/`domain` columns) can't be upgraded by guessing values; it's refused with an explanation, and nothing is changed. Recreate it.
+
+**Production pattern (least privilege).** Run `migrate.py upgrade` as the schema owner, then start the app with `MDM_AUTO_MIGRATE=false` under a restricted role. In that mode the app only *verifies* the schema is current and refuses to start otherwise — it never alters the schema itself.
+
+**Adding a migration:** append a `Migration(...)` to `MIGRATIONS` in `app/migrations/versions.py` (instructions are in that file's docstring), then pin its checksums in `test_shipped_platform_migrations_are_frozen`. Never edit or renumber one that has shipped. The tracking table is keyed by `(namespace, version)`, so a second, independently versioned list (e.g. customer extensions) can share the runner later; only the `platform` namespace exists today.
+
+**What's verified, and what isn't.** SQLite is fully tested: fresh install, adopting a legacy database with data intact, the backfill, rollback, tamper detection, check-only mode, and 6 threads racing to start on a fresh database (repeated across 6 databases per run). The tests were checked by deliberately breaking the runner four ways to confirm each break is caught. **Postgres SQL has never been executed:** the control flow (lock → one transaction per migration → unlock, placeholder translation, no lock or DDL when current) is verified against a fake `psycopg2`, and the Postgres statements match the old schema text exactly — but the `DO $$` blocks, the advisory lock, and the `information_schema` queries have not run against a live server. To validate: `python3 migrate.py upgrade` against a scratch database, then `psql -c "\d source_records"` (`attributes` should be `jsonb`); `tests/test_postgres_backend.py` also checks this when `TEST_DATABASE_URL` is set.
+
+**Upgrading an existing Postgres database** created before JSONB support: migration 004 converts six columns (a table rewrite) on first start. It is atomic — if any value isn't valid JSON it rolls back and changes nothing — but **take a `pg_dump` first**. Afterwards, `GET /v1/admin/audit-log` should still report `chain_valid: true`; the chain hashes the parsed, key-sorted JSON, so the conversion shouldn't affect it (audit details hold strings, integers and booleans), but that is reasoned, not verified on a live server. If Postgres row-level security is enabled with `FORCE`, run migrations as a role that bypasses it: under RLS with no tenant set, the backfill would see zero rows and silently do nothing.
+
 ## Postgres (optional — SQLite is the default)
 
 ```bash
@@ -328,6 +424,7 @@ afterward — your real `mdm.db` is never touched.
 
 ## Known gaps / honest limitations (cumulative)
 
+- **Resolved this round:** customer-editable domain config with a stale-index guard and reindex job; and an XSS hole in the console. **Still open on this track:** a re-match pass to re-resolve existing records under new rules, and rebuilding existing golden records after a survivorship change (see *What this does NOT do* above).
 - **Resolved this round:** bulk write batching (`ingest_batch`, with a real correctness bug caught and fixed along the way), JSONB storage for Postgres, and RLS policies as a second isolation layer.
 - **Resolved earlier:** the O(n²) full-table-rescan-per-ingest problem (indexed blocking table) and the Postgres per-query-connection bug (persistent connection + RLock) — both real, measured problems, not theoretical.
 - **RLS is applied but not security-validated** — see the RLS section above. This is genuinely different from "written but not run" (true of several other pieces here): RLS's actual guarantee can only be confirmed against a live server with two real database roles, which no amount of mocking substitutes for. Treat it as "the mechanism is in place," not "cross-tenant isolation is confirmed at the database level," until you've run the manual two-role check yourself.
@@ -337,7 +434,7 @@ afterward — your real `mdm.db` is never touched.
 - Active learning has no train/test split or drift monitoring, and doesn't get retroactively updated when its training data is later purged (right-to-be-forgotten deletes the source records, but a model already trained on them keeps their influence in its weights until the next retrain happens to exclude them).
 - `EMBEDDING_PROVIDER=sentence_transformers`, `ENABLE_LLM_ADJUDICATION=true`, Postgres, and the full `api.py` HTTP layer are real code paths never run against live network/services in this sandbox.
 - No connection pooling for Postgres — the single persistent connection (see the connection-reuse fix) serializes all DB access within one process via a lock; fine for an MVP's request volume, not for high concurrent throughput.
-- No schema migration system — every schema change only applies to a freshly created database; an existing database from before the change needs to be manually dropped and recreated.
+- Schema migrations are forward-only (no down-migrations), and their Postgres SQL has not been executed against a live server — see the Schema migrations section. The backfill (005) runs in one transaction, which is long on a very large table.
 - N+1 query patterns remain in a few places (e.g. `list_entities()` calling `get_entity()` once per row) — not addressed this round.
 - LLM adjudication calls aren't separately usage-metered yet.
 - Purge doesn't clean up dangling references in other entities' lineage history.
@@ -349,7 +446,7 @@ afterward — your real `mdm.db` is never touched.
 1. **Validate RLS for real** — the two-role, live-server security check described in the RLS section. This is now the single highest-value validation gap in the whole project, more so than the other ⚠️ items, since it's the one where a mock genuinely cannot substitute for a real check.
 2. Validate the rest of what's flagged ⚠️/❌ above (real LLM calls, Postgres end-to-end, the FastAPI layer itself).
 3. Connection pooling for Postgres, if concurrent request volume becomes real.
-4. A schema migration system (even a simple versioned-scripts approach) — the recurring "drop and recreate the database after a schema change" friction is worth solving properly.
+4. ~~Schema migrations~~ and ~~customer-editable domain config + reindex~~ — done. Next: run `migrate.py upgrade` and the Postgres tests against a real Postgres; a re-match pass that re-resolves existing records after a config change; a Dockerfile / one-command deployment; a least-privilege role split with append-only grants on `audit_log`.
 5. Real Stripe billing integration.
 6. A real Salesforce or Shopify connector, built against an actual account.
 7. Extend usage metering to LLM adjudication calls.

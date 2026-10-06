@@ -13,11 +13,14 @@ data yet and leaves any existing model untouched.
 import argparse
 
 from app.active_learning import MIN_TRAINING_EXAMPLES, build_training_set, feature_names, retrain
+from app.domain_config import DomainConfigError, load_configured_domains
 from app.domains import REGISTRY, get_domain_config
+from app.indexing import IndexStaleError
 from app.store_factory import get_store
 
 
 def main():
+    load_configured_domains()  # custom domains must exist before the --domain choices are built
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant", default="default", help="Tenant ID to retrain (default: 'default')")
     parser.add_argument("--domain", default="customer", choices=list(REGISTRY),
@@ -52,4 +55,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (DomainConfigError, IndexStaleError) as e:
+        print(f"\nError: {e}", file=__import__("sys").stderr)
+        raise SystemExit(2)

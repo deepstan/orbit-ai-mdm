@@ -42,13 +42,7 @@ class BaseConnector(ABC):
         """Yields (source_record_id, attributes) pairs. A generator, not
         a list -- so a connector pulling from a large or paginated
         source can stream records rather than loading everything into
-        memory first.
-
-        Returns:
-            Iterator[tuple[str, dict]]: ``(source_record_id, attributes)``
-            pairs, where ``attributes`` already uses the domain's canonical
-            field names.
-        """
+        memory first."""
 
 
 class CSVConnector(BaseConnector):
@@ -60,22 +54,15 @@ class CSVConnector(BaseConnector):
 
     def __init__(self, csv_path: str, field_mapping: dict[str, str],
                  source_record_id_column: str | None = None, source_system: str = "csv_import"):
-        """Configure a CSV import.
-
-        Args:
-            csv_path: Path to the CSV file. Read as UTF-8; the first row must be
-                the header.
-            field_mapping: ``{csv_column_name: canonical_field_name}``, e.g.
-                ``{"Email Address": "email", "First": "first_name"}``. Only
-                mapped columns are imported.
-            source_record_id_column: CSV column to use as the stable
-                ``source_record_id``. If omitted, the data row number (1 for the
-                first row after the header) is used. That's fine for a one-off
-                import, but a recurring feed should give a real stable ID column
-                so re-running the import doesn't create duplicate source
-                records.
-            source_system: Name recorded as the records' source system.
-                Defaults to ``"csv_import"``.
+        """
+        csv_path: path to the CSV file.
+        field_mapping: {csv_column_name: canonical_field_name}, e.g.
+            {"Email Address": "email", "First": "first_name"}
+        source_record_id_column: which CSV column to use as the stable
+            source_record_id. If omitted, uses the row's 1-based line
+            number -- fine for a one-off import, but a real recurring
+            feed should supply a real stable ID column so re-running the
+            import doesn't create duplicate source records.
         """
         self.csv_path = csv_path
         self.field_mapping = field_mapping
@@ -83,22 +70,6 @@ class CSVConnector(BaseConnector):
         self.source_system = source_system
 
     def fetch_records(self) -> Iterator[tuple[str, dict]]:
-        """Read the CSV file and yield one mapped record per row.
-
-        Each mapped column's value is trimmed of surrounding whitespace. A
-        mapped column that doesn't exist in the file gives ``""``. The file is
-        read lazily, row by row, as the generator is consumed.
-
-        Yields:
-            tuple[str, dict]: ``(source_record_id, attributes)`` for each row.
-
-        Raises:
-            FileNotFoundError: If ``csv_path`` doesn't exist (raised when
-                iteration starts, not when the connector is created).
-            KeyError: If ``source_record_id_column`` isn't a column in the file.
-            AttributeError: If a row has fewer cells than the header and a
-                mapped column is missing from that row.
-        """
         path = Path(self.csv_path)
         if not path.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
@@ -169,24 +140,11 @@ class JSONConnector(BaseConnector):
                 attributes[canonical_field] = str(value).strip() if value is not None else ""
             yield record_id, attributes
 
+
 def ingest_from_connector(store, tenant_id: str, domain: str, connector: BaseConnector) -> list[dict]:
     """Convenience wrapper: pulls every record from a connector and runs
     it through the normal ingest pipeline. Returns the list of
-    ingest_record() results, one per record.
-
-    Records are ingested one at a time, in order; each one can match
-    records ingested earlier in the same run. If one record fails, the
-    exception stops the import and records already ingested stay saved.
-
-    Args:
-        store: Storage backend.
-        tenant_id: Tenant to ingest into.
-        domain: Domain of the records.
-        connector: Any ``BaseConnector`` implementation.
-
-    Returns:
-        list[dict]: One ``ingest_record`` result per record.
-    """
+    ingest_record() results, one per record."""
     from .pipeline import ingest_record  # local import avoids a module-load-order cycle
 
     results = []
@@ -208,13 +166,6 @@ class SalesforceConnectorStub(BaseConnector):
     source_system = "salesforce"
 
     def __init__(self, *_args, **_kwargs):
-        """Always raises: this is a placeholder for a future Salesforce connector.
-
-        Raises:
-            NotImplementedError: Always, with a note on what a real
-                implementation needs (a Salesforce org, OAuth credentials and a
-                client library).
-        """
         raise NotImplementedError(
             "Real Salesforce integration needs a live Salesforce account, OAuth credentials, "
             "and the simple-salesforce (or similar) library. This class documents the shape "
@@ -223,11 +174,6 @@ class SalesforceConnectorStub(BaseConnector):
         )
 
     def fetch_records(self):
-        """Not implemented; the connector can't be created in the first place.
-
-        Raises:
-            NotImplementedError: Always.
-        """
         raise NotImplementedError
 
 
@@ -235,13 +181,6 @@ class ShopifyConnectorStub(BaseConnector):
     source_system = "shopify"
 
     def __init__(self, *_args, **_kwargs):
-        """Always raises: this is a placeholder for a future Shopify connector.
-
-        Raises:
-            NotImplementedError: Always, with a note on what a real
-                implementation needs (an Admin API access token and network
-                access to the store).
-        """
         raise NotImplementedError(
             "Real Shopify integration needs a live store's Admin API access token and network "
             "access to https://<store>.myshopify.com/admin/api/... -- same shape as CSVConnector "
@@ -249,9 +188,4 @@ class ShopifyConnectorStub(BaseConnector):
         )
 
     def fetch_records(self):
-        """Not implemented; the connector can't be created in the first place.
-
-        Raises:
-            NotImplementedError: Always.
-        """
         raise NotImplementedError

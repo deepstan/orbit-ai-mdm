@@ -44,34 +44,7 @@ def purge_entity(store: Store, tenant_id: str, domain: str, entity_id: str, requ
     """Permanently deletes a golden record and all of its source records.
     Logs the purge itself to the audit trail (the fact of erasure is
     retained even though the erased data is not). Raises ValueError if
-    the entity doesn't exist for this (tenant, domain).
-
-    What is removed: the entity row and every source record linked to it.
-
-    What is NOT removed:
-
-    - Lineage events for this entity. They are only counted, and that count
-      is returned as ``lineage_events_deleted`` even though nothing is
-      deleted. Lineage rows store old and new field values, so personal
-      data (names, emails...) remains in the ``lineage`` table after a
-      purge.
-    - Match candidates that point at the purged records (counted as
-      ``match_candidates_affected``).
-    - Learned model weights (they contain no per-record data).
-
-    Args:
-        store: Storage backend.
-        tenant_id: Tenant that owns the entity.
-        domain: Domain of the entity.
-        entity_id: The golden record to erase.
-        requested_by: Who asked for the erasure; recorded as the audit actor.
-
-    Returns:
-        PurgeResult: Counts of what was deleted or affected.
-
-    Raises:
-        ValueError: If the entity doesn't exist in this tenant and domain.
-    """
+    the entity doesn't exist for this (tenant, domain)."""
     entity = store.get_entity(entity_id, tenant_id, domain)
     if not entity:
         raise ValueError(f"No such entity '{entity_id}' for tenant '{tenant_id}' domain '{domain}'")
@@ -91,6 +64,7 @@ def purge_entity(store: Store, tenant_id: str, domain: str, entity_id: str, requ
     ]
 
     for rec in source_records:
+        store.delete_blocking_keys(rec.id, tenant_id, domain)
         store.delete_source_record(rec.id, tenant_id, domain)
     store.delete_entity(entity_id, tenant_id, domain)
 

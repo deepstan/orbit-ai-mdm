@@ -10,3 +10,6 @@ pydantic>=2.6
 # Optional (Phase 2): only needed if you set DATABASE_URL to a postgresql://
 # connection string instead of using the default SQLite backend.
 #   psycopg2-binary>=2.9
+
+# Optional: only needed for .yaml domain config files (JSON config works without it).
+#   pyyaml>=6.0

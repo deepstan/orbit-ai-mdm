@@ -1,0 +1,50 @@
+# A brand-new domain, defined entirely by this file: no code, no database change.
+# To use it, copy it into your config directory (./domains, or $MDM_DOMAINS_DIR) and
+# restart the app. Check it first with:  python3 domains_cli.py validate domain_templates/location.yaml
+name: location
+description: A physical site (warehouse, store, office).
+
+# Every field a record of this domain has, and how each is standardized before matching.
+# A bare name is shorthand for one step; a list runs the steps in order; an object adds a default.
+# See all the available steps with:  python3 domains_cli.py normalizers
+fields:
+  location_code: identifier
+  name: name
+  address_line1: address_line
+  city: name
+  state: [text, upper]
+  postal_code: postal_code
+  country:
+    normalize: [text, upper]
+    default: US                # used when the value is empty
+
+# An exact match (after standardization) on any of these means "same site", no scoring needed.
+deterministic_fields: [location_code]
+
+# Everything else is scored by similarity. Only the relative sizes of these matter.
+fuzzy_weights:
+  name: 0.25
+  address_line1: 0.30
+  city: 0.10
+  postal_code: 0.25
+
+# Meaning-based similarity over these fields (catches "Main St Depot" vs "Main Street Warehouse").
+semantic:
+  fields: [name]
+  weight: 0.10
+
+# How candidate pairs are FOUND (scoring only ever sees the candidates this finds, so it has to be
+# generous). Each group is one lookup key: the first 3 characters of each field in a multi-field
+# group, or the whole value of a single-field group. Changing this, or how a field used here is
+# standardized, changes what is stored in the index -- run `domains_cli.py reindex location` after.
+blocking:
+  - [location_code]
+  - [postal_code, name]
+  - [city, name]
+
+# Which source wins when records for the same site disagree.
+survivorship:
+  default: most_recent
+  fields:
+    name: most_complete
+    country: most_complete

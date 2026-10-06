@@ -36,7 +36,9 @@ import sys
 import time
 
 from app.connectors import CSVConnector, JSONConnector
+from app.domain_config import DomainConfigError, load_configured_domains
 from app.domains import REGISTRY
+from app.indexing import IndexStaleError
 from app.pipeline import ingest_batch
 from app.store_factory import get_store
 
@@ -55,6 +57,7 @@ def parse_inline_mapping(spec: str) -> dict[str, str]:
 
 
 def main():
+    load_configured_domains()  # custom domains must exist before the --domain choices are built
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tenant", required=True)
     parser.add_argument("--domain", required=True, choices=list(REGISTRY))
@@ -139,4 +142,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (DomainConfigError, IndexStaleError) as e:
+        print(f"\nError: {e}", file=__import__("sys").stderr)
+        raise SystemExit(2)

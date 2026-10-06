@@ -15,31 +15,10 @@ from typing import Any, Optional
 
 
 def now_iso() -> str:
-    """Return the current time as an ISO 8601 string in UTC.
-
-    Used as the default timestamp for every model's created/updated/changed
-    field, so all stored times share one timezone and one format and sort
-    correctly as plain strings.
-
-    Returns:
-        str: e.g. ``"2026-09-23T14:05:11.123456+00:00"``.
-    """
     return datetime.now(timezone.utc).isoformat()
 
 
 def new_id(prefix: str = "") -> str:
-    """Generate a new unique ID, optionally with a readable type prefix.
-
-    The ID is a random UUID4 in hex (32 characters, no dashes). The models
-    use prefixes such as ``"rec_"``, ``"ent_"`` and ``"cand_"`` so an ID shows
-    what kind of object it belongs to.
-
-    Args:
-        prefix: Text put in front of the hex UUID. Defaults to no prefix.
-
-    Returns:
-        str: e.g. ``"ent_3f2a9c..."``.
-    """
     return f"{prefix}{uuid.uuid4().hex}"
 
 

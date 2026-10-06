@@ -1,0 +1,106 @@
+{
+  "name": "vendor",
+  "override": true,
+  "fields": {
+    "company_name": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "tax_id": {
+      "normalize": [
+        "alnum_id"
+      ]
+    },
+    "duns_number": {
+      "normalize": [
+        "identifier"
+      ]
+    },
+    "contact_email": {
+      "normalize": [
+        "email"
+      ]
+    },
+    "contact_phone": {
+      "normalize": [
+        "phone"
+      ]
+    },
+    "address_line1": {
+      "normalize": [
+        "address_line"
+      ]
+    },
+    "city": {
+      "normalize": [
+        "name"
+      ]
+    },
+    "state": {
+      "normalize": [
+        "text",
+        "upper"
+      ]
+    },
+    "postal_code": {
+      "normalize": [
+        "postal_code"
+      ]
+    },
+    "country": {
+      "normalize": [
+        "text",
+        "upper"
+      ],
+      "default": "US"
+    }
+  },
+  "deterministic_fields": [
+    "tax_id",
+    "duns_number",
+    "contact_email"
+  ],
+  "fuzzy_weights": {
+    "address_line1": 0.2,
+    "city": 0.1,
+    "postal_code": 0.2,
+    "contact_phone": 0.15
+  },
+  "semantic": {
+    "fields": [
+      "company_name"
+    ],
+    "weight": 0.35
+  },
+  "blocking": [
+    [
+      "tax_id"
+    ],
+    [
+      "duns_number"
+    ],
+    [
+      "contact_email"
+    ],
+    [
+      "company_name",
+      "postal_code"
+    ]
+  ],
+  "survivorship": {
+    "default": "most_recent",
+    "fields": {
+      "company_name": "most_complete",
+      "tax_id": "most_recent",
+      "duns_number": "most_recent",
+      "contact_email": "most_recent",
+      "contact_phone": "most_recent",
+      "address_line1": "most_recent",
+      "city": "most_recent",
+      "state": "most_recent",
+      "postal_code": "most_recent",
+      "country": "most_complete"
+    }
+  }
+}
