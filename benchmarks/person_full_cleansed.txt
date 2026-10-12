@@ -1,0 +1,27 @@
+Benchmark 'person/full cleansed'  profile=person / full  seeds=[1, 2, 3]  scale=25  records=2850  (76.1 rec/s)
+
+POSITIVES (should link)     auto-linked   +review  shares a key
+  ssn_exact_name_variants          100%      100%          100%
+  ssn_typo                           4%      100%          100%
+  no_ssn_name_dob_address          100%      100%          100%
+  dob_swap                           0%      100%          100%
+  dob_year_only                      0%      100%          100%
+  moved_no_ssn                       0%      100%          100%
+  nickname_dob                     100%      100%          100%
+  ALL POSITIVES                     43%      100%          100%
+
+HARD NEGATIVES (must not merge)   WRONG MERGES  sent to review
+  ssn_placeholder                    0/75            0/75     
+  ssn_placeholder_same_name          0/75            0/75     
+  ssn_shared_error                   0/75            1/75     
+  dob_placeholder_same_name         11/75           64/75     
+  twins                              3/75           72/75     
+  jr_sr_dob                          0/75            0/75     
+  same_name_diff_dob                 0/75           55/75     
+  ALL NEGATIVES                            3%             37%
+
+Overall auto-link:  precision 94.2%   recall 43.4%   false-merged pairs 14
+Review queue:       761 pairs, 39% are true duplicates
+Blocking:           reduction ratio 99.69%, ~3.0 candidates/record, largest bucket 8 (p99 3)
+
+saved -> benchmarks/person_full_cleansed.json

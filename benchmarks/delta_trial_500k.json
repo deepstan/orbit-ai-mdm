@@ -1,0 +1,62 @@
+{
+  "base": 500000,
+  "base_load": {
+    "records": 500000,
+    "seconds": 894.4
+  },
+  "delta": {
+    "auto": 28918,
+    "changed": 100000,
+    "existing_entities_merged": 66,
+    "existing_entities_touched": 126001,
+    "new": 400000,
+    "new_entities": 372929,
+    "pairs": 925948,
+    "per_piece_seconds": [
+      132.4,
+      146.9,
+      158.7,
+      87.9,
+      88.9,
+      92.9,
+      96.1,
+      213.8,
+      79.5,
+      79.3,
+      82.9,
+      83.1,
+      84.2,
+      82.9,
+      84.8,
+      85.1,
+      92.2
+    ],
+    "records": 500000,
+    "review": 45320,
+    "seconds": 1771.6,
+    "stages": {
+      "classify": 9.0,
+      "cluster": 1.4,
+      "pairs": 760.3,
+      "score": 166.9,
+      "standardize": 195.1,
+      "write": 492.5
+    },
+    "unchanged": 0
+  },
+  "feed": 500000,
+  "invariants": {
+    "active_entities": 838791,
+    "active_entities_without_records": 0,
+    "database_bytes": 4101799936,
+    "history_rows": 100000,
+    "merged_entities": 115,
+    "records": 900000,
+    "records_at_version_2": 100000,
+    "records_in_a_merged_entity": 0,
+    "records_not_finished": 0,
+    "records_without_an_entity": 0
+  },
+  "n_pieces": 27,
+  "piece": 50000
+}

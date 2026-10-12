@@ -91,6 +91,11 @@ class TestMatchingAcrossDomains(unittest.TestCase):
         self.assertNotEqual(classify(r.score), "auto_merge")
 
 
+# NOTE on the "ambiguous pair" used by several tests below (Jennifer Nguyen vs Jenna Nguyen, different street): it
+# used to be "Jen Nguyen" at a similar address. "Jen" is now recognized as a nickname for Jennifer (see
+# NICKNAMES in app/standardize.py), so that pair became an unambiguous match (0.94) and stopped exercising the
+# review path. Jenna is a genuinely different name, so the pair stays ambiguous (0.80) and these tests still
+# test what they were written to test: review queue, steward decisions, and LLM adjudication of the middle band.
 class TestPipelineEndToEnd(unittest.TestCase):
     def setUp(self):
         self.db_path = "test_pipeline.db"
@@ -137,8 +142,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
         })
         ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         pending = self.store.list_candidates(TENANT_A, "customer", "pending")
         self.assertEqual(len(pending), 1)
@@ -196,8 +201,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
         })
         ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         pending = self.store.list_candidates(TENANT_A, "customer", "pending")
         self.assertEqual(len(pending), 1)
@@ -217,8 +222,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
         })
         r2 = ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         self.assertEqual(len(self.store.list_candidates(TENANT_A, "customer", "pending")), 0)
         self.assertIsNotNone(r2["matched_entity_id"])
@@ -236,8 +241,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
         })
         r1 = self.store.list_source_records(TENANT_A, "customer")[0]
         r2 = ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         self.assertEqual(len(self.store.list_candidates(TENANT_A, "customer", "pending")), 0)
         self.assertNotEqual(r2["matched_entity_id"], r1.entity_id)
@@ -254,8 +259,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
         })
         ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         self.assertEqual(len(self.store.list_candidates(TENANT_A, "customer", "pending")), 1)
 
@@ -266,8 +271,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
                 "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
             })
             ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-                "first_name": "Jen", "last_name": "Nguyen",
-                "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+                "first_name": "Jenna", "last_name": "Nguyen",
+                "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
             })
             mock_adjudicate.assert_not_called()
 
@@ -278,8 +283,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
         })
         ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-            "first_name": "Jen", "last_name": "Nguyen",
-            "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+            "first_name": "Jenna", "last_name": "Nguyen",
+            "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
         })
         self.assertEqual(len(self.store.list_candidates(TENANT_A, "customer", "pending")), 1)
 
@@ -298,12 +303,21 @@ class TestPipelineEndToEnd(unittest.TestCase):
                 "address_line1": "45 Birch Ln", "city": "Austin", "postal_code": "73301",
             })
             ingest_record(self.store, TENANT_A, "customer", "csv", "C2", {
-                "first_name": "Jen", "last_name": "Nguyen",
-                "address_line1": "450 Birchwood Lane", "city": "Austin", "postal_code": "73344",
+                "first_name": "Jenna", "last_name": "Nguyen",
+                "address_line1": "9 Elm Street", "city": "Austin", "postal_code": "73344",
             })
             candidates = self.store.list_candidates(TENANT_A, "customer", status=None)
             self.assertEqual(len(candidates), 1)
-            self.assertGreater(candidates[0].score, 0.87)
+            # The model must move the score, measurably. Asserted against this pair's UNBLENDED score rather than a
+            # fixed number, which would silently depend on which pair the test happens to use.
+            from app.matching import score_pair
+            from app.standardize import standardize
+            unblended = score_pair(
+                standardize("customer", {"first_name": "Jennifer", "last_name": "Nguyen", "address_line1": "45 Birch Ln",
+                                         "city": "Austin", "postal_code": "73301"}),
+                standardize("customer", {"first_name": "Jenna", "last_name": "Nguyen", "address_line1": "9 Elm Street",
+                                         "city": "Austin", "postal_code": "73344"}), config).score
+            self.assertGreater(candidates[0].score, unblended + 0.05)
             self.assertTrue(any("blended with learned model" in r for r in candidates[0].reasons))
         finally:
             import os as _os

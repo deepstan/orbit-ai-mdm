@@ -83,8 +83,9 @@ class TestFreshDatabase(unittest.TestCase):
         applied = rows(path, "SELECT namespace, version FROM schema_migrations ORDER BY version")
         self.assertEqual([(r["namespace"], r["version"]) for r in applied],
                          [("platform", m.version) for m in MIGRATIONS])
-        self.assertTrue({"source_records", "entities", "match_candidates", "lineage",
-                         "api_keys", "audit_log", "usage_events", "blocking_keys"} <= table_names(path))
+        self.assertTrue({"source_records", "match_candidates", "lineage", "api_keys", "audit_log", "usage_events", "blocking_keys",
+                         "standardized_records", "entity_customer", "entity_product", "entity_vendor"} <= table_names(path))
+        self.assertNotIn("entities", table_names(path))  # replaced by one table per domain (migration 009)
 
     def test_second_startup_applies_nothing(self):
         path = tmp_db(self)
@@ -101,10 +102,25 @@ class TestFreshDatabase(unittest.TestCase):
         conn.close()
         Store(migrated)
         legacy_schema, migrated_schema = describe_schema(legacy), describe_schema(migrated)
-        # Everything the old code created must be reproduced exactly. Tables added by LATER
-        # migrations (006: blocking_index_state) are the only permitted extras.
-        self.assertEqual({t: migrated_schema[t] for t in legacy_schema}, legacy_schema)
-        self.assertEqual(set(migrated_schema) - set(legacy_schema), {"blocking_index_state"})
+        # Everything the old code created must be reproduced exactly. What LATER migrations added is the only
+        # permitted difference: a table (006 blocking_index_state) and a trailing column (007 match_candidates.contributions).
+        # `entities` (one table, JSON attributes) was replaced by entity_<domain> tables (migration 009)
+        self.assertEqual(set(migrated_schema) - set(legacy_schema), {"blocking_index_state", "standardized_records",
+                                                                      "entity_customer", "entity_product", "entity_vendor",
+                                                                      "source_record_history", "pipeline_runs", "golden_dirty", "merge_audits"})
+        self.assertNotIn("entities", migrated_schema)
+        for table, (cols, idx) in {t: v for t, v in legacy_schema.items() if t != "entities"}.items():
+            m_cols, m_idx = migrated_schema[table]
+            self.assertEqual(m_cols[:len(cols)], cols, table)
+            later_idx = {"source_records": {(0, ("tenant_id", "domain", "source_system", "source_record_id")),  # 010: lookup by natural key
+                                            (0, ("domain", "ingested_at"))},                                    # 012: only the UNFINISHED rows
+                         "match_candidates": {(0, ("tenant_id", "domain", "record_a_id")), (0, ("tenant_id", "domain", "record_b_id")),
+                                              (0, ("tenant_id", "domain", "score", "id"))}}   # 016: the pending queue, in the order it is shown
+            self.assertEqual(m_idx - idx, later_idx.get(table, set()), table)
+            self.assertTrue(idx <= m_idx, table)
+            extra = [c[0] for c in m_cols[len(cols):]]
+            later = {"match_candidates": ["contributions"], "source_records": ["content_hash", "version", "updated_at", "processing_status", "processing_attempts", "processing_error"]}
+            self.assertEqual(extra, later.get(table, []), table)  # columns added by LATER migrations (007, 010)
 
     def test_no_schema_changes_when_already_current(self):
         """An up-to-date database must start without issuing any DDL or
@@ -146,7 +162,9 @@ class TestAdoptingExistingDatabases(unittest.TestCase):
 
         Store(path)  # previously: nothing could change this DB. Now it is adopted.
 
-        self.assertEqual([r["id"] for r in rows(path, "SELECT id FROM entities")], ["ent_old"])
+        # the golden record moved, id and all, into its domain's table (migration 009); the old table is kept as a safety net
+        self.assertEqual([r["entity_id"] for r in rows(path, "SELECT entity_id FROM entity_customer")], ["ent_old"])
+        self.assertEqual([r["id"] for r in rows(path, "SELECT id FROM entities_json_legacy")], ["ent_old"])
         self.assertEqual([r["version"] for r in rows(path, "SELECT version FROM schema_migrations ORDER BY version")],
                          [m.version for m in MIGRATIONS])
 
@@ -267,6 +285,26 @@ class TestSafetyRails(unittest.TestCase):
                 "c13fee26ccda817c983ce415ae01c123120423280ebcc3aa85aea1f3afedee0c"),
             6: ("2ed44c9e03ac1bdad5ed8b63b146744675063a49517d41d05099571f3827db85",
                 "2ed44c9e03ac1bdad5ed8b63b146744675063a49517d41d05099571f3827db85"),
+            7: ("5f1457717091da4a58ec529c26c09b8d0a1710ea762f38c6b40db67ba24e54d0",
+                "4939c878fe2f266d8fcb88f48046390ef0268fd07b2baa36074c546ce5af4b75"),
+            13: ("09ba79bbd2b1b880677af9bc7b7403dca2ab9fe301d988616ff00a5f30b6d9a5",
+                 "09ba79bbd2b1b880677af9bc7b7403dca2ab9fe301d988616ff00a5f30b6d9a5"),
+            12: ("cccb487f2a1bca07d3f1d8cd5faffbe185f8edfe108568c03efa71eb214e329b",
+                 "aaa336ac9c5c4876fd8f848160635c70afc36689d04299301f9123aca84f169c"),
+            11: ("4c304eebc4408e086fd5b24bc997b027f5e0d14a6ac93d92787c1588ced4d594",
+                 "4c304eebc4408e086fd5b24bc997b027f5e0d14a6ac93d92787c1588ced4d594"),
+            10: ("946e29f25a658242973eac8a7826fdb39262344f7987fdd5801241dd1c377023",
+                 "340323a04fc9f808e4c6d6ead23a24ba8320c6614eace548d0cc46e2bfeba2b2"),
+            9: ("383c5c5c501436e4e13f0cbb986c128f4095226298b2c7cd41eca877f96f3eca",
+                "383c5c5c501436e4e13f0cbb986c128f4095226298b2c7cd41eca877f96f3eca"),
+            8: ("767e8d329cb06f2ade3374f6d7584c8a440ba54b7b1c83f87154142c43295400",
+                "21408dc5d1d8c9456de461d5a639a3573ff227886ca06cacd2de65d5ad954e73"),
+                    14: ("2678e25c509949b72ae027e0c90c8276a6fc51ce33e0fc57beef23b6d347be7b",
+                 "2678e25c509949b72ae027e0c90c8276a6fc51ce33e0fc57beef23b6d347be7b"),
+            15: ("dd386f4b70c95f4a636a09111e8631199385e6f48e723e0ae55d16fcbed641eb",
+                 "dd386f4b70c95f4a636a09111e8631199385e6f48e723e0ae55d16fcbed641eb"),
+            16: ("4a6119737568721f6832eebfd2f844a91013dcd5d3b5e0d78fcc54a56337be8c",
+                 "4a6119737568721f6832eebfd2f844a91013dcd5d3b5e0d78fcc54a56337be8c"),
         }
         self.assertEqual(set(pinned), {m.version for m in MIGRATIONS},
                          "A migration was added or removed: pin the new one's checksums here.")

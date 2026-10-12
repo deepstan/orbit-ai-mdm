@@ -5,41 +5,69 @@
     "sku": {
       "normalize": [
         "identifier"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_id"
       ]
     },
     "upc": {
       "normalize": [
         "identifier"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_id"
       ]
     },
     "product_name": {
       "normalize": [
         "product_name"
+      ],
+      "present": [
+        "present_text"
       ]
     },
     "brand": {
       "normalize": [
         "name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_title"
       ]
     },
     "category": {
       "normalize": [
         "name"
+      ],
+      "present": [
+        "present_title"
       ]
     },
     "description": {
       "normalize": [
         "lower"
+      ],
+      "present": [
+        "present_text"
       ]
     },
     "price": {
       "normalize": [
         "text"
-      ]
+      ],
+      "present": [
+        "present_text"
+      ],
+      "type": "numeric"
     }
   },
   "deterministic_fields": [
     "sku",
+    "upc"
+  ],
+  "exclusive_fields": [
     "upc"
   ],
   "fuzzy_weights": {
@@ -66,6 +94,12 @@
       "category"
     ]
   ],
+  "mismatch_penalties": {
+    "sku": 0.3,
+    "upc": 0.4,
+    "brand": 0.2
+  },
+  "max_bucket_size": 500,
   "survivorship": {
     "default": "most_recent",
     "fields": {

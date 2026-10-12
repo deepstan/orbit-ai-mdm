@@ -104,7 +104,7 @@ def main():
     print("This only ever matches against other PRODUCT records for this tenant -- "
           "never against the Customer or Vendor records above, no matter how similar any field looks.")
 
-    print("\n--- Phase 3: audit log + usage (dev mode, no auth needed for this demo) ---")
+    print("\n--- Phase 3: audit log + usage (the demo writes to the database directly: no API key involved) ---")
     from app.audit import log_action, verify_chain
     from app.billing import get_usage_summary, record_usage
 
@@ -119,13 +119,13 @@ def main():
 
     print("\nDone. Start the API with:")
     print("  uvicorn app.api:app --reload --port 8000")
-    print(f"Then open http://localhost:8000/ (defaults to tenant '{TENANT}', Customer domain, auth OFF).")
-    print("Switch domains in the UI's tabs, or query directly:")
+    print(f"Then, to look around on a laptop (NO authentication: never expose it), run  MDM_DEV_MODE=1 uvicorn app.api:app --port 8000  and open http://localhost:8000/ (tenant '{TENANT}', Customer domain).")
+    print("Switch domains in the UI's tabs, or query directly (in dev mode; with authentication add -H 'Authorization: Bearer <key>'):")
     print('  curl http://localhost:8000/v1/product/review-queue')
     print('  curl http://localhost:8000/v1/vendor/review-queue')
     print("\nTo try RBAC + audit log + usage metering for real:")
     print(f'  python3 manage_api_keys.py create --tenant {TENANT} --role tenant_admin --label "root key"')
-    print("  export MDM_ENABLE_AUTH=true")
+    print("  uvicorn app.api:app --port 8000        # authentication is the default: no MDM_DEV_MODE")
     print('  curl -H "Authorization: Bearer <key>" http://localhost:8000/v1/admin/audit-log')
 
 

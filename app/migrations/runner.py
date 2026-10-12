@@ -172,6 +172,14 @@ class MigrationContext:
                 "WHERE table_schema = current_schema() AND table_name = ?", (name,))
         return bool(rows)
 
+    def column_types(self, table: str) -> dict:
+        """{column: declared type} (SQLite: the declared type, upper-cased; Postgres: information_schema's data_type)."""
+        if self.backend == "sqlite":
+            return {r["name"]: (r["type"] or "").upper() for r in self.query(f"PRAGMA table_info({table})")}
+        return {r["column_name"]: r["data_type"] for r in self.query(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?", (table,))}
+
     def columns(self, table: str) -> set:
         if self.backend == "sqlite":
             return {r["name"] for r in self.query(f"PRAGMA table_info({table})")}

@@ -1,0 +1,288 @@
+{
+  "name": "person",
+  "description": "People with SSN and date of birth. SSN and DOB are CLEANSED (implausible values become missing, with the reason recorded and never the value). The SSN is PROTECTED: matched and indexed as a keyed hash, shown as ***-**-6789, plain only in raw (needs MDM_TOKEN_KEY); with near:true a one-digit typo or adjacent swap in an SSN counts as a near match instead of a contradiction. DOB is read as ISO plus the month-first formats in `parse`, and compared as a date: a swapped day and month, or a year one out, nearly agrees, and a bare year agrees with any date in that year. BLOCKING is the scalable_tight_plus set: selective keys for everyone (SSN, email, phone with adjacent swaps, DOB combinations, whole surname + zip5, whole first name + zip5, whole surname + whole first name), and the loose name-only keys only for records that have no SSN, DOB, email or phone.",
+  "fields": {
+    "first_name": {
+      "normalize": [
+        "given_name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_name"
+      ]
+    },
+    "last_name": {
+      "normalize": [
+        "name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_name"
+      ]
+    },
+    "name_suffix": {
+      "normalize": [
+        "suffix"
+      ],
+      "sources": [
+        "name_suffix",
+        "last_name"
+      ],
+      "present": [
+        "present_suffix"
+      ]
+    },
+    "dob": {
+      "normalize": [
+        "dob"
+      ],
+      "present": [
+        "present_date"
+      ],
+      "type": "date",
+      "format": "%Y-%m-%d",
+      "parse": [
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%Y/%m/%d",
+        "%d-%b-%Y",
+        "%b %d, %Y"
+      ],
+      "options": {
+        "max_age_years": 120
+      }
+    },
+    "ssn": {
+      "normalize": [
+        "ssn"
+      ],
+      "present": [
+        "present_ssn"
+      ],
+      "options": {
+        "itin": "reject",
+        "near": true
+      },
+      "protect": "hash"
+    },
+    "email": {
+      "normalize": [
+        "email"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_email"
+      ]
+    },
+    "phone": {
+      "normalize": [
+        "phone"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_phone"
+      ]
+    },
+    "address_line1": {
+      "normalize": [
+        "address_line"
+      ],
+      "present": [
+        "present_address"
+      ]
+    },
+    "city": {
+      "normalize": [
+        "name"
+      ],
+      "present": [
+        "present_title"
+      ]
+    },
+    "state": {
+      "normalize": [
+        "text",
+        "upper"
+      ],
+      "present": [
+        "present_upper"
+      ]
+    },
+    "postal_code": {
+      "normalize": [
+        "postal_code"
+      ],
+      "present": [
+        "present_postal"
+      ]
+    }
+  },
+  "deterministic_fields": [
+    "ssn",
+    "email",
+    "phone"
+  ],
+  "exclusive_fields": [
+    "ssn"
+  ],
+  "fuzzy_weights": {
+    "first_name": 0.15,
+    "last_name": 0.2,
+    "dob": 0.25,
+    "address_line1": 0.2,
+    "city": 0.1,
+    "postal_code": 0.15
+  },
+  "semantic": {
+    "fields": [
+      "first_name",
+      "last_name"
+    ],
+    "weight": 0.15
+  },
+  "blocking": [
+    [
+      {
+        "field": "ssn",
+        "as": "exact"
+      }
+    ],
+    [
+      {
+        "field": "email",
+        "as": "exact"
+      }
+    ],
+    [
+      {
+        "field": "phone",
+        "as": "transpose"
+      }
+    ],
+    [
+      {
+        "field": "dob",
+        "as": "exact"
+      },
+      {
+        "field": "last_name",
+        "as": "soundex"
+      }
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "soundex"
+      },
+      "first_name",
+      {
+        "field": "dob",
+        "as": "prefix",
+        "size": 4
+      }
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "exact"
+      },
+      {
+        "field": "postal_code",
+        "as": "exact"
+      }
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "soundex"
+      },
+      {
+        "field": "first_name",
+        "as": "prefix",
+        "size": 1
+      },
+      {
+        "field": "dob",
+        "as": "exact"
+      }
+    ],
+    [
+      {
+        "field": "first_name",
+        "as": "exact"
+      },
+      {
+        "field": "postal_code",
+        "as": "exact"
+      }
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "exact"
+      },
+      {
+        "field": "first_name",
+        "as": "exact"
+      }
+    ],
+    {
+      "fields": [
+        "last_name",
+        "first_name"
+      ],
+      "unless_any": [
+        "ssn",
+        "dob",
+        "email",
+        "phone"
+      ]
+    },
+    {
+      "fields": [
+        {
+          "field": "last_name",
+          "as": "soundex"
+        },
+        "first_name"
+      ],
+      "unless_any": [
+        "ssn",
+        "dob",
+        "email",
+        "phone"
+      ]
+    },
+    {
+      "fields": [
+        "first_name",
+        "postal_code"
+      ],
+      "unless_any": [
+        "ssn",
+        "dob",
+        "email",
+        "phone"
+      ]
+    }
+  ],
+  "mismatch_penalties": {
+    "ssn": 0.4,
+    "dob": {
+      "penalty": 0.3,
+      "compare": "date"
+    },
+    "email": 0.15,
+    "phone": 0.15,
+    "first_name": 0.25,
+    "last_name": 0.15,
+    "name_suffix": {
+      "penalty": 0.4,
+      "compare": "exact"
+    }
+  },
+  "max_bucket_size": 500,
+  "survivorship": {
+    "default": "most_recent"
+  }
+}

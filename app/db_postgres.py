@@ -51,7 +51,8 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 
-from .migrations import PostgresMigrationBackend, apply_or_verify
+from . import golden, protect
+from .migrations import PostgresMigrationBackend, apply_or_verify, auto_migrate_enabled
 from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent, now_iso
 
 
@@ -116,6 +117,8 @@ class PostgresStore:
         self.database_url = database_url
         self._lock = threading.RLock()
         self._connection = None
+        self._auto_migrate = auto_migrate
+        self._entity_synced: dict = {}
         self._init_schema(auto_migrate)
 
     def _get_connection(self):
@@ -168,22 +171,24 @@ class PostgresStore:
     def save_source_record(self, rec: SourceRecord) -> None:
         with self._conn(tenant_id=rec.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, "
-                "attributes, ingested_at, entity_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (rec.id, rec.tenant_id, rec.domain, rec.source_system, rec.source_record_id,
-                 _j(rec.attributes), rec.ingested_at, rec.entity_id),
-            )
+                "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, attributes, "
+                "ingested_at, entity_id, content_hash, version, updated_at, processing_status, processing_attempts, processing_error) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (rec.id, rec.tenant_id, rec.domain, rec.source_system, rec.source_record_id, _j(rec.attributes),
+                 rec.ingested_at, rec.entity_id, rec.content_hash, rec.version, rec.updated_at,
+                 rec.processing_status, rec.processing_attempts, rec.processing_error))
 
     def save_source_records_batch(self, records: list[SourceRecord]) -> None:
         if not records:
             return
-        with self._conn(tenant_id=records[0].tenant_id if records else None) as conn, conn.cursor() as cur:
+        with self._conn(tenant_id=records[0].tenant_id) as conn, conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, "
-                "attributes, ingested_at, entity_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                [(r.id, r.tenant_id, r.domain, r.source_system, r.source_record_id,
-                  _j(r.attributes), r.ingested_at, r.entity_id) for r in records],
-            )
+                "INSERT INTO source_records (id, tenant_id, domain, source_system, source_record_id, attributes, "
+                "ingested_at, entity_id, content_hash, version, updated_at, processing_status, processing_attempts, processing_error) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                [(r.id, r.tenant_id, r.domain, r.source_system, r.source_record_id, _j(r.attributes), r.ingested_at,
+                  r.entity_id, r.content_hash, r.version, r.updated_at,
+                  r.processing_status, r.processing_attempts, r.processing_error) for r in records])
 
     def get_source_record(self, rec_id: str, tenant_id: str, domain: str) -> SourceRecord | None:
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
@@ -275,85 +280,103 @@ class PostgresStore:
             source_system=row["source_system"], source_record_id=row["source_record_id"],
             attributes=row["attributes"],
             ingested_at=row["ingested_at"], entity_id=row["entity_id"],
+            content_hash=row["content_hash"], version=row["version"], updated_at=row["updated_at"],
+            processing_status=row["processing_status"], processing_attempts=row["processing_attempts"],
+            processing_error=row["processing_error"],
         )
 
-    # --- entities --------------------------------------------------------
+    # --- entities = golden records: one table per domain, every field a real TYPED column (app/golden.py) ----
+    @staticmethod
+    def _entity_columns(domain: str):
+        from .domains import REGISTRY
+        cfg = REGISTRY.get(domain)
+        return golden.field_columns(cfg) if cfg else None
+
+    def _entity_fields(self, domain: str):
+        cols = self._entity_columns(domain)
+        return None if cols is None else [f for f, _ in cols]
+
+    def _ensure_entity_table(self, domain: str) -> None:
+        cols = self._entity_columns(domain)
+        if cols is None or self._entity_synced.get(domain) == tuple(cols):
+            return
+        golden.ensure_or_verify(PostgresMigrationBackend(self.database_url), domain, cols, auto_migrate_enabled(self._auto_migrate))
+        self._entity_synced[domain] = tuple(cols)
+
+    def sync_entity_table(self, domain: str) -> list:
+        cols = self._entity_columns(domain)
+        added = golden.sync_table(PostgresMigrationBackend(self.database_url), domain, cols)
+        self._entity_synced[domain] = tuple(cols)
+        return added
+
     def save_entity(self, ent: Entity) -> None:
+        self._ensure_entity_table(ent.domain)
+        cols = self._entity_columns(ent.domain)
+        if cols is None:
+            raise KeyError(f"No configuration is loaded for domain '{ent.domain}', so its golden records cannot be written")
+        names = ["entity_id", "tenant_id", "status", "created_at", "updated_at", "quality_issues", *[f for f, _ in cols]]
+        values = [ent.id, ent.tenant_id, ent.status, ent.created_at, ent.updated_at,
+                  _j(ent.quality_issues) if ent.quality_issues else None, *[ent.attributes.get(f) for f, _ in cols]]
+        updates = ", ".join(f"{golden.q(c)} = EXCLUDED.{golden.q(c)}" for c in names[1:])
         with self._conn(tenant_id=ent.tenant_id) as conn, conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO entities (id, tenant_id, domain, status, attributes, created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (id) DO UPDATE SET
-                     status = EXCLUDED.status, attributes = EXCLUDED.attributes,
-                     updated_at = EXCLUDED.updated_at""",
-                (ent.id, ent.tenant_id, ent.domain, ent.status, _j(ent.attributes),
-                 ent.created_at, ent.updated_at),
-            )
+            cur.execute(f"INSERT INTO {golden.q(golden.table_name(ent.domain))} ({', '.join(golden.q(c) for c in names)}) "
+                        f"VALUES ({', '.join(['%s'] * len(names))}) ON CONFLICT (entity_id) DO UPDATE SET {updates}", values)
+
+    def _row_to_entity(self, row, domain: str, source_ids: list) -> Entity:
+        fields = self._entity_fields(domain)
+        if fields is None:
+            fields = [c for c in row.keys() if c not in golden.SYSTEM_COLUMNS]
+        return Entity(id=row["entity_id"], tenant_id=row["tenant_id"], domain=domain, status=row["status"],
+                      attributes={f: row.get(f) for f in fields}, quality_issues=row.get("quality_issues") or [],
+                      source_record_ids=source_ids, created_at=row["created_at"], updated_at=row["updated_at"])
 
     def get_entity(self, entity_id: str, tenant_id: str, domain: str) -> Entity | None:
+        self._ensure_entity_table(domain)
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
-                (entity_id, tenant_id, domain),
-            )
+            cur.execute(f"SELECT * FROM {golden.q(golden.table_name(domain))} WHERE entity_id = %s AND tenant_id = %s", (entity_id, tenant_id))
             row = cur.fetchone()
-            if not row:
-                return None
-            source_ids = [r.id for r in self.list_source_records(tenant_id, domain, entity_id=entity_id)]
-            return Entity(
-                id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"], status=row["status"],
-                attributes=row["attributes"], source_record_ids=source_ids,
-                created_at=row["created_at"], updated_at=row["updated_at"],
-            )
+        if not row:
+            return None
+        return self._row_to_entity(row, domain, [r.id for r in self.list_source_records(tenant_id, domain, entity_id=entity_id)])
 
     def list_entities(self, tenant_id: str, domain: str, status: str | None = None) -> list[Entity]:
+        self._ensure_entity_table(domain)
+        sql, params = f"SELECT entity_id FROM {golden.q(golden.table_name(domain))} WHERE tenant_id = %s", [tenant_id]
+        if status:
+            sql, params = sql + " AND status = %s", params + [status]
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
-            if status:
-                cur.execute(
-                    "SELECT id FROM entities WHERE tenant_id = %s AND domain = %s AND status = %s",
-                    (tenant_id, domain, status),
-                )
-            else:
-                cur.execute("SELECT id FROM entities WHERE tenant_id = %s AND domain = %s", (tenant_id, domain))
-            ids = [r["id"] for r in cur.fetchall()]
+            cur.execute(sql, params)
+            ids = [r["entity_id"] for r in cur.fetchall()]
         return [self.get_entity(i, tenant_id, domain) for i in ids]
 
     def find_entities_by_attribute(self, tenant_id: str, domain: str, field: str, value: str) -> list[Entity]:
-        """Postgres-only bonus this JSONB migration unlocks: query
-        entities by an attribute VALUE directly in SQL (using jsonb's
-        ->> operator), instead of fetching every entity into Python and
-        filtering there. SQLite's `Store` has no equivalent method --
-        its TEXT-column attributes can only be filtered in Python after
-        loading the whole row, which is the exact limitation this
-        method exists to route around on Postgres. For serious use at
-        scale, this should be paired with a GIN or expression index on
-        `entities ((attributes->>'field'))` -- not created automatically
-        here, since which fields are worth indexing is data-dependent."""
+        """Finds golden records by a field's value directly in SQL. The field is a real column now, so this is an
+        ordinary indexable equality query (add an index on the column if you use it a lot)."""
+        fields = self._entity_fields(domain)
+        if fields is None or field not in fields:
+            raise ValueError(f"'{field}' is not a field of domain '{domain}'")
+        self._ensure_entity_table(domain)
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM entities WHERE tenant_id = %s AND domain = %s "
-                "AND attributes->>%s = %s",
-                (tenant_id, domain, field, value),
-            )
-            ids = [r["id"] for r in cur.fetchall()]
+            cur.execute(f"SELECT entity_id FROM {golden.q(golden.table_name(domain))} WHERE tenant_id = %s AND {golden.q(field)} = %s",
+                        (tenant_id, value))
+            ids = [r["entity_id"] for r in cur.fetchall()]
         return [self.get_entity(i, tenant_id, domain) for i in ids]
 
     def delete_entity(self, entity_id: str, tenant_id: str, domain: str) -> None:
+        """Hard delete -- right-to-be-forgotten purge only (app/compliance.py)."""
+        self._ensure_entity_table(domain)
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM entities WHERE id = %s AND tenant_id = %s AND domain = %s",
-                (entity_id, tenant_id, domain),
-            )
+            cur.execute(f"DELETE FROM {golden.q(golden.table_name(domain))} WHERE entity_id = %s AND tenant_id = %s", (entity_id, tenant_id))
 
     # --- match candidates --------------------------------------------------
     def save_candidate(self, c: MatchCandidate) -> None:
         with self._conn(tenant_id=c.tenant_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO match_candidates (id, tenant_id, domain, record_a_id, record_b_id, score, "
-                "match_type, reasons, status, created_at, decided_at, decided_by) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "match_type, reasons, status, created_at, decided_at, decided_by, contributions) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (c.id, c.tenant_id, c.domain, c.record_a_id, c.record_b_id, c.score, c.match_type,
-                 _j(c.reasons), c.status, c.created_at, c.decided_at, c.decided_by),
+                 _j(c.reasons), c.status, c.created_at, c.decided_at, c.decided_by, _j(c.contributions)),
             )
 
     def update_candidate_status(self, cand_id: str, tenant_id: str, domain: str,
@@ -383,7 +406,7 @@ class PostgresStore:
             MatchCandidate(
                 id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"],
                 record_a_id=r["record_a_id"], record_b_id=r["record_b_id"],
-                score=r["score"], match_type=r["match_type"], reasons=r["reasons"],
+                score=r["score"], match_type=r["match_type"], reasons=r["reasons"], contributions=r["contributions"] or [],
                 status=r["status"], created_at=r["created_at"],
                 decided_at=r["decided_at"], decided_by=r["decided_by"],
             )
@@ -402,7 +425,7 @@ class PostgresStore:
         return MatchCandidate(
             id=row["id"], tenant_id=row["tenant_id"], domain=row["domain"],
             record_a_id=row["record_a_id"], record_b_id=row["record_b_id"],
-            score=row["score"], match_type=row["match_type"], reasons=row["reasons"],
+            score=row["score"], match_type=row["match_type"], reasons=row["reasons"], contributions=row["contributions"] or [],
             status=row["status"], created_at=row["created_at"],
             decided_at=row["decided_at"], decided_by=row["decided_by"],
         )
@@ -416,6 +439,15 @@ class PostgresStore:
                 (ev.id, ev.tenant_id, ev.domain, ev.entity_id, ev.field, ev.old_value, ev.new_value,
                  ev.source_record_id, ev.reason, ev.changed_at),
             )
+
+    def add_lineage_batch(self, events: list) -> None:
+        if events:
+            with self._conn(tenant_id=events[0].tenant_id) as conn, conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO lineage (id, tenant_id, domain, entity_id, field, old_value, new_value, "
+                    "source_record_id, reason, changed_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [(ev.id, ev.tenant_id, ev.domain, ev.entity_id, ev.field, ev.old_value, ev.new_value,
+                      ev.source_record_id, ev.reason, ev.changed_at) for ev in events])
 
     def list_lineage(self, entity_id: str, tenant_id: str, domain: str) -> list[LineageEvent]:
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
@@ -601,3 +633,596 @@ class PostgresStore:
                 "DELETE FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = %s", deletes)
             cur.executemany(
                 "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)", inserts)
+
+    # --- Bucket sizes and statistics (see matching.py / domains_cli.py blocking-stats) ---
+    def blocking_bucket_sizes(self, tenant_id: str, domain: str, keys: set[str]) -> dict[str, int]:
+        if not keys:
+            return {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT blocking_key, COUNT(*) AS n FROM blocking_keys WHERE tenant_id = %s AND domain = %s "
+                "AND blocking_key = ANY(%s) GROUP BY blocking_key", (tenant_id, domain, list(keys)))
+            return {r["blocking_key"]: r["n"] for r in cur.fetchall()}
+
+    def blocking_key_stats(self, domain: str, top_n: int = 10) -> dict:
+        sized = "(SELECT COUNT(*) AS n FROM blocking_keys WHERE domain = %s GROUP BY tenant_id, blocking_key) AS t"
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS buckets, COALESCE(SUM(n), 0) AS key_rows, COALESCE(SUM(n * n), 0) AS sq, "
+                        f"COALESCE(MAX(n), 0) AS biggest FROM {sized}", (domain,))
+            t = cur.fetchone()
+            cur.execute(f"SELECT CASE WHEN n = 1 THEN '1' WHEN n <= 10 THEN '2-10' WHEN n <= 100 THEN '11-100' "
+                        f"WHEN n <= 1000 THEN '101-1000' ELSE '1000+' END AS band, COUNT(*) AS buckets FROM {sized} GROUP BY band", (domain,))
+            bands = cur.fetchall()
+            cur.execute("SELECT tenant_id, blocking_key, COUNT(*) AS n FROM blocking_keys WHERE domain = %s "
+                        "GROUP BY tenant_id, blocking_key ORDER BY n DESC, blocking_key LIMIT %s", (domain, top_n))
+            top = cur.fetchall()
+            cur.execute("SELECT COUNT(DISTINCT record_id) AS n FROM blocking_keys WHERE domain = %s "
+                        "AND blocking_key = '__no_block__'", (domain,))
+            unkeyed = cur.fetchone()["n"]
+        return {"buckets": t["buckets"], "key_rows": int(t["key_rows"]), "sum_squares": int(t["sq"]), "biggest": t["biggest"],
+                "bands": {r["band"]: r["buckets"] for r in bands},
+                "top": [(r["tenant_id"], r["blocking_key"], r["n"]) for r in top], "records_without_keys": unkeyed}
+
+    # --- Staging layer: standardized_records (see app/staging.py) ---------
+    def save_staged_batch(self, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        now = now_iso()
+        with self._conn(tenant_id=rows[0][0]) as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO standardized_records (tenant_id, domain, record_id, matching, cleansed, fingerprint, standardized_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant_id, domain, record_id) DO UPDATE SET "
+                "matching = EXCLUDED.matching, cleansed = EXCLUDED.cleansed, fingerprint = EXCLUDED.fingerprint, "
+                "standardized_at = EXCLUDED.standardized_at",
+                [(t, d, rid, _j(m), _j(c), fp, now) for t, d, rid, m, c, fp in rows])
+
+    def get_staged_many(self, tenant_id: str, domain: str, record_ids) -> dict:
+        ids = list(record_ids)
+        if not ids:
+            return {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT record_id, matching, cleansed FROM standardized_records "
+                        "WHERE tenant_id = %s AND domain = %s AND record_id = ANY(%s)", (tenant_id, domain, ids))
+            return {r["record_id"]: (r["matching"], r["cleansed"]) for r in cur.fetchall()}
+
+    def delete_staged(self, record_id: str, tenant_id: str, domain: str) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM standardized_records WHERE record_id = %s AND tenant_id = %s AND domain = %s",
+                        (record_id, tenant_id, domain))
+
+    def count_staged(self, domain: str) -> int:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM standardized_records WHERE domain = %s", (domain,))
+            return cur.fetchone()["n"]
+
+    def list_entities_page(self, domain: str, after_id: str, limit: int) -> list[tuple[str, str]]:
+        self._ensure_entity_table(domain)
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT tenant_id, entity_id FROM {golden.q(golden.table_name(domain))} "
+                        f"WHERE status = 'active' AND entity_id > %s ORDER BY entity_id LIMIT %s", (after_id, limit))
+            return [(r["tenant_id"], r["entity_id"]) for r in cur.fetchall()]
+
+    def replace_derived_batch(self, entries: list[tuple]) -> None:
+        now = now_iso()
+        deletes = [(t, d, rid) for t, d, rid, *_ in entries]
+        keys = [(t, d, rid, k) for t, d, rid, _m, _c, _f, ks in entries for k in ks]
+        staged = [(t, d, rid, _j(m), _j(c), fp, now) for t, d, rid, m, c, fp, _ks in entries]
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany("DELETE FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = %s", deletes)
+            cur.executemany("INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)", keys)
+            cur.executemany(
+                "INSERT INTO standardized_records (tenant_id, domain, record_id, matching, cleansed, fingerprint, standardized_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant_id, domain, record_id) DO UPDATE SET "
+                "matching = EXCLUDED.matching, cleansed = EXCLUDED.cleansed, fingerprint = EXCLUDED.fingerprint, "
+                "standardized_at = EXCLUDED.standardized_at", staged)
+
+    # --- Idempotent raw ingest (see pipeline.ingest_record) ----------------
+    _NATURAL = ("SELECT * FROM source_records WHERE tenant_id = %s AND domain = %s AND source_system = %s AND source_record_id = %s "
+                "ORDER BY ingested_at DESC, id DESC LIMIT 1")
+
+    def find_source_record(self, tenant_id: str, domain: str, source_system: str, source_record_id: str) -> SourceRecord | None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(self._NATURAL, (tenant_id, domain, source_system, source_record_id))
+            row = cur.fetchone()
+        return self._row_to_source_record(row) if row else None
+
+    def find_source_records_by_keys(self, tenant_id: str, domain: str, keys) -> dict:
+        out = {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for source_system, source_record_id in keys:
+                cur.execute(self._NATURAL, (tenant_id, domain, source_system, source_record_id))
+                row = cur.fetchone()
+                if row:
+                    out[(source_system, source_record_id)] = self._row_to_source_record(row)
+        return out
+
+    def update_source_record(self, rec_id: str, tenant_id: str, domain: str, attributes: dict, content_hash: str, version: int) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE source_records SET attributes = %s, content_hash = %s, version = %s, updated_at = %s, "
+                        "processing_status = 'landed', processing_attempts = 0, processing_error = NULL "
+                        "WHERE id = %s AND tenant_id = %s AND domain = %s",
+                        (_j(attributes), content_hash, version, now_iso(), rec_id, tenant_id, domain))
+
+    def add_record_history(self, rows: list[tuple]) -> None:
+        if not rows:
+            return
+        with self._conn(tenant_id=rows[0][0]) as conn, conn.cursor() as cur:
+            cur.executemany("INSERT INTO source_record_history (tenant_id, domain, record_id, version, content_hash, attributes, superseded_at) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (record_id, version) DO UPDATE SET "
+                            "content_hash = EXCLUDED.content_hash, attributes = EXCLUDED.attributes, superseded_at = EXCLUDED.superseded_at",
+                            [(t, d, rid, v, h, _j(a), at) for t, d, rid, v, h, a, at in rows])
+
+    def list_record_history(self, record_id: str, tenant_id: str, domain: str) -> list[dict]:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT version, content_hash, attributes, superseded_at FROM source_record_history "
+                        "WHERE record_id = %s AND tenant_id = %s AND domain = %s ORDER BY version", (record_id, tenant_id, domain))
+            return [dict(r) for r in cur.fetchall()]
+
+    def delete_record_history(self, record_id: str, tenant_id: str, domain: str) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM source_record_history WHERE record_id = %s AND tenant_id = %s AND domain = %s", (record_id, tenant_id, domain))
+
+    def supersede_pending_candidates(self, tenant_id: str, domain: str, record_id: str) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE match_candidates SET status = 'superseded', decided_at = %s, decided_by = 'system:record_changed' "
+                        "WHERE tenant_id = %s AND domain = %s AND status = 'pending' AND (record_a_id = %s OR record_b_id = %s)",
+                        (now_iso(), tenant_id, domain, record_id, record_id))
+            return cur.rowcount
+
+    def count_duplicate_raw_keys(self, domain: str) -> int:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM (SELECT 1 FROM source_records WHERE domain = %s "
+                        "GROUP BY tenant_id, source_system, source_record_id HAVING COUNT(*) > 1) AS t", (domain,))
+            return cur.fetchone()["n"]
+
+    # --- Processing state, run log, deferred golden rebuilds (see pipeline.py) -------------------------
+    def set_processing_status(self, record_ids, tenant_id: str, domain: str, status: str, error: str | None = None) -> None:
+        ids = list(record_ids)
+        if ids:
+            with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+                cur.execute("UPDATE source_records SET processing_status = %s, processing_error = %s WHERE tenant_id = %s AND domain = %s "
+                            "AND id = ANY(%s)", (status, error, tenant_id, domain, ids))
+
+    def record_processing_failure(self, record_id: str, tenant_id: str, domain: str, message: str) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE source_records SET processing_error = %s, processing_attempts = processing_attempts + 1 "
+                        "WHERE id = %s AND tenant_id = %s AND domain = %s", (message, record_id, tenant_id, domain))
+
+    def list_unfinished_records(self, domain: str, limit: int, max_attempts: int) -> list[SourceRecord]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM source_records WHERE domain = %s AND processing_status <> 'matched' AND processing_attempts < %s "
+                        "ORDER BY ingested_at, id LIMIT %s", (domain, max_attempts, limit))
+            return [self._row_to_source_record(r) for r in cur.fetchall()]
+
+    def count_unfinished(self, domain: str) -> tuple:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN processing_error IS NOT NULL THEN 1 ELSE 0 END), 0) AS failing "
+                        "FROM source_records WHERE domain = %s AND processing_status <> 'matched'", (domain,))
+            r = cur.fetchone()
+        return r["n"], int(r["failing"])
+
+    def list_candidate_pairs(self, tenant_id: str, domain: str, record_id: str) -> dict:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, record_b_id AS other, status, score FROM match_candidates WHERE tenant_id = %s AND domain = %s AND record_a_id = %s AND status <> 'superseded' "
+                "UNION ALL SELECT id, record_a_id AS other, status, score FROM match_candidates WHERE tenant_id = %s AND domain = %s AND record_b_id = %s AND status <> 'superseded'",
+                (tenant_id, domain, record_id, tenant_id, domain, record_id))
+            return {r["other"]: {"id": r["id"], "status": r["status"], "score": r["score"]} for r in cur.fetchall()}
+
+    def create_run(self, run_id: str, tenant_id: str, domain: str, mode: str, triggered_by: str, started_at: str) -> None:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO pipeline_runs (run_id, tenant_id, domain, mode, triggered_by, status, started_at, finished_at, counts, errors) "
+                        "VALUES (%s, %s, %s, %s, %s, 'running', %s, NULL, '{}'::jsonb, '[]'::jsonb)", (run_id, tenant_id, domain, mode, triggered_by, started_at))
+
+    def finish_run(self, run_id: str, status: str, counts: dict, errors: list) -> None:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE pipeline_runs SET status = %s, finished_at = %s, counts = %s, errors = %s WHERE run_id = %s",
+                        (status, now_iso(), _j(counts), _j(errors), run_id))
+
+    def list_runs(self, domain: str | None = None, tenant_id: str | None = None, limit: int = 20) -> list[dict]:
+        sql, params = "SELECT * FROM pipeline_runs WHERE TRUE", []
+        for col, val in (("domain", domain), ("tenant_id", tenant_id)):
+            if val:
+                sql, params = sql + f" AND {col} = %s", params + [val]
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(sql + " ORDER BY started_at DESC, run_id DESC LIMIT %s", (*params, limit))
+            return [dict(r) for r in cur.fetchall()]
+
+    def mark_golden_dirty(self, rows: list[tuple]) -> None:
+        if rows:
+            with self._conn(tenant_id=rows[0][0]) as conn, conn.cursor() as cur:
+                cur.executemany("INSERT INTO golden_dirty (tenant_id, domain, entity_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", rows)
+
+    def list_golden_dirty(self, domain: str, limit: int = 10000) -> list[tuple]:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT tenant_id, entity_id FROM golden_dirty WHERE domain = %s ORDER BY entity_id LIMIT %s", (domain, limit))
+            return [(r["tenant_id"], r["entity_id"]) for r in cur.fetchall()]
+
+    def clear_golden_dirty(self, rows: list[tuple]) -> None:
+        if rows:
+            with self._conn(tenant_id=rows[0][0]) as conn, conn.cursor() as cur:
+                cur.executemany("DELETE FROM golden_dirty WHERE tenant_id = %s AND domain = %s AND entity_id = %s", rows)
+
+    def iter_raw_attributes(self, domain: str, tenant_id: str | None = None, source_system: str | None = None, batch: int = 5000):
+        last = ""
+        while True:
+            sql, params = "SELECT id, attributes FROM source_records WHERE domain = %s AND id > %s", [domain, last]
+            for col, val in (("tenant_id", tenant_id), ("source_system", source_system)):
+                if val:
+                    sql, params = sql + f" AND {col} = %s", params + [val]
+            with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+                cur.execute(sql + " ORDER BY id LIMIT %s", (*params, batch))
+                rows = cur.fetchall()
+            if not rows:
+                return
+            for r in rows:
+                yield r["attributes"] if isinstance(r["attributes"], dict) else json.loads(r["attributes"])
+            last = rows[-1]["id"]
+
+    def scrub_protected(self, domain: str, field: str, prefix: str) -> dict:
+        """See Store.scrub_protected. (Postgres SQL: written to the same shape, never run against a live server.)"""
+        done = {"lineage": 0, "golden": 0, "reasons": 0}
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE lineage SET old_value = CASE WHEN old_value IS NULL OR old_value LIKE '***%%' THEN old_value ELSE %s || right(old_value, 4) END, "
+                        "new_value = CASE WHEN new_value IS NULL OR new_value LIKE '***%%' THEN new_value ELSE %s || right(new_value, 4) END "
+                        "WHERE domain = %s AND field = %s AND ((old_value IS NOT NULL AND old_value NOT LIKE '***%%') OR (new_value IS NOT NULL AND new_value NOT LIKE '***%%'))",
+                        (prefix, prefix, domain, field))
+            done["lineage"] = cur.rowcount
+            col, table = golden.q(field), golden.q(golden.table_name(domain))
+            cur.execute(f"UPDATE {table} SET {col} = %s || right({col}, 4) WHERE {col} IS NOT NULL AND {col} NOT LIKE '***%%'", (prefix,))
+            done["golden"] = cur.rowcount
+            cur.execute("SELECT id, reasons FROM match_candidates WHERE domain = %s AND (reasons::text LIKE %s OR reasons::text LIKE %s)",
+                        (domain, f"%exact {field} match (%", f"%{field} disagrees (%"))
+            for r in cur.fetchall():
+                reasons = [protect.scrub_reason(field, x) for x in (r["reasons"] if isinstance(r["reasons"], list) else json.loads(r["reasons"]))]
+                cur.execute("UPDATE match_candidates SET reasons = %s WHERE id = %s", (_j(reasons), r["id"]))
+                done["reasons"] += 1
+        return done
+
+    # --- bulk load (app/bulk.py). Written to the same shape as the SQLite versions; never run against a live server. ----------
+    def has_source_records(self, tenant_id: str, domain: str) -> bool:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM source_records WHERE tenant_id = %s AND domain = %s LIMIT 1", (tenant_id, domain))
+            return cur.fetchone() is not None
+
+    def save_candidates_batch(self, candidates: list) -> None:
+        if candidates:
+            with self._conn(tenant_id=candidates[0].tenant_id) as conn, conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO match_candidates (id, tenant_id, domain, record_a_id, record_b_id, score, match_type, reasons, status, created_at, "
+                    "decided_at, decided_by, contributions) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [(c.id, c.tenant_id, c.domain, c.record_a_id, c.record_b_id, c.score, c.match_type, _j(c.reasons), c.status, c.created_at,
+                      c.decided_at, c.decided_by, _j(c.contributions)) for c in candidates])
+
+    def save_entities_batch(self, entities: list) -> None:
+        if not entities:
+            return
+        domain = entities[0].domain
+        self._ensure_entity_table(domain)
+        cols = self._entity_columns(domain)
+        if cols is None:
+            raise KeyError(f"No configuration is loaded for domain '{domain}', so its golden records cannot be written")
+        names = ["entity_id", "tenant_id", "status", "created_at", "updated_at", "quality_issues", *[f for f, _ in cols]]
+        updates = ", ".join(f"{golden.q(c)} = EXCLUDED.{golden.q(c)}" for c in names[1:])
+        rows = [[e.id, e.tenant_id, e.status, e.created_at, e.updated_at, _j(e.quality_issues) if e.quality_issues else None,
+                 *[e.attributes.get(f) for f, _ in cols]] for e in entities]
+        with self._conn(tenant_id=entities[0].tenant_id) as conn, conn.cursor() as cur:
+            cur.executemany(f"INSERT INTO {golden.q(golden.table_name(domain))} ({', '.join(golden.q(c) for c in names)}) "
+                            f"VALUES ({', '.join(['%s'] * len(names))}) ON CONFLICT (entity_id) DO UPDATE SET {updates}", rows)
+
+    def rollback_bulk(self, tenant_id: str, domain: str, token: str) -> None:
+        rec, ent = f"rec\\_{token}\\_%", f"ent\\_{token}\\_%"
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM merge_audits WHERE tenant_id = %s AND domain = %s AND candidate_id IN (SELECT id FROM match_candidates WHERE tenant_id = %s AND domain = %s "
+                        "AND record_a_id LIKE %s)", (tenant_id, domain, tenant_id, domain, rec))   # the pairs this load made were audited too
+            for table, col, pattern in (("blocking_keys", "record_id", rec), ("standardized_records", "record_id", rec), ("match_candidates", "record_a_id", rec),
+                                        ("lineage", "entity_id", ent), ("source_records", "id", rec)):
+                cur.execute(f"DELETE FROM {table} WHERE tenant_id = %s AND domain = %s AND {col} LIKE %s", (tenant_id, domain, pattern))
+            cur.execute(f"DELETE FROM {golden.q(golden.table_name(domain))} WHERE tenant_id = %s AND entity_id LIKE %s", (tenant_id, ent))
+
+    # --- onboarding a new source onto existing data (app/bulk.py). Same shape as the SQLite versions; never run against a live server. ----
+    def count_tenant_records(self, tenant_id: str, domain: str) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM source_records WHERE tenant_id = %s AND domain = %s", (tenant_id, domain))
+            return cur.fetchone()["n"]
+
+    def unfinished_in(self, tenant_id: str, domain: str) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM source_records WHERE tenant_id = %s AND domain = %s AND processing_status <> 'matched'", (tenant_id, domain))
+            return cur.fetchone()["n"]
+
+    def blocking_members(self, tenant_id: str, domain: str, keys) -> dict:
+        keys, out = list(keys), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(keys), 500):
+                cur.execute("SELECT blocking_key, record_id FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND blocking_key = ANY(%s)",
+                            (tenant_id, domain, keys[i:i + 500]))
+                for r in cur.fetchall():
+                    out.setdefault(r["blocking_key"], []).append(r["record_id"])
+        return out
+
+    def get_record_entities(self, tenant_id: str, domain: str, record_ids) -> dict:
+        ids, out = list(record_ids), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute("SELECT id, entity_id FROM source_records WHERE tenant_id = %s AND domain = %s AND id = ANY(%s)", (tenant_id, domain, ids[i:i + 500]))
+                out.update({r["id"]: r["entity_id"] for r in cur.fetchall()})
+        return out
+
+    def get_entities_batch(self, tenant_id: str, domain: str, entity_ids) -> dict:
+        self._ensure_entity_table(domain)
+        ids, out = list(entity_ids), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute(f"SELECT * FROM {golden.q(golden.table_name(domain))} WHERE tenant_id = %s AND entity_id = ANY(%s)", (tenant_id, ids[i:i + 500]))
+                for row in cur.fetchall():
+                    out[row["entity_id"]] = self._row_to_entity(row, domain, [])
+        return out
+
+    def list_records_of_entities(self, tenant_id: str, domain: str, entity_ids) -> list:
+        ids, out = list(entity_ids), []
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute("SELECT * FROM source_records WHERE tenant_id = %s AND domain = %s AND entity_id = ANY(%s) ORDER BY ingested_at, id",
+                            (tenant_id, domain, ids[i:i + 500]))
+                out += [self._row_to_source_record(r) for r in cur.fetchall()]
+        return out
+
+    def apply_onboarding(self, tenant_id: str, domain: str, reassign: list, entities: list, lineage: list, *, history=(), record_updates=(), supersede=(),
+                         derived=(), candidates=()) -> None:
+        table = golden.q(golden.table_name(domain))
+        self._ensure_entity_table(domain)
+        cols = self._entity_columns(domain)
+        names = ["entity_id", "tenant_id", "status", "created_at", "updated_at", "quality_issues", *[f for f, _ in cols]]
+        updates = ", ".join(f"{golden.q(c)} = EXCLUDED.{golden.q(c)}" for c in names[1:])
+        rows = [[e.id, e.tenant_id, e.status, e.created_at, e.updated_at, _j(e.quality_issues) if e.quality_issues else None,
+                 *[e.attributes.get(f) for f, _ in cols]] for e in entities]
+        now = now_iso()
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:  # one transaction: the connection rolls back on any exception
+            if history:
+                cur.executemany("INSERT INTO source_record_history (tenant_id, domain, record_id, version, content_hash, attributes, superseded_at) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (record_id, version) DO UPDATE SET content_hash = EXCLUDED.content_hash, "
+                                "attributes = EXCLUDED.attributes, superseded_at = EXCLUDED.superseded_at", [(t, d, rid, v, h, _j(a), at) for t, d, rid, v, h, a, at in history])
+            if record_updates:
+                cur.executemany("UPDATE source_records SET attributes = %s, content_hash = %s, version = %s, updated_at = %s, processing_status = 'matched', "
+                                "processing_attempts = 0, processing_error = NULL WHERE id = %s AND tenant_id = %s AND domain = %s",
+                                [(_j(a), h, v, at, rid, tenant_id, domain) for rid, a, h, v, at in record_updates])
+            if supersede:
+                ids = list(supersede)
+                for i in range(0, len(ids), 1000):
+                    part = ids[i:i + 1000]
+                    cur.execute("UPDATE match_candidates SET status = 'superseded', decided_at = %s, decided_by = 'system:record_changed' WHERE tenant_id = %s AND domain = %s "
+                                "AND status = 'pending' AND (record_a_id = ANY(%s) OR record_b_id = ANY(%s))", (now, tenant_id, domain, part, part))
+            if derived:
+                cur.executemany("DELETE FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = %s", [(t, d, rid) for t, d, rid, *_ in derived])
+                cur.executemany("INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)",
+                                [(t, d, rid, k) for t, d, rid, _m, _c, _f, ks in derived for k in ks])
+                cur.executemany("INSERT INTO standardized_records (tenant_id, domain, record_id, matching, cleansed, fingerprint, standardized_at) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                                "ON CONFLICT (tenant_id, domain, record_id) DO UPDATE SET matching = EXCLUDED.matching, cleansed = EXCLUDED.cleansed, "
+                                "fingerprint = EXCLUDED.fingerprint, standardized_at = EXCLUDED.standardized_at",
+                                [(t, d, rid, _j(m), _j(c), fp, now) for t, d, rid, m, c, fp, _ks in derived])
+            if candidates:
+                cur.executemany("INSERT INTO match_candidates (id, tenant_id, domain, record_a_id, record_b_id, score, match_type, reasons, status, created_at, "
+                                "decided_at, decided_by, contributions) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                                [(c.id, c.tenant_id, c.domain, c.record_a_id, c.record_b_id, c.score, c.match_type, _j(c.reasons), c.status, c.created_at,
+                                  c.decided_at, c.decided_by, _j(c.contributions)) for c in candidates])
+            for loser, survivor in reassign:
+                cur.execute("UPDATE source_records SET entity_id = %s WHERE tenant_id = %s AND domain = %s AND entity_id = %s", (survivor, tenant_id, domain, loser))
+                cur.execute(f"UPDATE {table} SET status = 'merged' WHERE tenant_id = %s AND entity_id = %s", (tenant_id, loser))
+            if rows:
+                cur.executemany(f"INSERT INTO {table} ({', '.join(golden.q(c) for c in names)}) VALUES ({', '.join(['%s'] * len(names))}) "
+                                f"ON CONFLICT (entity_id) DO UPDATE SET {updates}", rows)
+            if lineage:
+                cur.executemany("INSERT INTO lineage (id, tenant_id, domain, entity_id, field, old_value, new_value, source_record_id, reason, changed_at) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", [(ev.id, ev.tenant_id, ev.domain, ev.entity_id, ev.field, ev.old_value, ev.new_value,
+                                                                              ev.source_record_id, ev.reason, ev.changed_at) for ev in lineage])
+
+    def blocking_keys_of(self, tenant_id: str, domain: str, record_ids) -> dict:
+        ids, out = list(record_ids), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute("SELECT record_id, blocking_key FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = ANY(%s)", (tenant_id, domain, ids[i:i + 500]))
+                for r in cur.fetchall():
+                    out.setdefault(r["record_id"], []).append(r["blocking_key"])
+        return out
+
+    def get_matching_many(self, tenant_id: str, domain: str, record_ids) -> dict:
+        ids, out = list(record_ids), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute("SELECT record_id, matching FROM standardized_records WHERE tenant_id = %s AND domain = %s AND record_id = ANY(%s)", (tenant_id, domain, ids[i:i + 500]))
+                out.update({r["record_id"]: r["matching"] for r in cur.fetchall()})
+        return out
+
+    # --- label hygiene and merge audits (same shape as the SQLite versions; never run against a live server) -------------------------
+    AUDIT_VERDICTS = ("correct", "wrong")
+
+    @staticmethod
+    def _candidate_from_row(r) -> MatchCandidate:
+        return MatchCandidate(id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"], record_a_id=r["record_a_id"], record_b_id=r["record_b_id"], score=r["score"],
+                              match_type=r["match_type"], reasons=r["reasons"], contributions=r["contributions"] or [], status=r["status"],
+                              created_at=r["created_at"], decided_at=r["decided_at"], decided_by=r["decided_by"])
+
+    def flag_merge_audits(self, tenant_id: str, domain: str, candidate_ids) -> int:
+        ids = list(candidate_ids)
+        if not ids:
+            return 0
+        flagged, now = 0, now_iso()
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 1000):
+                cur.execute("SELECT id, decided_by FROM match_candidates WHERE tenant_id = %s AND domain = %s AND id = ANY(%s)", (tenant_id, domain, ids[i:i + 1000]))
+                mine = [(r["id"], r["decided_by"]) for r in cur.fetchall()]
+                for c, by in mine:
+                    cur.execute("INSERT INTO merge_audits (candidate_id, tenant_id, domain, sampled_at, made_by) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (candidate_id) DO NOTHING",
+                                (c, tenant_id, domain, now, "promoted" if by == "system:learned_scorer" else "rule"))
+                    flagged += cur.rowcount
+        return flagged
+
+    def sample_merge_audit(self, tenant_id: str, domain: str, rate: float, seed=None) -> int:
+        import random
+        if not 0 < rate <= 1:
+            raise ValueError("rate must be above 0 and at most 1")
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM match_candidates mc WHERE tenant_id = %s AND domain = %s AND status = 'confirmed' AND decided_by LIKE 'system:%%' "
+                        "AND NOT EXISTS (SELECT 1 FROM merge_audits a WHERE a.candidate_id = mc.id) ORDER BY id", (tenant_id, domain))
+            ids = [r["id"] for r in cur.fetchall()]
+        rng = random.Random(seed)
+        return self.flag_merge_audits(tenant_id, domain, [i for i in ids if rng.random() < rate])
+
+    def record_merge_audit(self, candidate_id: str, tenant_id: str, domain: str, verdict: str, audited_by: str) -> bool:
+        if verdict not in self.AUDIT_VERDICTS:
+            raise ValueError(f"verdict must be one of {self.AUDIT_VERDICTS}")
+        if not audited_by or audited_by.startswith("system:"):
+            raise ValueError("a verdict must come from a person, not from the system")
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE merge_audits SET verdict = %s, audited_by = %s, audited_at = %s WHERE candidate_id = %s AND tenant_id = %s AND domain = %s",
+                        (verdict, audited_by, now_iso(), candidate_id, tenant_id, domain))
+            return cur.rowcount == 1
+
+    def list_merge_audits(self, tenant_id: str, domain: str, pending_only: bool = False) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT a.candidate_id, a.sampled_at, a.verdict, a.audited_by, a.audited_at, COALESCE(a.made_by, 'rule') AS made_by, mc.score, mc.record_a_id, mc.record_b_id, mc.decided_by FROM merge_audits a "
+                        "JOIN match_candidates mc ON mc.id = a.candidate_id WHERE a.tenant_id = %s AND a.domain = %s" + (" AND a.verdict IS NULL" if pending_only else "")
+                        + " ORDER BY a.sampled_at, a.candidate_id", (tenant_id, domain))
+            return [dict(r) for r in cur.fetchall()]
+
+    def human_labeled_candidates(self, tenant_id: str, domain: str) -> list:
+        out, seen = [], set()
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT mc.*, CASE a.verdict WHEN 'correct' THEN 1 ELSE 0 END AS label FROM merge_audits a JOIN match_candidates mc ON mc.id = a.candidate_id "
+                        "WHERE a.tenant_id = %s AND a.domain = %s AND a.verdict IS NOT NULL AND (mc.decided_by IS NULL OR mc.decided_by NOT LIKE 'unmerge:%%') ORDER BY mc.id", (tenant_id, domain))
+            for r in cur.fetchall():
+                out.append((self._candidate_from_row(r), r["label"], "audit"))
+                seen.add(r["id"])
+            cur.execute("SELECT mc.*, CASE mc.status WHEN 'confirmed' THEN 1 ELSE 0 END AS label FROM match_candidates mc WHERE mc.tenant_id = %s AND mc.domain = %s "
+                        "AND mc.status IN ('confirmed', 'rejected') AND mc.decided_by IS NOT NULL AND mc.decided_by NOT LIKE 'system:%%' ORDER BY mc.id", (tenant_id, domain))
+            for r in cur.fetchall():
+                if r["id"] not in seen:
+                    out.append((self._candidate_from_row(r), r["label"], "steward"))
+        return out
+
+    def count_auto_merges(self, tenant_id: str, domain: str) -> dict:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT CASE WHEN decided_by = 'system:learned_scorer' THEN 'promoted' ELSE 'rule' END AS stratum, COUNT(*) AS n FROM match_candidates "
+                        "WHERE tenant_id = %s AND domain = %s AND status = 'confirmed' AND decided_by LIKE 'system:%%' GROUP BY stratum", (tenant_id, domain))
+            counts = {"rule": 0, "promoted": 0}
+            counts.update({r["stratum"]: r["n"] for r in cur.fetchall()})
+        return counts
+
+    # --- unmerge (same shape as the SQLite versions; never run against a live server) ----------------------------------------
+    def confirmed_pairs_among(self, tenant_id: str, domain: str, record_ids) -> list:
+        ids, out, listed = set(record_ids), [], list(set(record_ids))
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(listed), 500):
+                chunk = listed[i:i + 500]
+                cur.execute("SELECT id, record_a_id, record_b_id FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'confirmed' AND record_a_id = ANY(%s)", (tenant_id, domain, chunk))
+                out.extend((r["id"], r["record_a_id"], r["record_b_id"]) for r in cur.fetchall() if r["record_b_id"] in ids)
+        return out
+
+    def has_separations(self, tenant_id: str, domain: str) -> bool:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'rejected' AND decided_by LIKE 'unmerge:%%' LIMIT 1", (tenant_id, domain))
+            return cur.fetchone() is not None
+
+    def separated_partners(self, tenant_id: str, domain: str, record_id: str) -> set:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT record_a_id, record_b_id FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'rejected' AND decided_by LIKE 'unmerge:%%' "
+                        "AND (record_a_id = %s OR record_b_id = %s)", (tenant_id, domain, record_id, record_id))
+            rows = cur.fetchall()
+        return {r["record_b_id"] if r["record_a_id"] == record_id else r["record_a_id"] for r in rows}
+
+    def entities_separated(self, tenant_id: str, domain: str, entity_a: str, entity_b: str):
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT mc.id FROM match_candidates mc JOIN source_records ra ON ra.id = mc.record_a_id AND ra.tenant_id = mc.tenant_id AND ra.domain = mc.domain "
+                        "JOIN source_records rb ON rb.id = mc.record_b_id AND rb.tenant_id = mc.tenant_id AND rb.domain = mc.domain "
+                        "WHERE mc.tenant_id = %s AND mc.domain = %s AND mc.status = 'rejected' AND mc.decided_by LIKE 'unmerge:%%' "
+                        "AND ((ra.entity_id = %s AND rb.entity_id = %s) OR (ra.entity_id = %s AND rb.entity_id = %s)) LIMIT 1", (tenant_id, domain, entity_a, entity_b, entity_b, entity_a))
+            row = cur.fetchone()
+        return row["id"] if row else None
+
+    def separation_violations(self, tenant_id: str, domain: str) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT mc.id, mc.record_a_id, mc.record_b_id, ra.entity_id FROM match_candidates mc JOIN source_records ra ON ra.id = mc.record_a_id AND ra.tenant_id = mc.tenant_id "
+                        "AND ra.domain = mc.domain JOIN source_records rb ON rb.id = mc.record_b_id AND rb.tenant_id = mc.tenant_id AND rb.domain = mc.domain "
+                        "WHERE mc.tenant_id = %s AND mc.domain = %s AND mc.status = 'rejected' AND mc.decided_by LIKE 'unmerge:%%' "
+                        "AND ra.entity_id IS NOT NULL AND ra.entity_id = rb.entity_id", (tenant_id, domain))
+            rows = cur.fetchall()
+        return [(r["id"], r["record_a_id"], r["record_b_id"], r["entity_id"]) for r in rows]
+
+    def separation_pairs(self, tenant_id: str, domain: str) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT record_a_id, record_b_id FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'rejected' AND decided_by LIKE 'unmerge:%%'", (tenant_id, domain))
+            rows = cur.fetchall()
+        return [(r["record_a_id"], r["record_b_id"]) for r in rows]
+
+    # --- the audit page and the monitor, computed in SQL (same shape as the SQLite versions; never run against a live server) ---
+    def audit_counts(self, tenant_id: str, domain: str) -> dict:
+        out = {"rule": {"audited": 0, "wrong": 0}, "promoted": {"audited": 0, "wrong": 0}, "waiting": 0}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(made_by, 'rule') AS kind, COUNT(*) FILTER (WHERE verdict IS NOT NULL) AS audited, COUNT(*) FILTER (WHERE verdict = 'wrong') AS wrong, "
+                        "COUNT(*) FILTER (WHERE verdict IS NULL) AS waiting FROM merge_audits WHERE tenant_id = %s AND domain = %s GROUP BY kind", (tenant_id, domain))
+            for r in cur.fetchall():
+                out[r["kind"]]["audited"], out[r["kind"]]["wrong"] = r["audited"], r["wrong"]
+                out["waiting"] += r["waiting"]
+        return out
+
+    def audited_wrong(self, tenant_id: str, domain: str) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT candidate_id, COALESCE(made_by, 'rule') AS kind FROM merge_audits WHERE tenant_id = %s AND domain = %s AND verdict = 'wrong' ORDER BY audited_at, candidate_id", (tenant_id, domain))
+            return [(r["candidate_id"], r["kind"]) for r in cur.fetchall()]
+
+    def pending_audits(self, tenant_id: str, domain: str, limit: int) -> list:
+        out = []
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for kind_clause in ("a.made_by = 'promoted'", "(a.made_by = 'rule' OR a.made_by IS NULL)"):
+                if len(out) >= limit:
+                    break
+                cur.execute("SELECT a.candidate_id, a.sampled_at, COALESCE(a.made_by, 'rule') AS made_by FROM merge_audits a JOIN match_candidates mc ON mc.id = a.candidate_id "
+                            f"WHERE a.tenant_id = %s AND a.domain = %s AND a.verdict IS NULL AND mc.status = 'confirmed' AND {kind_clause} "
+                            "ORDER BY a.sampled_at, a.candidate_id LIMIT %s", (tenant_id, domain, limit - len(out)))
+                out.extend(dict(r) for r in cur.fetchall())
+        return out
+
+    # --- pages of the two lists a person scrolls (same shape as the SQLite versions; never run against a live server) ---------------
+    def pending_page(self, tenant_id: str, domain: str, limit: int, after=None) -> list:
+        sql, params = "SELECT * FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'pending'", [tenant_id, domain]
+        if after is not None:
+            sql, params = sql + " AND (score, id) < (%s, %s)", params + [after[0], after[1]]
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(sql + " ORDER BY score DESC, id DESC LIMIT %s", (*params, limit))
+            return [self._candidate_from_row(r) for r in cur.fetchall()]
+
+    def count_pending(self, tenant_id: str, domain: str) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'pending'", (tenant_id, domain))
+            return cur.fetchone()["n"]
+
+    def get_source_records_batch(self, tenant_id: str, domain: str, record_ids) -> dict:
+        ids, out = list(dict.fromkeys(record_ids)), {}
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for i in range(0, len(ids), 500):
+                cur.execute("SELECT * FROM source_records WHERE tenant_id = %s AND domain = %s AND id = ANY(%s)", (tenant_id, domain, ids[i:i + 500]))
+                for r in cur.fetchall():
+                    out[r["id"]] = self._row_to_source_record(r)
+        return out
+
+    def entities_page(self, tenant_id: str, domain: str, limit: int, after_id: str | None = None, status: str | None = None) -> list:
+        self._ensure_entity_table(domain)
+        sql, params = f"SELECT entity_id FROM {golden.q(golden.table_name(domain))} WHERE tenant_id = %s", [tenant_id]
+        if after_id is not None:
+            sql, params = sql + " AND entity_id > %s", params + [after_id]
+        if status:
+            sql, params = sql + " AND status = %s", params + [status]
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(sql + " ORDER BY entity_id LIMIT %s", (*params, limit))
+            ids = [r["entity_id"] for r in cur.fetchall()]
+        entities = self.get_entities_batch(tenant_id, domain, ids)
+        sources: dict = {}
+        for rec in self.list_records_of_entities(tenant_id, domain, ids):
+            sources.setdefault(rec.entity_id, []).append(rec.id)
+        page = []
+        for entity_id in ids:
+            if entity_id in entities:
+                entities[entity_id].source_record_ids = sources.get(entity_id, [])
+                page.append(entities[entity_id])
+        return page

@@ -86,6 +86,7 @@ def running_server(env_overrides: dict | None = None, db_path: str = "validate_t
     to its own SQLite file so it never touches your real mdm.db."""
     env = os.environ.copy()
     env["DATABASE_URL"] = db_path  # plain path -> SQLite backend, isolated from real data
+    env.pop("MDM_DEV_MODE", None)  # a stray MDM_DEV_MODE in the caller's shell must not turn a secure-mode test into a dev-mode one
     env.update(env_overrides or {})
 
     proc = subprocess.Popen(
@@ -97,7 +98,7 @@ def running_server(env_overrides: dict | None = None, db_path: str = "validate_t
         for _ in range(40):  # ~10s max wait
             try:
                 with socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
-                    status, _ = http_get(f"{base}/v1/domains")
+                    status, _ = http_get(f"{base}/healthz")   # needs no key, so it works in secure mode too
                     if status == 200:
                         break
             except (ConnectionRefusedError, OSError):
@@ -158,7 +159,7 @@ def section_fastapi_http(require: bool):
         return
 
     try:
-        with running_server() as base:
+        with running_server(env_overrides={"MDM_DEV_MODE": "1"}) as base:   # no keys: this section tests the API itself, in dev mode
             status, body = http_get(f"{base}/v1/domains")
             assert status == 200 and len(body) == 3, f"expected 3 domains, got {body}"
             report("GET /v1/domains", "PASS", f"{len(body)} domains registered")
@@ -211,10 +212,15 @@ def section_rbac_http(require: bool):
         store.save_api_key(ApiKeyRecord(tenant_id="validate_tenant", role="api_consumer",
                                          key_hash=reader_hash, label="validate reader"))
 
-        with running_server(env_overrides={"MDM_ENABLE_AUTH": "true"}, db_path=db_path) as base:
+        with running_server(db_path=db_path) as base:   # no overrides: authentication is the DEFAULT now
             status, _ = http_get(f"{base}/v1/customer/entities")
             assert status == 401, f"expected 401 with no key, got {status}"
-            report("No API key -> 401", "PASS")
+            report("No API key -> 401 (by default: nothing was set)", "PASS")
+
+            for path in ("/v1/domains", "/v1/customer/schema"):
+                status, _ = http_get(f"{base}{path}")
+                assert status == 401, f"expected 401 for {path} with no key, got {status}"
+            report("Domains and schema need a key too", "PASS")
 
             status, _ = http_get(f"{base}/v1/customer/entities",
                                   headers={"Authorization": f"Bearer {admin_plain}"})

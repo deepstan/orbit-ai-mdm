@@ -1,0 +1,29 @@
+{
+ "today: the rule score, best cutoff": {
+  "auto_point": 70336,
+  "auto_false_point": 35,
+  "auto_safe": 53011,
+  "true_dups_auto": 70301,
+  "review_left": 44299,
+  "review_precision": 0.234,
+  "auto_rejected": 15766
+ },
+ "model, trained on ALL labelled pairs (upper bound)": {
+  "auto_point": 78473,
+  "auto_false_point": 39,
+  "auto_safe": 74945,
+  "true_dups_auto": 78434,
+  "review_left": 2296,
+  "review_precision": 0.97,
+  "auto_rejected": 49632
+ },
+ "model, trained on review band + 2% audit (realistic)": {
+  "auto_point": 78405,
+  "auto_false_point": 39,
+  "auto_safe": 73897,
+  "true_dups_auto": 78366,
+  "review_left": 2375,
+  "review_precision": 0.966,
+  "auto_rejected": 49621
+ }
+}

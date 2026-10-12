@@ -64,10 +64,14 @@ See setup_rls.py for a role-creation example that gets this right.
 # failure mode this whole feature exists to prevent).
 TENANT_SCOPED_TABLES = [
     "source_records",
-    "entities",
     "match_candidates",
     "lineage",
     "blocking_keys",
+    "source_record_history",
+    "merge_audits",
+    "pipeline_runs",
+    "golden_dirty",
+    "standardized_records",
     "audit_log",
     "usage_events",
     # NOTE: api_keys deliberately excluded -- see the module docstring
@@ -76,9 +80,16 @@ TENANT_SCOPED_TABLES = [
 ]
 
 
-def generate_rls_sql() -> str:
+def tenant_scoped_tables(domains=None) -> list:
+    """The fixed tables plus one golden-record table per domain (default: every registered domain). Re-run
+    `setup_rls.py enable` after adding a custom domain so its new table gets a policy."""
+    from .domains import REGISTRY
+    return TENANT_SCOPED_TABLES + [f"entity_{d}" for d in (domains if domains is not None else REGISTRY)]
+
+
+def generate_rls_sql(tables=None) -> str:
     statements = []
-    for table in TENANT_SCOPED_TABLES:
+    for table in (tables if tables is not None else tenant_scoped_tables()):
         statements.append(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")
         statements.append(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY;")
         statements.append(f"""
@@ -89,12 +100,12 @@ CREATE POLICY tenant_isolation ON {table}
     return "\n\n".join(statements)
 
 
-def generate_disable_rls_sql() -> str:
+def generate_disable_rls_sql(tables=None) -> str:
     """The reverse operation -- drops the policies and disables RLS.
     For rolling back if something goes wrong, or for local dev where
     you've decided RLS is more friction than it's worth right now."""
     statements = []
-    for table in TENANT_SCOPED_TABLES:
+    for table in (tables if tables is not None else tenant_scoped_tables()):
         statements.append(f"DROP POLICY IF EXISTS tenant_isolation ON {table};")
         statements.append(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY;")
     return "\n".join(statements)

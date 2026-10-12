@@ -5,47 +5,79 @@
     "company_name": {
       "normalize": [
         "name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_text"
       ]
     },
     "tax_id": {
       "normalize": [
         "alnum_id"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_id"
       ]
     },
     "duns_number": {
       "normalize": [
         "identifier"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_id"
       ]
     },
     "contact_email": {
       "normalize": [
         "email"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_email"
       ]
     },
     "contact_phone": {
       "normalize": [
         "phone"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_phone"
       ]
     },
     "address_line1": {
       "normalize": [
         "address_line"
+      ],
+      "present": [
+        "present_address"
       ]
     },
     "city": {
       "normalize": [
         "name"
+      ],
+      "present": [
+        "present_title"
       ]
     },
     "state": {
       "normalize": [
         "text",
         "upper"
+      ],
+      "present": [
+        "present_upper"
       ]
     },
     "postal_code": {
       "normalize": [
         "postal_code"
+      ],
+      "present": [
+        "present_postal"
       ]
     },
     "country": {
@@ -53,13 +85,20 @@
         "text",
         "upper"
       ],
-      "default": "US"
+      "default": "US",
+      "present": [
+        "present_upper"
+      ]
     }
   },
   "deterministic_fields": [
     "tax_id",
     "duns_number",
     "contact_email"
+  ],
+  "exclusive_fields": [
+    "tax_id",
+    "duns_number"
   ],
   "fuzzy_weights": {
     "address_line1": 0.2,
@@ -88,6 +127,13 @@
       "postal_code"
     ]
   ],
+  "mismatch_penalties": {
+    "tax_id": 0.4,
+    "duns_number": 0.4,
+    "contact_email": 0.1,
+    "contact_phone": 0.1
+  },
+  "max_bucket_size": 500,
   "survivorship": {
     "default": "most_recent",
     "fields": {

@@ -25,7 +25,8 @@ the `verify` command below exists specifically to catch.
 import argparse
 import sys
 
-from app.rls_policies import TENANT_SCOPED_TABLES, generate_disable_rls_sql, generate_rls_sql
+from app.domain_config import load_configured_domains
+from app.rls_policies import generate_disable_rls_sql, generate_rls_sql, tenant_scoped_tables
 
 
 def _get_connection(db_url: str | None):
@@ -49,7 +50,7 @@ def cmd_enable(args):
         with conn.cursor() as cur:
             cur.execute(generate_rls_sql())
         conn.commit()
-        print(f"RLS policies applied to: {', '.join(TENANT_SCOPED_TABLES)}")
+        print(f"RLS policies applied to: {', '.join(tenant_scoped_tables())}")
         print("\n⚠️  This does NOTHING if your app connects as a superuser or as these "
               "tables' owner. Run `python3 setup_rls.py verify` AS YOUR APP'S ACTUAL "
               "RUNTIME ROLE to confirm RLS is genuinely in effect, not just 'enabled'.")
@@ -85,7 +86,7 @@ def cmd_verify(args):
             if bypasses_rls:
                 problems.append(f"'{user}' has the BYPASSRLS attribute -- same effect as superuser.")
 
-            for table in TENANT_SCOPED_TABLES:
+            for table in tenant_scoped_tables():
                 cur.execute(
                     "SELECT tableowner FROM pg_tables WHERE tablename = %s;", (table,)
                 )
@@ -125,7 +126,7 @@ def cmd_create_role(args):
                 f"END IF; END $$;",
                 (args.password,),
             )
-            for table in TENANT_SCOPED_TABLES + ["api_keys"]:
+            for table in tenant_scoped_tables() + ["api_keys"]:
                 cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {args.role_name};")
         conn.commit()
         print(f"Role '{args.role_name}' created (or already existed) with NOSUPERUSER NOBYPASSRLS, "
@@ -138,6 +139,7 @@ def cmd_create_role(args):
 
 
 def main():
+    load_configured_domains()  # custom domains have their own golden-record tables
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default=None, help="postgresql:// URL (default: DATABASE_URL env var)")
     sub = parser.add_subparsers(dest="command", required=True)

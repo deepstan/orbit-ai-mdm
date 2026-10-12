@@ -1,0 +1,135 @@
+{
+  "label": "baseline",
+  "overall": {
+    "all_pairs": 776520,
+    "bucket_max": 35,
+    "bucket_p99": 9,
+    "candidate_pairs": 6695,
+    "fp": 723,
+    "pending": 5757,
+    "pending_true": 110,
+    "pred_pairs": 1032,
+    "tp": 309,
+    "true_pairs": 540
+  },
+  "records": 2160,
+  "records_per_sec": 54.3,
+  "scale": 20,
+  "scenarios": {
+    "email_changed": {
+      "is_positive": 1,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "exact_dup": {
+      "is_positive": 1,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "household": {
+      "is_positive": 0,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "jr_sr": {
+      "is_positive": 0,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "missing_fields": {
+      "is_positive": 1,
+      "merged": 0,
+      "pairs": 60,
+      "queued": 60,
+      "shares_key": 60
+    },
+    "moved_typo_phone": {
+      "is_positive": 1,
+      "merged": 0,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 0
+    },
+    "nickname": {
+      "is_positive": 1,
+      "merged": 10,
+      "pairs": 60,
+      "queued": 50,
+      "shares_key": 60
+    },
+    "nickname_with_email": {
+      "is_positive": 1,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "phone_changed": {
+      "is_positive": 1,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "placeholder": {
+      "is_positive": 0,
+      "merged": 60,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 60
+    },
+    "same_name": {
+      "is_positive": 0,
+      "merged": 21,
+      "pairs": 60,
+      "queued": 39,
+      "shares_key": 60
+    },
+    "typo_early": {
+      "is_positive": 1,
+      "merged": 0,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 0
+    },
+    "typo_late": {
+      "is_positive": 1,
+      "merged": 59,
+      "pairs": 60,
+      "queued": 0,
+      "shares_key": 59
+    }
+  },
+  "seconds": 39.77,
+  "seeds": [
+    1,
+    2,
+    3
+  ],
+  "summary": {
+    "auto_precision": 0.29941860465116277,
+    "auto_recall": 0.5722222222222222,
+    "avg_candidates_per_record": 6.199074074074074,
+    "bucket_max": 35,
+    "bucket_p99": 9,
+    "false_merged_pairs": 723,
+    "neg_queued_rate": 0.1625,
+    "neg_wrong_merge_rate": 0.8375,
+    "pos_auto_recall": 0.5722222222222222,
+    "pos_blocking_recall": 0.7759259259259259,
+    "pos_recall_with_review": 0.7759259259259259,
+    "records": 2160,
+    "records_per_sec": 54.3,
+    "reduction_ratio": 0.9913782001751403,
+    "review_pairs": 5757,
+    "review_precision": 0.019107173875282265
+  }
+}

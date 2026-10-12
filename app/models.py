@@ -31,6 +31,7 @@ def new_id(prefix: str = "") -> str:
 CUSTOMER_SCHEMA_FIELDS = [
     "first_name",
     "last_name",
+    "name_suffix",
     "email",
     "phone",
     "address_line1",
@@ -79,6 +80,14 @@ class SourceRecord:
     domain: str = DEFAULT_DOMAIN
     ingested_at: str = field(default_factory=now_iso)
     entity_id: Optional[str] = None  # set once clustered into a golden record
+    content_hash: Optional[str] = None  # sha256 of the canonical payload: what makes re-ingesting the same record a no-op
+    version: int = 1                     # 1 + the number of times the source changed this record
+    updated_at: Optional[str] = None     # when the current version arrived (None = still the first)
+    # Where the record is on its way from raw to golden. landed -> staged -> matched (the only finished state). A record that
+    # stops short is RESUMED when it is sent again or by `process-pending`, never mistaken for a finished duplicate.
+    processing_status: str = "landed"
+    processing_attempts: int = 0
+    processing_error: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +98,8 @@ class MatchCandidate:
     score: float
     match_type: str  # "deterministic" | "fuzzy" | "llm_adjudicated"
     reasons: list[str] = field(default_factory=list)
+    # Per-field breakdown of the score (field, state, similarity, points) -- what a steward needs to see WHY.
+    contributions: list = field(default_factory=list)
     id: str = field(default_factory=lambda: new_id("cand_"))
     tenant_id: str = DEFAULT_TENANT
     domain: str = DEFAULT_DOMAIN
@@ -163,3 +174,5 @@ class Entity:
     source_record_ids: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
+    # Values that could not be cast to their field's declared type (app/fieldtypes.py). The record is kept; the value is NULL.
+    quality_issues: list = field(default_factory=list)

@@ -4,43 +4,83 @@
   "fields": {
     "first_name": {
       "normalize": [
-        "name"
+        "given_name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_name"
       ]
     },
     "last_name": {
       "normalize": [
         "name"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_name"
+      ]
+    },
+    "name_suffix": {
+      "normalize": [
+        "suffix"
+      ],
+      "sources": [
+        "name_suffix",
+        "last_name"
+      ],
+      "present": [
+        "present_suffix"
       ]
     },
     "email": {
       "normalize": [
         "email"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_email"
       ]
     },
     "phone": {
       "normalize": [
         "phone"
+      ],
+      "anonymous_defaults": true,
+      "present": [
+        "present_phone"
       ]
     },
     "address_line1": {
       "normalize": [
         "address_line"
+      ],
+      "present": [
+        "present_address"
       ]
     },
     "city": {
       "normalize": [
         "name"
+      ],
+      "present": [
+        "present_title"
       ]
     },
     "state": {
       "normalize": [
         "text",
         "upper"
+      ],
+      "present": [
+        "present_upper"
       ]
     },
     "postal_code": {
       "normalize": [
         "postal_code"
+      ],
+      "present": [
+        "present_postal"
       ]
     },
     "country": {
@@ -48,7 +88,10 @@
         "text",
         "upper"
       ],
-      "default": "US"
+      "default": "US",
+      "present": [
+        "present_upper"
+      ]
     }
   },
   "deterministic_fields": [
@@ -75,7 +118,11 @@
       "postal_code"
     ],
     [
-      "phone"
+      {
+        "field": "phone",
+        "as": "windows",
+        "size": 4
+      }
     ],
     [
       "email"
@@ -83,8 +130,41 @@
     [
       "last_name",
       "first_name"
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "soundex"
+      },
+      {
+        "field": "postal_code",
+        "as": "prefix",
+        "size": 3
+      }
+    ],
+    [
+      {
+        "field": "last_name",
+        "as": "soundex"
+      },
+      "first_name"
+    ],
+    [
+      "first_name",
+      "postal_code"
     ]
   ],
+  "mismatch_penalties": {
+    "email": 0.15,
+    "phone": 0.15,
+    "first_name": 0.25,
+    "last_name": 0.15,
+    "name_suffix": {
+      "penalty": 0.4,
+      "compare": "exact"
+    }
+  },
+  "max_bucket_size": 500,
   "survivorship": {
     "default": "most_recent",
     "fields": {
@@ -96,7 +176,8 @@
       "postal_code": "most_recent",
       "country": "most_complete",
       "first_name": "most_complete",
-      "last_name": "most_complete"
+      "last_name": "most_complete",
+      "name_suffix": "most_complete"
     }
   }
 }

@@ -103,16 +103,18 @@ def save_model(model: LearnedModel) -> None:
 
 
 def build_training_set(store: Store, tenant_id: str, domain: str) -> list[tuple[list[float], int]]:
+    """Only HUMAN labels: a steward's confirm or reject, and the verdict of a person who checked an automatic merge (see Store.human_labeled_candidates).
+    The system's own decisions are not labels. This used to take every `confirmed` pair, and an automatic merge is stored as `confirmed`, so the model was
+    trained mostly on its own merges (and its only negatives were the review band's rejections)."""
     config = get_domain_config(domain)
     examples = []
-    for status, label in (("confirmed", 1), ("rejected", 0)):
-        for cand in store.list_candidates(tenant_id, domain, status=status):
-            rec_a = store.get_source_record(cand.record_a_id, tenant_id, domain)
-            rec_b = store.get_source_record(cand.record_b_id, tenant_id, domain)
-            if not rec_a or not rec_b:
-                continue
-            std_a, std_b = standardize(domain, rec_a.attributes), standardize(domain, rec_b.attributes)
-            examples.append((extract_features(std_a, std_b, config), label))
+    for cand, label, _source in store.human_labeled_candidates(tenant_id, domain):
+        rec_a = store.get_source_record(cand.record_a_id, tenant_id, domain)
+        rec_b = store.get_source_record(cand.record_b_id, tenant_id, domain)
+        if not rec_a or not rec_b:
+            continue
+        std_a, std_b = standardize(domain, rec_a.attributes), standardize(domain, rec_b.attributes)
+        examples.append((extract_features(std_a, std_b, config), label))
     return examples
 
 

@@ -64,6 +64,26 @@ class TestPostgresBackend(unittest.TestCase):
         })
         self.assertEqual(r1["matched_entity_id"], r2["matched_entity_id"])
 
+    def test_merge_audits_and_human_labels_work_on_postgres(self):
+        """Migration 014's table, the audit sampling and verdicts, and the rule that only a person's decision is a label. (Written without a server to run it on.)"""
+        from app.pipeline import ingest_record
+        payload = {"first_name": "Edsger", "last_name": "Dijkstra", "email": "edsger@example.com"}
+        ingest_record(self.store, self.tenant, "customer", "crm", "PG-A1", payload)
+        ingest_record(self.store, self.tenant, "customer", "shop", "PG-A2", payload)          # the same person: merged automatically, by the system
+        self.assertEqual(self.store.human_labeled_candidates(self.tenant, "customer"), [])     # the system's own merge is not a label
+        self.assertEqual(self.store.sample_merge_audit(self.tenant, "customer", 1.0, seed=1), 1)
+        self.assertEqual(self.store.sample_merge_audit(self.tenant, "customer", 1.0, seed=1), 0)        # already flagged
+        audits = self.store.list_merge_audits(self.tenant, "customer")
+        self.assertEqual(len(audits), 1)
+        cid = audits[0]["candidate_id"]
+        with self.assertRaises(ValueError):
+            self.store.record_merge_audit(cid, self.tenant, "customer", "correct", "system:auto_merge")
+        self.assertFalse(self.store.record_merge_audit(cid, self.tenant + "_other", "customer", "correct", "jane"))   # another tenant cannot judge it
+        self.assertTrue(self.store.record_merge_audit(cid, self.tenant, "customer", "correct", "jane"))
+        labeled = self.store.human_labeled_candidates(self.tenant, "customer")
+        self.assertEqual([(c.id, label, source) for c, label, source in labeled], [(cid, 1, "audit")])
+        self.assertEqual(self.store.human_labeled_candidates(self.tenant + "_other", "customer"), [])
+
     def test_tenant_and_domain_isolation_holds_on_postgres_too(self):
         from app.pipeline import ingest_record
         payload = {"first_name": "Alan", "last_name": "Turing", "email": "alan@example.com"}
@@ -172,10 +192,10 @@ class TestPostgresBackend(unittest.TestCase):
             cur.execute(
                 "SELECT table_name, column_name, data_type FROM information_schema.columns "
                 "WHERE table_schema = current_schema() AND (table_name, column_name) IN "
-                "(('source_records','attributes'), ('entities','attributes'), ('match_candidates','reasons'), "
+                "(('source_records','attributes'), ('match_candidates','reasons'), "
                 "('audit_log','details'), ('usage_events','metadata'), ('api_keys','allowed_domains'))")
             types = {(r["table_name"], r["column_name"]): r["data_type"] for r in cur.fetchall()}
-        self.assertEqual(len(types), 6)
+        self.assertEqual(len(types), 5)
         self.assertEqual(set(types.values()), {"jsonb"})
 
     def test_index_state_and_reindex_primitives_work_on_postgres(self):
@@ -203,6 +223,59 @@ class TestPostgresBackend(unittest.TestCase):
         self.assertEqual(self.store.find_candidate_record_ids(self.tenant, domain, {"k3"}, exclude_record_id="x"), {"rec1"})
         self.assertEqual(self.store.count_source_records(domain), 0)
         self.assertEqual(self.store.list_source_records_page(domain, "", 10), [])
+
+    def test_golden_records_are_real_columns_on_postgres(self):
+        """Migration 009 and the per-domain entity tables, on a real server: one column per field, no JSON blob, and
+        the equality lookup that used to need a JSONB expression is now an ordinary column query."""
+        from app.pipeline import ingest_record
+        r = ingest_record(self.store, self.tenant, "customer", "crm", "GOLD-1",
+                          {"first_name": "  gina ", "last_name": "LOPEZ", "email": "gina.pg@test.local"})
+        with self.store._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = 'entity_customer'")
+            cols = {x["column_name"]: x["data_type"] for x in cur.fetchall()}
+        self.assertIn("email", cols)
+        self.assertNotIn("attributes", cols)
+        entity = self.store.get_entity(r["matched_entity_id"], self.tenant, "customer")
+        self.assertEqual((entity.attributes["first_name"], entity.attributes["last_name"]), ("Gina", "Lopez"))
+        found = self.store.find_entities_by_attribute(self.tenant, "customer", "email", "gina.pg@test.local")
+        self.assertEqual([e.id for e in found], [entity.id])
+
+    def test_golden_columns_are_typed_on_postgres(self):
+        """Typed golden columns on a real server: product.price is NUMERIC, quality_issues is JSONB, and a value that cannot be cast
+        is NULL with the problem recorded, not a wrong value."""
+        from decimal import Decimal
+        from app.pipeline import ingest_record
+        ok = ingest_record(self.store, self.tenant, "product", "erp", "TYPED-1", {"sku": "TYPED-1", "product_name": "Widget", "price": "$1,299.00"})
+        bad = ingest_record(self.store, self.tenant, "product", "erp", "TYPED-2", {"sku": "TYPED-2", "product_name": "Gadget", "price": "N/A"})
+        with self.store._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() "
+                        "AND table_name = 'entity_product' AND column_name IN ('price', 'quality_issues')")
+            types = {r["column_name"]: r["data_type"] for r in cur.fetchall()}
+        self.assertEqual(types, {"price": "numeric", "quality_issues": "jsonb"})
+        self.assertEqual(self.store.get_entity(ok["matched_entity_id"], self.tenant, "product").attributes["price"], Decimal("1299.00"))
+        gadget = self.store.get_entity(bad["matched_entity_id"], self.tenant, "product")
+        self.assertIsNone(gadget.attributes["price"])
+        self.assertEqual(gadget.quality_issues[0]["field"], "price")
+
+    def test_processing_state_run_log_and_golden_dirty_work_on_postgres(self):
+        """Resumable processing on a real server: a record is unfinished until matched, runs are logged with JSON counts, and the durable
+        golden-dirty marker round-trips."""
+        from app.pipeline import Run, batch_ctx, flush_golden, ingest_record, process_pending
+        a = ingest_record(self.store, self.tenant, "customer", "crm", "PROC-1", {"first_name": "Pia", "last_name": "Roe", "email": "pia.proc@test.local"}, mode="batch")
+        self.assertTrue(a["deferred"])
+        self.assertIn(a["record_id"], [r.id for r in self.store.list_unfinished_records("customer", 100000, 5)])
+        out = process_pending(self.store, "customer")
+        self.assertGreaterEqual(out["finished"], 1)
+        self.assertEqual(self.store.get_source_record(a["record_id"], self.tenant, "customer").processing_status, "matched")
+        run = Run.start(self.store, self.tenant, "customer", "batch", "test")
+        run.counts["new"] = 2
+        run.finish()
+        self.assertEqual(self.store.list_runs(domain="customer", tenant_id=self.tenant, limit=1)[0]["counts"]["new"], 2)
+        self.store.mark_golden_dirty([(self.tenant, "customer", "ent_does_not_exist")])
+        self.assertIn((self.tenant, "ent_does_not_exist"), self.store.list_golden_dirty("customer"))
+        flush_golden(self.store, "customer", {(self.tenant, "ent_does_not_exist")})  # a missing entity is skipped, not an error
+        self.assertNotIn((self.tenant, "ent_does_not_exist"), self.store.list_golden_dirty("customer"))
 
     def test_purge_works_on_postgres(self):
         from app.compliance import purge_entity

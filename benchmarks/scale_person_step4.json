@@ -1,0 +1,205 @@
+{
+  "settings": {
+    "cap": 500,
+    "dup_rate": 0.08,
+    "dup_sample": 1000,
+    "rates": {
+      "dob_rate": 0.9,
+      "email_rate": 0.6,
+      "phone_rate": 0.8,
+      "ssn_rate": 0.7
+    },
+    "sample": 2000,
+    "seed": 7,
+    "variants": [
+      "customer_like",
+      "scalable",
+      "scalable_tight"
+    ]
+  },
+  "sizes": [
+    {
+      "by_group": {
+        "dob+first initial": 0.1,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 0.2,
+        "first+zip (sparse only)": 0.0,
+        "last (exact)+zip5": 0.1,
+        "last+first": 0.4,
+        "last+first (sparse only)": 0.0,
+        "last+zip": 0.2,
+        "phone + adjacent swaps": 0.1,
+        "phone exact": 0.1,
+        "phone windows(4)": 31.2,
+        "soundex(last)+first": 0.3,
+        "soundex(last)+first (sparse only)": 0.0,
+        "soundex(last)+first initial+dob": 0.1,
+        "soundex(last)+first+birth year": 0.1,
+        "soundex(last)+zip3": 0.2,
+        "ssn exact": 0.1
+      },
+      "duplicates_in_sample": 775,
+      "records": 10000,
+      "records_per_second": 1581,
+      "sample": 2000,
+      "seconds": 6.3,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.9987,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 15.8,
+          "partners_max": 69,
+          "partners_mean": 31.7,
+          "partners_median": 37,
+          "partners_p95": 53,
+          "unreachable_pct": 0.0
+        },
+        "scalable": {
+          "blocking_recall": 1.0,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.1,
+          "partners_max": 6,
+          "partners_mean": 0.3,
+          "partners_median": 0,
+          "partners_p95": 1,
+          "unreachable_pct": 0.0
+        },
+        "scalable_tight": {
+          "blocking_recall": 0.9974,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.1,
+          "partners_max": 3,
+          "partners_mean": 0.2,
+          "partners_median": 0,
+          "partners_p95": 1,
+          "unreachable_pct": 0.0
+        }
+      }
+    },
+    {
+      "by_group": {
+        "dob+first initial": 0.3,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 0.9,
+        "first+zip (sparse only)": 0.0,
+        "last (exact)+zip5": 0.1,
+        "last+first": 2.7,
+        "last+first (sparse only)": 0.0,
+        "last+zip": 0.7,
+        "phone + adjacent swaps": 0.1,
+        "phone exact": 0.1,
+        "phone windows(4)": 318.1,
+        "soundex(last)+first": 1.1,
+        "soundex(last)+first (sparse only)": 0.0,
+        "soundex(last)+first initial+dob": 0.1,
+        "soundex(last)+first+birth year": 0.1,
+        "soundex(last)+zip3": 0.3,
+        "ssn exact": 0.1
+      },
+      "duplicates_in_sample": 1000,
+      "records": 100000,
+      "records_per_second": 2118,
+      "sample": 2000,
+      "seconds": 47.2,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.998,
+          "growth_exponent": 1.01,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 161.3,
+          "partners_max": 530,
+          "partners_mean": 322.6,
+          "partners_median": 383,
+          "partners_p95": 473,
+          "unreachable_pct": 0.0
+        },
+        "scalable": {
+          "blocking_recall": 0.996,
+          "growth_exponent": 0.52,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.5,
+          "partners_max": 17,
+          "partners_mean": 1.0,
+          "partners_median": 1,
+          "partners_p95": 3,
+          "unreachable_pct": 0.0
+        },
+        "scalable_tight": {
+          "blocking_recall": 0.992,
+          "growth_exponent": 0.0,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.1,
+          "partners_max": 4,
+          "partners_mean": 0.2,
+          "partners_median": 0,
+          "partners_p95": 1,
+          "unreachable_pct": 0.0
+        }
+      }
+    },
+    {
+      "by_group": {
+        "dob+first initial": 1.9,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 7.3,
+        "first+zip (sparse only)": 0.0,
+        "last (exact)+zip5": 0.2,
+        "last+first": 27.7,
+        "last+first (sparse only)": 0.0,
+        "last+zip": 5.4,
+        "phone + adjacent swaps": 0.1,
+        "phone exact": 0.1,
+        "phone windows(4)": 514.5,
+        "soundex(last)+first": 10.7,
+        "soundex(last)+first (sparse only)": 0.0,
+        "soundex(last)+first initial+dob": 0.1,
+        "soundex(last)+first+birth year": 0.2,
+        "soundex(last)+zip3": 2.1,
+        "ssn exact": 0.1
+      },
+      "duplicates_in_sample": 1000,
+      "records": 1000000,
+      "records_per_second": 5474,
+      "sample": 2000,
+      "seconds": 182.7,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.997,
+          "growth_exponent": 0.24,
+          "keys_over_cap_pct": 38.12,
+          "pairs_per_record": 280.4,
+          "partners_max": 2557,
+          "partners_mean": 560.9,
+          "partners_median": 477,
+          "partners_p95": 1700,
+          "unreachable_pct": 0.0
+        },
+        "scalable": {
+          "blocking_recall": 0.994,
+          "growth_exponent": 0.92,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 4.2,
+          "partners_max": 146,
+          "partners_mean": 8.4,
+          "partners_median": 7,
+          "partners_p95": 21,
+          "unreachable_pct": 0.0
+        },
+        "scalable_tight": {
+          "blocking_recall": 0.99,
+          "growth_exponent": 0.3,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.2,
+          "partners_max": 7,
+          "partners_mean": 0.4,
+          "partners_median": 0,
+          "partners_p95": 2,
+          "unreachable_pct": 0.0
+        }
+      }
+    }
+  ]
+}

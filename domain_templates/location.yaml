@@ -8,7 +8,9 @@ description: A physical site (warehouse, store, office).
 # A bare name is shorthand for one step; a list runs the steps in order; an object adds a default.
 # See all the available steps with:  python3 domains_cli.py normalizers
 fields:
-  location_code: identifier
+  location_code:
+    normalize: identifier
+    anonymous_defaults: true   # "0000", "N/A", "TBD" ... count as missing, never as a match
   name: name
   address_line1: address_line
   city: name
@@ -41,6 +43,14 @@ blocking:
   - [location_code]
   - [postal_code, name]
   - [city, name]
+  - [{field: name, as: soundex}, {field: postal_code, as: prefix, size: 3}]   # spelling variants
+
+# Evidence AGAINST a match: when both values are present and disagree, subtract this. (An empty field costs nothing.)
+mismatch_penalties:
+  postal_code: 0.10
+
+# A blocking key shared by more than this many records is skipped at ingest (see `domains_cli.py blocking-stats`).
+max_bucket_size: 500
 
 # Which source wins when records for the same site disagree.
 survivorship:

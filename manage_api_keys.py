@@ -2,7 +2,7 @@
 Create, list, and revoke API keys directly against the database --
 bypassing the HTTP API entirely, which is how you bootstrap the very
 first key (you can't call POST /v1/admin/api-keys without already
-having one once MDM_ENABLE_AUTH=true).
+having one: authentication is required unless MDM_DEV_MODE=1).
 
     python3 manage_api_keys.py create --tenant acme --role tenant_admin --label "root key"
     python3 manage_api_keys.py create --tenant acme --role data_steward --label "Jane" --domains customer,product
@@ -11,8 +11,7 @@ having one once MDM_ENABLE_AUTH=true).
 
 Typical bootstrap flow:
     python3 manage_api_keys.py create --tenant acme --role tenant_admin --label "root key"
-    # copy the printed key, then:
-    export MDM_ENABLE_AUTH=true
+    # copy the printed key, then (authentication is the default):
     uvicorn app.api:app --reload --port 8000
     curl -H "Authorization: Bearer <the key>" http://localhost:8000/v1/customer/entities
 """

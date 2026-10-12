@@ -1,0 +1,31 @@
+{
+  "auto_pairs": 89734,
+  "blocking_recall": 0.99916,
+  "candidate_pairs": 1389661,
+  "capped_keys": 0,
+  "dry_run": true,
+  "duplicates": {
+    "auto": 67945,
+    "candidate": 79770,
+    "compared_but_rejected": 269,
+    "never_compared": 67,
+    "review": 11556,
+    "same_entity": 68183
+  },
+  "entities": 931793,
+  "falsely_merged_records": 10,
+  "impure_clusters": 10,
+  "merge_recall": 0.85403,
+  "pairs_per_record": 1.39,
+  "records": 1000000,
+  "review_pairs": 89990,
+  "review_precision": 0.1894,
+  "seconds": {
+    "cluster": 1.35,
+    "pairs": 31.86,
+    "score": 423.69,
+    "standardize": 369.63
+  },
+  "true_duplicate_pairs": 79837,
+  "true_entities": 920163
+}

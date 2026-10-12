@@ -27,6 +27,7 @@ swapping in SSO later means adding a second way to resolve a `Principal`
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 from dataclasses import dataclass, field
 from typing import Optional
@@ -95,3 +96,46 @@ def check_permission(principal: Principal, action: str, domain: Optional[str] = 
         raise AuthError(f"Role '{principal.role}' is not permitted to perform '{action}'")
     if domain is not None and not principal.can_access_domain(domain):
         raise AuthError(f"API key '{principal.label}' is not scoped to domain '{domain}'")
+
+
+# --------------------------------------------------------------------------- the choices that must not be left to the caller
+DEV_MODE_ENV = "MDM_DEV_MODE"
+
+
+def dev_mode() -> bool:
+    """True ONLY when someone has said so: MDM_DEV_MODE=1/true/yes. Authentication is required otherwise. (It used to be the other way round: auth was off unless
+    MDM_ENABLE_AUTH was set, so forgetting one variable in production left the whole API open to anyone naming a tenant in a header.)"""
+    return os.environ.get(DEV_MODE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def human_actor(principal: Principal) -> str:
+    """The name recorded for a person's decision, taken from the authenticated key and NEVER from the request: 'steward:<key label>'. It cannot begin with
+    'system:' (that prefix marks the system's own decisions, which are not training labels), whatever the label says."""
+    return f"steward:{(principal.label or principal.key_id or 'unknown').strip()}"
+
+
+MAX_LABEL = 100
+
+
+def valid_key_label(label) -> str:
+    """A key's label becomes the name on every decision made with that key: it must be a real, printable name, and must not pass as the system."""
+    text = (label or "").strip() if isinstance(label, str) else ""
+    if not text:
+        raise ValueError("a key needs a label: it is the name recorded on every decision made with it")
+    if len(text) > MAX_LABEL:
+        raise ValueError(f"a key's label may be at most {MAX_LABEL} characters")
+    if not text.isprintable():
+        raise ValueError("a key's label may not contain control characters")
+    if text.lower().startswith("system:"):
+        raise ValueError("a key's label may not begin with 'system:': that marks the system's own decisions")
+    return text
+
+
+def visible_domains(principal: Principal, names) -> list:
+    """The domains from `names` this key may see (all of them for a key with no domain restriction)."""
+    return [n for n in names if principal.can_access_domain(n)]
+
+
+def may_see_log_entry(principal: Principal, entry_domain) -> bool:
+    """A key restricted to some domains sees only the audit-log entries of those domains: never the tenant-wide ones (a key created, a purge) and never other domains'."""
+    return principal.allowed_domains is None or (entry_domain is not None and entry_domain in principal.allowed_domains)

@@ -32,7 +32,7 @@ from app.domains import BUILTIN_DOMAINS, REGISTRY, register_domain
 from app.indexing import IndexStaleError, blocking_fingerprint, index_state, reindex_domain
 from app.normalizers import NORMALIZER_DOCS, NORMALIZERS, DeclarativeStandardizer, FieldSpec
 from app.pipeline import ingest_batch, ingest_record
-from app.standardize import standardize
+from app.standardize import standardize, standardize_customer, standardize_product, standardize_vendor
 
 try:
     import yaml  # noqa: F401
@@ -124,19 +124,24 @@ class TestNormalizerEngine(DomainTestCase):
 
 # ------------------------------------- the built-ins are expressible in the same format
 class TestBuiltinsAreExpressibleDeclaratively(DomainTestCase):
-    def test_builtin_field_specs_reproduce_the_python_standardizers(self):
-        """The built-ins' field_specs feed the blocking fingerprint, so they must be TRUE
-        descriptions of the Python standardizers -- this is what stops them drifting apart."""
+    def test_declarative_builtins_reproduce_the_original_hand_written_standardizers(self):
+        """The built-ins USE the declarative standardizer, so comparing it to itself would prove nothing. The
+        original functions are kept for exactly this check: on inputs with no placeholders, no nicknames and no
+        suffix, the output must be identical (apart from the later-added name_suffix field)."""
+        legacy = {"customer": standardize_customer, "product": standardize_product, "vendor": standardize_vendor}
         for name, cfg in BUILTIN_DOMAINS.items():
-            declarative = DeclarativeStandardizer(cfg.schema_fields, cfg.field_specs)
             for raw in BATTERY[name]:
-                self.assertEqual(declarative(raw), cfg.standardizer(raw), (name, raw))
+                got = cfg.standardizer(raw)
+                got.pop("name_suffix", None)
+                self.assertEqual(got, legacy[name](raw), (name, raw))
 
     def test_shipped_templates_load_back_as_identical_configs(self):
         for name, builtin in BUILTIN_DOMAINS.items():
             cfg = load_domain_file(os.path.join(TEMPLATES, f"{name}.json"))
+            self.assertEqual(cfg.keyspecs(), builtin.keyspecs(), name)
             for attr in ("schema_fields", "deterministic_fields", "fuzzy_weights", "semantic_fields",
-                         "semantic_weight", "blocking_field_groups", "field_strategies", "default_strategy"):
+                         "semantic_weight", "blocking_field_groups", "field_strategies", "default_strategy",
+                         "mismatch_penalties", "mismatch_exact", "exclusive_fields", "max_bucket_size", "field_specs"):
                 self.assertEqual(getattr(cfg, attr), getattr(builtin, attr), (name, attr))
             for raw in BATTERY[name]:
                 self.assertEqual(cfg.standardizer(raw), builtin.standardizer(raw), (name, raw))
@@ -191,7 +196,7 @@ class TestValidation(DomainTestCase):
         doc = people_doc()
         del doc["blocking"]
         self.assertIn("blocking: required", self.errors_for(doc))
-        self.assertIn("must not be empty", self.errors_for(people_doc(blocking=[[]])))
+        self.assertIn("non-empty list", self.errors_for(people_doc(blocking=[[]])))
         self.assertIn("duplicate", self.errors_for(people_doc(blocking=[["email"], ["email"]])))
 
     def test_weights_must_be_positive_real_numbers_for_real_fields(self):
@@ -428,10 +433,14 @@ class TestIndexFreshness(DomainTestCase):
     def test_scoring_only_changes_do_not_need_a_reindex(self):
         self.ann("A", "a@x.com")
         self.register(people_doc(blocking=[["email"]], fuzzy={"first_name": 0.9, "last_name": 0.1},
-                                 semantic={"fields": ["first_name"], "weight": 0.5},
-                                 survivorship={"default": "most_complete"}))
+                                 semantic={"fields": ["first_name"], "weight": 0.5}))
         self.assertEqual(index_state(self.store, "people", REGISTRY["people"]), "READY")
         self.ann("B", "b@x.com")  # must not raise
+
+    def test_changing_survivorship_is_stale_because_golden_records_are_derived_from_it(self):
+        self.ann("A", "a@x.com")
+        cfg = self.register(people_doc(blocking=[["email"]], survivorship={"default": "most_complete"}))
+        self.assertEqual(index_state(self.store, "people", cfg), "STALE")
 
     def test_changing_how_a_blocking_field_is_standardized_is_stale(self):
         self.ann("A", "a@x.com")
@@ -439,11 +448,19 @@ class TestIndexFreshness(DomainTestCase):
             "first_name": "name", "last_name": "name", "email": ["email", "upper"], "postal_code": "postal_code"}))
         self.assertEqual(index_state(self.store, "people", cfg), "STALE")
 
-    def test_changing_a_field_that_is_not_used_for_blocking_is_not_stale(self):
+    def test_changing_how_any_field_is_standardized_is_stale_because_staging_stores_it(self):
+        """The staging layer holds EVERY field's standardized form (and golden records come from the cleansed one),
+        so this needs a rebuild even for a field that plays no part in blocking."""
         self.ann("A", "a@x.com")
         cfg = self.register(people_doc(blocking=[["email"]], fields={
             "first_name": ["text", "upper"], "last_name": "name", "email": "email", "postal_code": "postal_code"}))
-        self.assertEqual(index_state(self.store, "people", cfg), "READY")
+        self.assertEqual(index_state(self.store, "people", cfg), "STALE")
+
+    def test_changing_only_how_a_field_is_presented_is_stale_too(self):
+        self.ann("A", "a@x.com")
+        cfg = self.register(people_doc(blocking=[["email"]], fields={
+            "first_name": {"normalize": "name", "present": "present_upper"}, "last_name": "name", "email": "email", "postal_code": "postal_code"}))
+        self.assertEqual(index_state(self.store, "people", cfg), "STALE")
 
     def test_reindex_makes_existing_records_findable_under_the_new_rules(self):
         a = self.ann("A", "ann1@x.com")
@@ -474,7 +491,7 @@ class TestIndexFreshness(DomainTestCase):
         for i in range(3):
             self.ann(f"R{i}", f"r{i}@x.com")
         v2 = self.to_v2()
-        real, calls = self.store.replace_blocking_keys_batch, {"n": 0}
+        real, calls = self.store.replace_derived_batch, {"n": 0}
 
         def flaky(entries):
             calls["n"] += 1
@@ -482,7 +499,7 @@ class TestIndexFreshness(DomainTestCase):
                 raise RuntimeError("disk full")
             return real(entries)
 
-        self.store.replace_blocking_keys_batch = flaky
+        self.store.replace_derived_batch = flaky
         with self.assertRaises(RuntimeError):
             reindex_domain(self.store, "people", batch_size=1)
         self.assertEqual(index_state(self.store, "people", v2), "REINDEXING")
@@ -490,7 +507,7 @@ class TestIndexFreshness(DomainTestCase):
             self.ann("Z", "z@x.com")  # a half-rebuilt index must never be used
         self.assertIn("interrupted", str(cm.exception))
 
-        self.store.replace_blocking_keys_batch = real
+        self.store.replace_derived_batch = real
         reindex_domain(self.store, "people", batch_size=1)
         self.assertEqual(index_state(self.store, "people", v2), "READY")
         self.ann("Z", "z@x.com")

@@ -1,0 +1,41 @@
+{
+  "bulk": {
+    "auto_pairs": 1371,
+    "entities": 18692,
+    "falsely_merged_records": 0,
+    "impure_entities": 0,
+    "merge_recall": 0.8499,
+    "review_pairs": 280,
+    "review_precision": 0.9071,
+    "seconds": 10.94,
+    "stages": {
+      "cluster": 0.02,
+      "pairs": 0.33,
+      "score": 0.13,
+      "standardize": 5.11,
+      "write": 5.34
+    },
+    "true_duplicate_pairs": 1539,
+    "true_entities": 18461
+  },
+  "identical": {
+    "auto_pairs": true,
+    "entities": true,
+    "golden_records": true,
+    "review_pairs": true
+  },
+  "records": 20000,
+  "regular": {
+    "auto_pairs": 1371,
+    "entities": 18692,
+    "falsely_merged_records": 0,
+    "impure_entities": 0,
+    "merge_recall": 0.8499,
+    "review_pairs": 280,
+    "review_precision": 0.9071,
+    "seconds": 1113.39,
+    "true_duplicate_pairs": 1539,
+    "true_entities": 18461
+  },
+  "speedup": 101.8
+}

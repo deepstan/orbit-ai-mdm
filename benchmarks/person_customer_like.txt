@@ -1,0 +1,27 @@
+Benchmark 'person/customer_like'  profile=person / customer_like  seeds=[1, 2, 3]  scale=25  records=2850  (62.6 rec/s)
+
+POSITIVES (should link)     auto-linked   +review  shares a key
+  ssn_exact_name_variants          100%      100%          100%
+  ssn_typo                           0%      100%          100%
+  no_ssn_name_dob_address          100%      100%          100%
+  dob_swap                           0%      100%          100%
+  dob_year_only                      0%      100%          100%
+  moved_no_ssn                       0%      100%          100%
+  nickname_dob                     100%      100%          100%
+  ALL POSITIVES                     43%      100%          100%
+
+HARD NEGATIVES (must not merge)   WRONG MERGES  sent to review
+  ssn_placeholder                    0/75            0/75     
+  ssn_placeholder_same_name          0/75           75/75     
+  ssn_shared_error                   0/75            0/75     
+  dob_placeholder_same_name         56/75           19/75     
+  twins                              3/75           72/75     
+  jr_sr_dob                          0/75            0/75     
+  same_name_diff_dob                 0/75           62/75     
+  ALL NEGATIVES                           11%             43%
+
+Overall auto-link:  precision 79.2%   recall 42.9%   false-merged pairs 59
+Review queue:       552 pairs, 54% are true duplicates
+Blocking:           reduction ratio 99.70%, ~2.9 candidates/record, largest bucket 10 (p99 4)
+
+saved -> benchmarks/person_customer_like.json

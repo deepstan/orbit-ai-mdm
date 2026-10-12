@@ -1,0 +1,27 @@
+Benchmark 'person/scalable_tight_plus (step 4)'  profile=person / scalable_tight_plus  seeds=[1, 2, 3]  scale=25  records=2850  (84.5 rec/s)
+
+POSITIVES (should link)     auto-linked   +review  shares a key
+  ssn_exact_name_variants          100%      100%          100%
+  ssn_typo                         100%      100%          100%
+  no_ssn_name_dob_address          100%      100%          100%
+  dob_swap                         100%      100%          100%
+  dob_year_only                    100%      100%          100%
+  moved_no_ssn                       0%      100%          100%
+  nickname_dob                     100%      100%          100%
+  ALL POSITIVES                     86%      100%          100%
+
+HARD NEGATIVES (must not merge)   WRONG MERGES  sent to review
+  ssn_placeholder                    0/75            0/75     
+  ssn_placeholder_same_name          0/75            0/75     
+  ssn_shared_error                   0/75            1/75     
+  dob_placeholder_same_name         11/75           64/75     
+  twins                              3/75           72/75     
+  jr_sr_dob                          0/75            0/75     
+  same_name_diff_dob                 0/75           55/75     
+  ALL NEGATIVES                            3%             37%
+
+Overall auto-link:  precision 97.0%   recall 85.7%   false-merged pairs 14
+Review queue:       537 pairs, 14% are true duplicates
+Blocking:           reduction ratio 99.89%, ~1.1 candidates/record, largest bucket 8 (p99 2)
+
+saved -> benchmarks/person_scalable_tight_plus.json

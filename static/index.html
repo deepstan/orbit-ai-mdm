@@ -188,6 +188,16 @@
     pointer-events: none;
   }
   .toast.show { opacity: 1; }
+.contrib{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0}.contrib th,.contrib td{padding:3px 6px;text-align:left;border-bottom:1px solid #e5e7eb}.contrib .disagree td{color:#b91c1c}.contrib .missing td{color:#9ca3af}.contrib .pts{text-align:right;font-variant-numeric:tabular-nums}
+  /* the audit panel */
+  .audits { margin-top: 32px; }
+  .audit-summary { background: var(--panel, #1a1d24); border: 1px solid var(--border, #2a2f3a); border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; font-size: 13px; line-height: 1.7; }
+  .audit-summary b { color: var(--text); }
+  .audit-summary .alert { color: var(--warn); }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; border: 1px solid var(--border, #2a2f3a); }
+  .badge.model { color: var(--warn); border-color: var(--warn); }
+  .more { text-align: center; margin: 14px 0; }
+  .note { font-size: 12px; color: var(--muted, #8a93a6); }
 </style>
 </head>
 <body>
@@ -208,6 +218,12 @@
 
 <main>
   <div id="queue"></div>
+
+  <section class="audits">
+    <h2>Audit: are these automatic merges right?</h2>
+    <div id="audit-summary"></div>
+    <div id="audits"></div>
+  </section>
 
   <section class="golden">
     <h2>Golden records</h2>
@@ -271,6 +287,7 @@ function renderTabs(counts) {
 
 function switchDomain(domain) {
   currentDomain = domain;
+  resetPages();
   loadAll();
 }
 
@@ -290,6 +307,18 @@ function renderRecord(rec) {
     </div>`;
 }
 
+// Per-field evidence behind a score: the "why" a steward needs, as numbers, not just sentences.
+function renderContributions(list) {
+  if (!list || !list.length) return '';
+  const rows = list.map(c => {
+    const pts = Number(c.points);
+    const sim = (c.similarity === null || c.similarity === undefined) ? '—' : Number(c.similarity).toFixed(2);
+    return `<tr class="${esc(c.state)}"><td>${esc(String(c.field).replace(/_/g, ' '))}</td><td>${esc(c.state)}</td>` +
+           `<td>${esc(sim)}</td><td class="pts">${esc((pts >= 0 ? '+' : '') + pts.toFixed(2))}</td></tr>`;
+  }).join('');
+  return `<table class="contrib"><thead><tr><th>field</th><th>evidence</th><th>similarity</th><th>points</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 function renderCandidate(c) {
   const reasonsHtml = c.reasons.map(r => `<li>${esc(r)}</li>`).join('');
   return `
@@ -299,6 +328,7 @@ function renderCandidate(c) {
         <div class="score high">${(c.score * 100).toFixed(0)}% match</div>
       </div>
       <div class="reasons">Why: <ul>${reasonsHtml}</ul></div>
+      ${renderContributions(c.contributions)}
       <div class="pair">
         ${renderRecord(c.record_a)}
         ${renderRecord(c.record_b)}
@@ -315,56 +345,162 @@ async function resolve(candidateId, decision) {
     await fetchJSON(`/v1/${currentDomain}/review-queue/${candidateId}/resolve`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({decision, decided_by: 'steward:demo_user'})
+      body: JSON.stringify({decision})   // who decided is the signed-in key's name, decided by the server
     });
     showToast(decision === 'confirm' ? 'Merged into golden record' : 'Marked as not a match');
+    resetPages();   // a decision changes what is on every page: start again from the first
     await loadAll();
   } catch (e) {
     showToast('Error: ' + e.message);
   }
 }
 
-async function loadQueue() {
-  const items = await fetchJSON(`/v1/${currentDomain}/review-queue`);
-  const queueEl = document.getElementById('queue');
-  document.getElementById('stat-pending').textContent = items.length;
-  if (items.length === 0) {
-    queueEl.innerHTML = `<div class="empty"><div class="big">Review queue is empty</div>All incoming ${currentDomain} records were either auto-merged or had no plausible match.</div>`;
-    return;
-  }
-  queueEl.innerHTML = items.map(renderCandidate).join('');
-  return items.length;
+// The two long lists are shown a page at a time. The page refreshes itself every 8 seconds: while someone has asked for more pages, the refresh leaves those lists alone
+// (it would otherwise collapse them under their eyes); a decision, or switching domain, starts them again from the first page.
+let queueLoaded = [], queueCursor = null, queueTotal = 0, queueExpanded = false;
+let entitiesLoaded = [], entitiesCursor = null, entitiesExpanded = false;
+
+function resetPages() {
+  queueLoaded = []; queueCursor = null; queueTotal = 0; queueExpanded = false;
+  entitiesLoaded = []; entitiesCursor = null; entitiesExpanded = false;
 }
 
-async function loadEntities() {
-  const entities = await fetchJSON(`/v1/${currentDomain}/entities?status=active`);
-  document.getElementById('stat-entities').textContent = entities.length;
+function renderQueue() {
+  const queueEl = document.getElementById('queue');
+  document.getElementById('stat-pending').textContent = queueTotal;
+  if (queueLoaded.length === 0) {
+    queueEl.innerHTML = `<div class="empty"><div class="big">Review queue is empty</div>All incoming ${esc(currentDomain)} records were either auto-merged or had no plausible match.</div>`;
+    return;
+  }
+  const more = queueCursor
+    ? `<div class="more"><button class="action-btn confirm" onclick="loadQueue(true)">Show more (${esc(Math.max(0, queueTotal - queueLoaded.length))} more waiting)</button></div>` : '';
+  queueEl.innerHTML = queueLoaded.map(renderCandidate).join('') + more;
+}
+
+async function loadQueue(more = false) {
+  if (!more && queueExpanded) return queueTotal;   // see above: leave what someone is reading alone
+  const page = await fetchJSON(`/v1/${currentDomain}/review-queue` + (more && queueCursor ? `?cursor=${encodeURIComponent(queueCursor)}` : ''));
+  const items = (page && page.items) || [];
+  queueLoaded = more ? queueLoaded.concat(items) : items;
+  queueCursor = (page && page.next_cursor) || null;
+  queueTotal = (page && page.total !== undefined) ? page.total : queueLoaded.length;
+  if (more) queueExpanded = true;
+  renderQueue();
+  return queueTotal;
+}
+
+function renderEntities() {
+  document.getElementById('stat-entities').textContent = entitiesLoaded.length + (entitiesCursor ? '+' : '');
   const container = document.getElementById('entities-container');
   const domainFields = (DOMAINS.find(d => d.id === currentDomain) || { fields: [] }).fields;
   const preferred = (SUMMARY_FIELDS[currentDomain] || []).filter(f => domainFields.includes(f));
   const summaryFields = preferred.length ? preferred : domainFields.slice(0, 4);
 
-  if (entities.length === 0) {
-    container.innerHTML = `<div class="empty">No ${currentDomain} golden records yet.</div>`;
+  if (entitiesLoaded.length === 0) {
+    container.innerHTML = `<div class="empty">No ${esc(currentDomain)} golden records yet.</div>`;
     return;
   }
 
   const headerRow = summaryFields.map(f => `<th>${esc(f.replace(/_/g, ' '))}</th>`).join('');
-  const rows = entities.map(e => {
+  const rows = entitiesLoaded.map(e => {
     const cells = summaryFields.map(f => `<td>${esc(e.attributes[f] || '—')}</td>`).join('');
-    return `<tr><td class="id">${e.entity_id.slice(0, 12)}…</td>${cells}<td>${e.source_record_ids.length}</td></tr>`;
+    return `<tr><td class="id">${esc(e.entity_id.slice(0, 12))}…</td>${cells}<td>${esc(e.source_record_ids.length)}</td></tr>`;
   }).join('');
+  const more = entitiesCursor ? `<div class="more"><button class="action-btn confirm" onclick="loadEntities(true)">Show more</button></div>` : '';
 
   container.innerHTML = `
     <table>
       <thead><tr><th>ID</th>${headerRow}<th>Sources</th></tr></thead>
       <tbody>${rows}</tbody>
-    </table>`;
+    </table>` + more;
+}
+
+async function loadEntities(more = false) {
+  if (!more && entitiesExpanded) return;
+  const page = await fetchJSON(`/v1/${currentDomain}/entities?status=active` + (more && entitiesCursor ? `&cursor=${encodeURIComponent(entitiesCursor)}` : ''));
+  const items = (page && page.items) || [];
+  entitiesLoaded = more ? entitiesLoaded.concat(items) : items;
+  entitiesCursor = (page && page.next_cursor) || null;
+  if (more) entitiesExpanded = true;
+  renderEntities();
+}
+
+// ---- Audit: a random sample of the system's AUTOMATIC merges, for a person to say whether each is right. The model's promotions come first.
+const pct = (v) => (v === null || v === undefined) ? '–' : (Number(v) * 100).toFixed(2) + '%';
+
+function renderAuditSummary(s) {
+  if (!s || !s.strata) return '';
+  const row = (label, k) => {
+    const t = s.strata[k] || {};
+    return `<div>${esc(label)}: <b>${esc(t.audited ?? 0)}</b> checked of ${esc(t.merges ?? 0)}, <b>${esc(t.wrong ?? 0)}</b> wrong (${esc(pct(t.estimate))}, plausibly ${esc(pct(t.lower_bound))} to ${esc(pct(t.upper_bound))})</div>`;
+  };
+  const sc = s.scorer || {};
+  const model = !sc.present ? 'no learned model for this domain'
+    : sc.state === 'rolled_back' ? `<span class="alert">ROLLED BACK: ${esc(sc.reason)}. Promotion is off until an administrator resets it.</span>`
+    : sc.promotion_live ? 'live: it promotes pairs out of review' : 'trained, not live (it only proposes)';
+  return `<div class="audit-summary"><div><b>${esc(s.waiting ?? 0)}</b> waiting for a person. Target: at most ${esc(pct(s.target))} wrong.</div>` +
+         row('Rule score merges', 'rule') + row('Model promotions', 'promoted') + `<div>Model: ${model}</div></div>`;
+}
+
+function renderAudit(a) {
+  const u = a.unmerge || {};
+  const reasonsHtml = (a.reasons || []).map(r => `<li>${esc(r)}</li>`).join('');
+  const id = esc(a.candidate_id);
+  const unmergeBtn = u.possible
+    ? `<button class="action-btn reject" onclick="auditVerdict('${id}', 'wrong', true)">Wrong: unmerge (${esc(u.moves)} record(s) move out)</button>`
+    : `<span class="note">Cannot be unmerged on its own: ${esc(u.why || '')}</span>`;
+  return `
+    <div class="card" data-id="${id}">
+      <div class="card-head">
+        <div>Automatic merge<span class="badge ${a.made_by === 'model' ? 'model' : ''}">${a.made_by === 'model' ? 'promoted by the model' : 'rule score'}</span><span class="match-type">${esc(a.match_type)}</span></div>
+        <div class="score high">${(Number(a.score) * 100).toFixed(0)}% match</div>
+      </div>
+      <div class="reasons">Why it was merged: <ul>${reasonsHtml}</ul></div>
+      ${renderContributions(a.contributions)}
+      <div class="pair">
+        ${renderRecord(a.record_a)}
+        ${renderRecord(a.record_b)}
+      </div>
+      <div class="actions">
+        <button class="action-btn confirm" onclick="auditVerdict('${id}', 'correct', false)">Correct: same entity</button>
+        <button class="action-btn reject" onclick="auditVerdict('${id}', 'wrong', false)">Wrong (only record it)</button>
+        ${unmergeBtn}
+      </div>
+    </div>`;
+}
+
+async function auditVerdict(candidateId, verdict, unmerge) {
+  try {
+    const r = await fetchJSON(`/v1/${currentDomain}/audits/${candidateId}/verdict`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({verdict, unmerge})
+    });
+    if (r.unmerge && r.unmerge.ok) showToast(`Recorded as wrong; ${r.unmerge.moved} record(s) moved to a new entity`);
+    else if (r.unmerge) showToast('Recorded as wrong, but not unmerged: ' + r.unmerge.why);
+    else showToast(verdict === 'correct' ? 'Recorded as correct' : 'Recorded as wrong');
+    lastAuditSignature = null;
+    await loadAll();
+  } catch (e) {
+    showToast('Error: ' + e.message);
+  }
+}
+
+let lastAuditSignature = null;   // the page refreshes itself: do not redraw (and lose someone's place) when nothing changed
+async function loadAudits() {
+  const data = await fetchJSON(`/v1/${currentDomain}/audits`);
+  const items = (data && data.items) || [];
+  const signature = currentDomain + JSON.stringify(items.map(i => i.candidate_id)) + JSON.stringify(data && data.summary);
+  if (signature === lastAuditSignature) return;
+  lastAuditSignature = signature;
+  document.getElementById('audit-summary').innerHTML = renderAuditSummary(data && data.summary);
+  document.getElementById('audits').innerHTML = items.length
+    ? items.map(renderAudit).join('')
+    : `<div class="empty"><div class="big">Nothing waiting for an audit</div>A random sample of automatic merges shows up here as they are made.</div>`;
 }
 
 async function loadAll() {
   const pendingCount = await loadQueue();
   await loadEntities();
+  try { await loadAudits(); } catch (e) { /* a role that may not audit just sees no panel content */ }
 
   // Fetch pending counts for every domain so the tab bar shows all three
   // at once without switching -- accumulate into one object before the
@@ -373,8 +509,8 @@ async function loadAll() {
   for (const d of DOMAINS) {
     if (d.id === currentDomain) continue;
     try {
-      const items = await fetchJSON(`/v1/${d.id}/review-queue`);
-      counts[d.id] = items.length;
+      const page = await fetchJSON(`/v1/${d.id}/review-queue?limit=1`);   // only the count is wanted: ask for one item, read `total`
+      counts[d.id] = (page && page.total !== undefined) ? page.total : ((page && page.items) || []).length;
     } catch (e) { /* ignore */ }
   }
   renderTabs(counts);

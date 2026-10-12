@@ -41,7 +41,7 @@ class FieldDecision:
 
 
 def _non_empty_candidates(records: list[SourceRecord], field: str):
-    for rec in sorted(records, key=lambda r: r.ingested_at, reverse=True):
+    for rec in sorted(records, key=lambda r: getattr(r, "updated_at", None) or r.ingested_at, reverse=True):
         val = rec.attributes.get(field)
         if val not in (None, ""):
             yield rec, val

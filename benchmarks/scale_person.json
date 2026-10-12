@@ -1,0 +1,247 @@
+{
+  "settings": {
+    "cap": 500,
+    "dup_rate": 0.08,
+    "dup_sample": 1000,
+    "rates": {
+      "dob_rate": 0.9,
+      "email_rate": 0.6,
+      "phone_rate": 0.8,
+      "ssn_rate": 0.7
+    },
+    "sample": 2000,
+    "seed": 7,
+    "variants": null
+  },
+  "sizes": [
+    {
+      "by_group": {
+        "dob+first initial": 0.1,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 0.2,
+        "last+first": 0.4,
+        "last+zip": 0.2,
+        "phone exact": 0.1,
+        "phone windows(4)": 31.2,
+        "soundex(last)+first": 0.3,
+        "soundex(last)+first+birth year": 0.1,
+        "soundex(last)+zip3": 0.2,
+        "ssn exact": 0.3
+      },
+      "duplicates_in_sample": 775,
+      "records": 10000,
+      "records_per_second": 3313,
+      "sample": 2000,
+      "seconds": 3.0,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.9987,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 15.8,
+          "partners_max": 69,
+          "partners_mean": 31.7,
+          "partners_median": 37,
+          "partners_p95": 53,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_no_ssn": {
+          "blocking_recall": 0.9935,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.1,
+          "partners_max": 6,
+          "partners_mean": 0.3,
+          "partners_median": 0,
+          "partners_p95": 1,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_windows_no_ssn": {
+          "blocking_recall": 0.9948,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 15.7,
+          "partners_max": 68,
+          "partners_mean": 31.3,
+          "partners_median": 36,
+          "partners_p95": 53,
+          "unreachable_pct": 0.0
+        },
+        "full": {
+          "blocking_recall": 1.0,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 15.9,
+          "partners_max": 87,
+          "partners_mean": 31.9,
+          "partners_median": 37,
+          "partners_p95": 54,
+          "unreachable_pct": 0.0
+        },
+        "ssn_no_phone": {
+          "blocking_recall": 0.9987,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.4,
+          "partners_max": 37,
+          "partners_mean": 0.8,
+          "partners_median": 0,
+          "partners_p95": 3,
+          "unreachable_pct": 0.0
+        }
+      }
+    },
+    {
+      "by_group": {
+        "dob+first initial": 0.3,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 0.9,
+        "last+first": 2.7,
+        "last+zip": 0.7,
+        "phone exact": 0.1,
+        "phone windows(4)": 318.1,
+        "soundex(last)+first": 1.1,
+        "soundex(last)+first+birth year": 0.1,
+        "soundex(last)+zip3": 0.3,
+        "ssn exact": 2.1
+      },
+      "duplicates_in_sample": 1000,
+      "records": 100000,
+      "records_per_second": 4290,
+      "sample": 2000,
+      "seconds": 23.3,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.998,
+          "growth_exponent": 1.01,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 161.3,
+          "partners_max": 530,
+          "partners_mean": 322.6,
+          "partners_median": 383,
+          "partners_p95": 473,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_no_ssn": {
+          "blocking_recall": 0.992,
+          "growth_exponent": 0.56,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 0.5,
+          "partners_max": 25,
+          "partners_mean": 1.1,
+          "partners_median": 1,
+          "partners_p95": 3,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_windows_no_ssn": {
+          "blocking_recall": 0.993,
+          "growth_exponent": 1.01,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 159.5,
+          "partners_max": 527,
+          "partners_mean": 319.0,
+          "partners_median": 380,
+          "partners_p95": 470,
+          "unreachable_pct": 0.0
+        },
+        "full": {
+          "blocking_recall": 1.0,
+          "growth_exponent": 1.01,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 162.4,
+          "partners_max": 800,
+          "partners_mean": 324.8,
+          "partners_median": 383,
+          "partners_p95": 476,
+          "unreachable_pct": 0.0
+        },
+        "ssn_no_phone": {
+          "blocking_recall": 0.998,
+          "growth_exponent": 0.92,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 3.3,
+          "partners_max": 320,
+          "partners_mean": 6.6,
+          "partners_median": 3,
+          "partners_p95": 17,
+          "unreachable_pct": 0.0
+        }
+      }
+    },
+    {
+      "by_group": {
+        "dob+first initial": 2.6,
+        "dob+soundex(last)": 0.1,
+        "email exact": 0.1,
+        "first+zip": 7.3,
+        "last+first": 27.7,
+        "last+zip": 5.4,
+        "phone exact": 0.1,
+        "phone windows(4)": 514.5,
+        "soundex(last)+first": 10.7,
+        "soundex(last)+first+birth year": 0.2,
+        "soundex(last)+zip3": 2.1,
+        "ssn exact": 0.1
+      },
+      "duplicates_in_sample": 1000,
+      "records": 1000000,
+      "records_per_second": 4421,
+      "sample": 2000,
+      "seconds": 226.2,
+      "variants": {
+        "customer_like": {
+          "blocking_recall": 0.997,
+          "growth_exponent": 0.24,
+          "keys_over_cap_pct": 38.12,
+          "pairs_per_record": 280.4,
+          "partners_max": 2557,
+          "partners_mean": 560.9,
+          "partners_median": 477,
+          "partners_p95": 1700,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_no_ssn": {
+          "blocking_recall": 0.984,
+          "growth_exponent": 0.92,
+          "keys_over_cap_pct": 0.0,
+          "pairs_per_record": 4.6,
+          "partners_max": 219,
+          "partners_mean": 9.2,
+          "partners_median": 7,
+          "partners_p95": 21,
+          "unreachable_pct": 0.0
+        },
+        "dob_phone_windows_no_ssn": {
+          "blocking_recall": 0.985,
+          "growth_exponent": 0.22,
+          "keys_over_cap_pct": 36.61,
+          "pairs_per_record": 261.8,
+          "partners_max": 2531,
+          "partners_mean": 523.6,
+          "partners_median": 458,
+          "partners_p95": 1674,
+          "unreachable_pct": 0.0
+        },
+        "full": {
+          "blocking_recall": 1.0,
+          "growth_exponent": 0.24,
+          "keys_over_cap_pct": 27.82,
+          "pairs_per_record": 281.7,
+          "partners_max": 2557,
+          "partners_mean": 563.5,
+          "partners_median": 479,
+          "partners_p95": 1705,
+          "unreachable_pct": 0.0
+        },
+        "ssn_no_phone": {
+          "blocking_recall": 0.995,
+          "growth_exponent": 0.85,
+          "keys_over_cap_pct": 0.1,
+          "pairs_per_record": 23.2,
+          "partners_max": 497,
+          "partners_mean": 46.5,
+          "partners_median": 29,
+          "partners_p95": 153,
+          "unreachable_pct": 0.0
+        }
+      }
+    }
+  ]
+}

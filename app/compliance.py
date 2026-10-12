@@ -65,6 +65,9 @@ def purge_entity(store: Store, tenant_id: str, domain: str, entity_id: str, requ
 
     for rec in source_records:
         store.delete_blocking_keys(rec.id, tenant_id, domain)
+        store.clear_golden_dirty([(tenant_id, domain, entity_id)])
+        store.delete_record_history(rec.id, tenant_id, domain)  # superseded payloads are personal data too
+        store.delete_staged(rec.id, tenant_id, domain)  # the staging layer holds a copy of the personal data too
         store.delete_source_record(rec.id, tenant_id, domain)
     store.delete_entity(entity_id, tenant_id, domain)
 

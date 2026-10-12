@@ -37,6 +37,51 @@ def normalize_name(value: str | None) -> str:
     return " ".join(tokens)
 
 
+# Common US-English nicknames -> the full given name. Deliberately limited to nicknames that map to ONE name:
+# Pat (Patrick/Patricia), Chris, Sam, Jamie, Terry, Alex... are ambiguous and left alone, because guessing wrong
+# would merge or split people. String similarity alone can't do this job: Bob~Robert scores 0.50 while
+# unrelated names routinely score 0.4-0.6, so without a table a nickname looks like a different person.
+NICKNAMES = {
+    **dict.fromkeys(["bob", "bobby", "rob", "robbie", "robby"], "robert"),
+    **dict.fromkeys(["bill", "billy", "will", "willy", "willie"], "william"),
+    **dict.fromkeys(["jim", "jimmy"], "james"), **dict.fromkeys(["mike", "mikey"], "michael"),
+    **dict.fromkeys(["liz", "lizzie", "beth", "betty", "eliza", "libby"], "elizabeth"),
+    **dict.fromkeys(["peggy", "maggie", "meg", "marge"], "margaret"), **dict.fromkeys(["jack", "johnny"], "john"),
+    **dict.fromkeys(["dick", "rick", "ricky", "rich", "richie"], "richard"), **dict.fromkeys(["tom", "tommy"], "thomas"),
+    **dict.fromkeys(["chuck", "charlie", "chas"], "charles"), **dict.fromkeys(["joe", "joey"], "joseph"),
+    **dict.fromkeys(["jen", "jenny", "jenn"], "jennifer"), **dict.fromkeys(["trish", "tricia", "patty"], "patricia"),
+    **dict.fromkeys(["kim", "kimmy"], "kimberly"), **dict.fromkeys(["ted", "teddy", "ed", "eddie", "ned"], "edward"),
+    **dict.fromkeys(["hank", "harry"], "henry"), **dict.fromkeys(["kate", "katie", "kathy"], "katherine"),
+    "cathy": "catherine", **dict.fromkeys(["dave", "davy"], "david"), **dict.fromkeys(["dan", "danny"], "daniel"),
+    "matt": "matthew", "tony": "anthony", **dict.fromkeys(["steve", "stevie"], "steven"),
+    **dict.fromkeys(["andy", "drew"], "andrew"), "josh": "joshua", "nick": "nicholas",
+    **dict.fromkeys(["sue", "susie", "suzy"], "susan"), **dict.fromkeys(["barb", "barbie"], "barbara"),
+    **dict.fromkeys(["deb", "debbie"], "deborah"), "becky": "rebecca", "vicky": "victoria", "cindy": "cynthia",
+    "sandy": "sandra", "mandy": "amanda", "pam": "pamela", **dict.fromkeys(["ben", "benny"], "benjamin"),
+    "greg": "gregory", "jeff": "jeffrey", **dict.fromkeys(["ken", "kenny"], "kenneth"), "larry": "lawrence",
+    "pete": "peter", "phil": "philip", **dict.fromkeys(["ron", "ronnie"], "ronald"), "tim": "timothy",
+    **dict.fromkeys(["zach", "zack"], "zachary"), "abby": "abigail", "jess": "jessica",
+}
+
+
+def normalize_given_name(value: str | None) -> str:
+    """normalize_name(), plus the FIRST token mapped from a nickname to its full name (Bob -> robert).
+    Only the first token: in "Mary Beth" the Beth is a middle name, not a nickname for Elizabeth."""
+    tokens = normalize_name(value).split(" ")
+    if tokens and tokens[0] in NICKNAMES:
+        tokens[0] = NICKNAMES[tokens[0]]
+    return " ".join(t for t in tokens if t)
+
+
+def normalize_suffix(value: str | None) -> str:
+    """The generational suffix ending a name ("Park Jr." -> "jr"), else "".
+    normalize_name() drops suffixes so "Park Jr" and "Park" can still match
+    on surname; this keeps the information so a Jr and a Sr at one address
+    can be told apart instead of silently merged."""
+    tokens = re.sub(r"[.,]", " ", clean_text(value).lower()).split()
+    return tokens[-1] if tokens and tokens[-1] in _NAME_SUFFIXES else ""
+
+
 def normalize_email(value: str | None) -> str:
     if not value:
         return ""
@@ -175,6 +220,7 @@ def standardize(domain: str, raw: dict) -> dict:
     """Dispatches to the right standardizer for a domain. Raises KeyError
     with a clear message for an unregistered domain rather than silently
     returning something wrong."""
+    from . import domains  # noqa: F401 -- importing it installs each registered domain's standardizer
     try:
         return STANDARDIZERS[domain](raw)
     except KeyError:
