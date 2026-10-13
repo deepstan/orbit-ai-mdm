@@ -18,9 +18,11 @@ touching this file.
 """
 from __future__ import annotations
 
+import os
 import re
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from .domains import DomainConfig
 from .normalizers import group_keys
@@ -108,12 +110,33 @@ def jaro_winkler(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
     return jaro_sim + prefix_len * prefix_weight * (1 - jaro_sim)
 
 
+def cache_size(env_name: str, default: int) -> int:
+    """A cache size from the environment: a whole number, 0 turns the cache off. A typo fails loudly at start-up instead of silently disabling a speed-up."""
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"{env_name} must be a whole number (0 turns the cache off); got {raw!r}") from None
+    if n < 0:
+        raise ValueError(f"{env_name} must not be negative; got {n}")
+    return n
+
+
+# Jaro-Winkler is a pure function of two strings, and the same names, cities and streets recur constantly: on a 6,500-record run 96% of calls were repeats. An LRU cache, BOUNDED
+# (about 0.25 KB an entry, so the default is about 35 MB per process; a bulk run with worker processes has one cache each), makes the second and later calls a dictionary lookup.
+# Jaro-Winkler is symmetric (tests/test_caches.py proves it on 50,000 random pairs, bit for bit), so (a, b) and (b, a) share an entry.
+SIMILARITY_CACHE_DEFAULT = 131_072
+_jw = lru_cache(maxsize=cache_size("MDM_SIMILARITY_CACHE_SIZE", SIMILARITY_CACHE_DEFAULT))(jaro_winkler)
+
+
 def similarity(a: str, b: str) -> float:
     """Similarity used throughout the matcher. Empty-vs-empty is treated as
     'no signal' (0.0), not a false match."""
     if not a or not b:
         return 0.0
-    return jaro_winkler(a, b)
+    return _jw(a, b) if a <= b else _jw(b, a)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +180,11 @@ def _get_embedding_provider():
 # a weak similarity. Measured: unrelated first names score below 0.6 about 90% of the time, but a nickname can too
 # (Bob/Robert 0.50) -- which is why given names are canonicalized through a nickname table BEFORE they get here.
 DISAGREE_BELOW = 0.6
+# A GIVEN NAME is held to a stricter line. Jaro-Winkler scores unrelated first names (richard / barbara 0.62, william / wei 0.69, tony / thomas 0.65) in the 'partial' band
+# between DISAGREE_BELOW and 0.85, which carries no penalty: two different people sharing a phone and an address were auto-merged. (Nicknames are NOT this module's job:
+# the standardizer already turns the unambiguous ones into the full name, Bob -> robert, and leaves the ambiguous ones, Ted or Pat, alone on purpose.)
+GIVEN_NAME_FIELDS = frozenset({"first_name", "given_name"})
+GIVEN_NAME_DISAGREE_BELOW = 0.75   # swept 0.60..0.80 on a synthetic benchmark (3 seeds): 0.70-0.75 has the best F1; 0.75 the fewest wrong merges. Calibrate on real names.
 DETERMINISTIC_SCORE = 0.97
 
 
@@ -197,14 +225,20 @@ def _share_near(a, b) -> bool:
     return bool(a and b and set(a.split(",")) & set(b.split(",")))
 
 
-def _compare(va: str, vb: str, exact: bool):
+def _below(config, f: str) -> float:
+    """The similarity below which two values of this field disagree: the domain's own setting, else the given-name line, else the default."""
+    override = getattr(config, "disagree_below", None) or {}
+    return override.get(f, GIVEN_NAME_DISAGREE_BELOW if f in GIVEN_NAME_FIELDS else DISAGREE_BELOW)
+
+
+def _compare(va: str, vb: str, exact: bool, below: float = DISAGREE_BELOW):
     """-> (state, similarity). 'missing' is NOT 'different': an empty field says nothing either way."""
     if not va or not vb:
         return "missing", None
     if exact:
         return ("agree", 1.0) if va == vb else ("disagree", 0.0)
     sim = similarity(va, vb)
-    return ("agree" if sim >= 0.85 else "disagree" if sim < DISAGREE_BELOW else "partial"), sim
+    return ("agree" if sim >= 0.85 else "disagree" if sim < below else "partial"), sim
 
 
 def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown:
@@ -253,7 +287,7 @@ def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown
         scale = (0.5 + 0.5 * total_weight / ideal) / total_weight  # fewer fields compared -> less confidence
         base = sum(sim * w for _, sim, w in parts) * scale
         for f, sim, w in parts:
-            contributions.append({"field": f, "state": "agree" if sim >= 0.85 else "disagree" if sim < DISAGREE_BELOW else "partial",
+            contributions.append({"field": f, "state": "agree" if sim >= 0.85 else "disagree" if sim < _below(config, f) else "partial",
                                   "similarity": round(sim, 4), "points": round(sim * w * scale, 4)})
 
     penalty = 0.0
@@ -266,7 +300,7 @@ def score_pair(std_a: dict, std_b: dict, config: DomainConfig) -> ScoreBreakdown
             state, sim = date_compare(std_a.get(f, ""), std_b.get(f, ""))
             fraction = NEAR_DATE_PENALTY
         else:
-            state, sim = _compare(std_a.get(f, ""), std_b.get(f, ""), exact=is_identifier or f in config.mismatch_exact)
+            state, sim = _compare(std_a.get(f, ""), std_b.get(f, ""), exact=is_identifier or f in config.mismatch_exact, below=_below(config, f))
             fraction = NEAR_SSN_PENALTY
             if state == "disagree" and f in near_ids and _share_near(std_a.get(f + "~near"), std_b.get(f + "~near")):
                 state = "near"  # one typo apart: strong-but-fallible evidence, not a contradiction

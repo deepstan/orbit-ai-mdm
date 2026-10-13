@@ -30,11 +30,17 @@ def _cache_seconds() -> float:
         return DEFAULT_SUMMARY_CACHE_SECONDS
 
 
+def _database_of(store):
+    """What the store POINTS AT: the SQLite file or the Postgres URL. Not id(store): Python reuses the address of a freed object (50 of 60 fresh stores in a
+    measurement), so a cache keyed on it could serve one database's count for another."""
+    return getattr(store, "path", None) or getattr(store, "database_url", None) or id(store)
+
+
 def merge_totals(store, tenant_id: str, domain: str, clock=time.monotonic) -> dict:
     """How many automatic merges each kind has made. Counting them reads every one (the single cost of the page that grows with the data), they change slowly and
     only weight what the page DISPLAYS, so the page may use a total up to MDM_SUMMARY_CACHE_SECONDS old (30; 0 turns the cache off). The audit counts, which a person's
     verdict changes at once, are never cached, and neither is anything the rollback decides on."""
-    ttl, key, now = _cache_seconds(), (id(store), tenant_id, domain), clock()
+    ttl, key, now = _cache_seconds(), (_database_of(store), tenant_id, domain), clock()
     with _merge_totals_lock:
         hit = _merge_totals.get(key)
         if ttl > 0 and hit and now - hit[0] < ttl:

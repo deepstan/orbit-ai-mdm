@@ -133,6 +133,25 @@ class TestTheMergeTotalIsCachedBrieflyAndNothingElseIs(Audited):
             stewardship.merge_totals(self.store, TENANT, DOMAIN)
             self.assertEqual(len(calls), 4)                                  # 0 turns the cache off
 
+    def test_two_databases_never_share_a_cached_total_even_if_a_store_object_reuses_an_address(self):
+        """The cache was keyed on id(store), and Python reuses the address of a freed object: a NEW store could be handed a DEAD store's count. It is keyed on the database."""
+        from app import stewardship
+        from app.models import MatchCandidate
+        with mock.patch.dict(os.environ, {"MDM_SUMMARY_CACHE_SECONDS": "3600"}):
+            stores = []
+            for n in (1, 5):                                   # two different databases that hold a different number of automatic merges for the SAME tenant and domain
+                tmp = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, tmp, True)
+                store = Store(os.path.join(tmp, "t.db"))
+                store.save_candidates_batch([MatchCandidate(record_a_id=f"a{i}", record_b_id=f"b{i}", tenant_id=TENANT, domain=DOMAIN, score=0.95, match_type="fuzzy",
+                                                            status="confirmed", decided_by="system:bulk_load") for i in range(n)])
+                stores.append(store)
+            counts = [stewardship.merge_totals(s, TENANT, DOMAIN)["rule"] for s in stores]
+            self.assertEqual(counts, [1, 5])
+            with mock.patch.object(stewardship, "id", lambda obj: 12345, create=True):    # even if every store object had the SAME address
+                self.assertEqual([stewardship.merge_totals(s, TENANT, DOMAIN)["rule"] for s in stores], [1, 5])
+        self.assertEqual(stewardship._database_of(stores[0]), stores[0].path)
+
     def test_a_verdict_shows_in_the_summary_at_once_even_with_the_cache_on(self):
         with mock.patch.dict(os.environ, {"MDM_SUMMARY_CACHE_SECONDS": "3600"}):
             before = audit_summary(self.store, TENANT, DOMAIN)

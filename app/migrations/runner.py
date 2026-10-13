@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from ..models import now_iso
+from ..sql_dialect import get_dialect
 
 PLATFORM_NAMESPACE = "platform"
 
@@ -128,10 +129,11 @@ class MigrationContext:
 
     def __init__(self, backend_name: str, conn):
         self.backend = backend_name
+        self.dialect = get_dialect(backend_name)      # the SQL TEXT that differs between databases lives there (app/sql_dialect.py)
         self._conn = conn
 
     def _sql(self, sql: str) -> str:
-        return sql.replace("?", "%s") if self.backend == "postgres" else sql
+        return self.dialect.sql(sql)
 
     def execute(self, sql: str, params: tuple = ()) -> None:
         if self.backend == "postgres":
@@ -164,28 +166,17 @@ class MigrationContext:
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
     def table_exists(self, name: str) -> bool:
-        if self.backend == "sqlite":
-            rows = self.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
-        else:
-            rows = self.query(
-                "SELECT 1 AS present FROM information_schema.tables "
-                "WHERE table_schema = current_schema() AND table_name = ?", (name,))
-        return bool(rows)
+        sql, params = self.dialect.table_exists_query(name)
+        return bool(self.query(sql, params))
 
     def column_types(self, table: str) -> dict:
         """{column: declared type} (SQLite: the declared type, upper-cased; Postgres: information_schema's data_type)."""
-        if self.backend == "sqlite":
-            return {r["name"]: (r["type"] or "").upper() for r in self.query(f"PRAGMA table_info({table})")}
-        return {r["column_name"]: r["data_type"] for r in self.query(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = ?", (table,))}
+        sql, params = self.dialect.column_types_query(table)
+        return self.dialect.parse_column_types(self.query(sql, params))
 
     def columns(self, table: str) -> set:
-        if self.backend == "sqlite":
-            return {r["name"] for r in self.query(f"PRAGMA table_info({table})")}
-        return {r["column_name"] for r in self.query(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = ?", (table,))}
+        sql, params = self.dialect.columns_query(table)
+        return self.dialect.parse_columns(self.query(sql, params))
 
 
 # ---------------------------------------------------------------------------

@@ -27,11 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from test_unmerge import A, B, C, D  # noqa: E402
+from app import audit  # noqa: E402
 from app import learned_scorer as ls  # noqa: E402
 from app import monitor  # noqa: E402
 from app.bulk import bulk_load  # noqa: E402
-from app.models import MatchCandidate, now_iso  # noqa: E402
+from app.models import Entity, MatchCandidate, now_iso  # noqa: E402
 from app.pipeline import ingest_record, merge_two_records  # noqa: E402
+from app.sql_dialect import get_dialect  # noqa: E402
 from app.stewardship import audit_queue, audit_summary, give_verdict  # noqa: E402
 from app.unmerge import CannotUnmerge, plan_unmerge, separation_violations, unmerge_pair  # noqa: E402
 
@@ -215,7 +217,215 @@ class Contract:
         self.assertEqual(self.store.get_source_records_batch(f"{self.tenant}_other", DOMAIN, ids[:3]), {})     # another tenant's key sees nothing
 
 
+    # ---------------------------------------------------------------- tenant isolation, which must NOT depend on the database's row-level security
+    # Another database may have no such feature, or a different one. So every read is asked for ANOTHER tenant's data using that tenant's REAL ids, and must come back empty.
+    # The tenant-taking methods the isolation tests do NOT exercise. A visible list of debt: a new method must be probed or added here with a reason, and removing a name is progress.
+    NOT_YET_PROBED = frozenset({
+        # reads that need data this test does not seed (audits, API keys, runs, usage, history)
+        "audit_counts", "audited_wrong", "pending_audits", "list_merge_audits", "list_api_keys", "list_usage_events", "list_runs", "iter_raw_attributes",
+        "separation_violations", "unfinished_in",
+        # writes that need set-up of their own (a run, an onboarding, a bulk token, an API key, an audit sample)
+        "apply_onboarding", "create_run", "flag_merge_audits", "record_merge_audit", "record_processing_failure", "revoke_api_key", "rollback_bulk", "sample_merge_audit", "save_blocking_keys",
+    })
+
+    @staticmethod
+    def empty(x):
+        if x is None or x is False:
+            return True
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            return x == 0
+        if isinstance(x, (list, tuple, set, frozenset)):
+            return all(Contract.empty(v) for v in x)                                       # a tuple of empty answers (one per variant of a call) is empty
+        if isinstance(x, dict):
+            return all(Contract.empty(v) for v in x.values())
+        return False
+
+    def seed_one_tenant(self):
+        ids = self.chain()
+        bc = self.pair(ids, "B", "C")
+        ab = self.pair(ids, "A", "B")
+        self.pending = self.pending_candidates(5)
+        history = {"first_name": "Hilda", "last_name": "Zander", "email": "hilda@z.example"}
+        h = self.ingest("H", history)["record_id"]
+        self.ingest("H", {**history, "city": "Macon"})                                      # a changed record keeps its earlier version in the record history
+        audit.log_action(self.store, self.tenant, action="probe", actor="test", domain=DOMAIN, details={})
+        unmerge_pair(self.store, self.tenant, DOMAIN, ab, "jane", "different people")
+        self.seeded = {"ids": ids, "ab": ab, "bc": bc, "h": h}
+        return ids, ab, bc
+
+    def probes(self):
+        ids, ab, bc = self.seed_one_tenant()
+        s, rids = self.store, list(ids.values())
+        rid, e_a, e_bc = ids["A"], self.entity_of(ids["A"]), self.entity_of(ids["B"])
+        keys = set()
+        for ks in s.blocking_keys_of(self.tenant, DOMAIN, rids).values():
+            keys |= set(ks)
+        self.assertTrue(keys, "the probe data has blocking keys")
+        pairs = [("src", n) for n in ids]
+        return {
+            "get_source_record": lambda t: s.get_source_record(rid, t, DOMAIN),
+            "list_source_records": lambda t: (s.list_source_records(t, DOMAIN), s.list_source_records(t, DOMAIN, e_bc)),            # with and without the entity filter
+            "get_source_records_batch": lambda t: s.get_source_records_batch(t, DOMAIN, rids),
+            "find_source_record": lambda t: s.find_source_record(t, DOMAIN, "src", "A"),
+            "find_source_records_by_keys": lambda t: s.find_source_records_by_keys(t, DOMAIN, pairs),
+            "get_record_entities": lambda t: s.get_record_entities(t, DOMAIN, rids),
+            "has_source_records": lambda t: s.has_source_records(t, DOMAIN),
+            "count_tenant_records": lambda t: s.count_tenant_records(t, DOMAIN),
+            "get_entity": lambda t: s.get_entity(e_bc, t, DOMAIN),
+            "get_entities_batch": lambda t: s.get_entities_batch(t, DOMAIN, [e_a, e_bc]),
+            "entities_page": lambda t: (s.entities_page(t, DOMAIN, 100), s.entities_page(t, DOMAIN, 100, after_id="!"), s.entities_page(t, DOMAIN, 100, status="active")),
+            "list_entities": lambda t: (s.list_entities(t, DOMAIN), s.list_entities(t, DOMAIN, "active")),
+            "list_records_of_entities": lambda t: s.list_records_of_entities(t, DOMAIN, [e_a, e_bc]),
+            "pending_page": lambda t: s.pending_page(t, DOMAIN, 50),
+            "count_pending": lambda t: s.count_pending(t, DOMAIN),
+            "list_candidates": lambda t: (s.list_candidates(t, DOMAIN, None), s.list_candidates(t, DOMAIN), s.list_candidates(t, DOMAIN, "confirmed")),
+            "get_candidate": lambda t: s.get_candidate(bc, t, DOMAIN),
+            "list_candidate_pairs": lambda t: s.list_candidate_pairs(t, DOMAIN, ids["B"]),
+            "confirmed_pairs_among": lambda t: s.confirmed_pairs_among(t, DOMAIN, [ids["B"], ids["C"]]),
+            "list_lineage": lambda t: s.list_lineage(e_bc, t, DOMAIN),
+            "list_record_history": lambda t: s.list_record_history(self.seeded["h"], t, DOMAIN),
+            "list_audit_log": lambda t: (s.list_audit_log(t), s.list_audit_log(t, DOMAIN)),
+            "get_last_audit_entry": lambda t: s.get_last_audit_entry(t),
+            "separation_pairs": lambda t: s.separation_pairs(t, DOMAIN),
+            "has_separations": lambda t: s.has_separations(t, DOMAIN),
+            "separated_partners": lambda t: s.separated_partners(t, DOMAIN, rid),
+            "entities_separated": lambda t: s.entities_separated(t, DOMAIN, e_a, e_bc),
+            "blocking_bucket_sizes": lambda t: s.blocking_bucket_sizes(t, DOMAIN, keys),
+            "blocking_keys_of": lambda t: s.blocking_keys_of(t, DOMAIN, rids),
+            "blocking_members": lambda t: s.blocking_members(t, DOMAIN, keys),
+            "find_candidate_record_ids": lambda t: s.find_candidate_record_ids(t, DOMAIN, keys, "no-such-record"),
+            "get_staged_many": lambda t: s.get_staged_many(t, DOMAIN, rids),
+            "get_matching_many": lambda t: s.get_matching_many(t, DOMAIN, rids),
+            "count_auto_merges": lambda t: s.count_auto_merges(t, DOMAIN),
+            "human_labeled_candidates": lambda t: s.human_labeled_candidates(t, DOMAIN),
+        }
+
+    def write_probes(self):
+        """Writes that must do NOTHING when made under another tenant, with the real ids of this one. Call after probes()."""
+        s, ids, bc = self.store, self.seeded["ids"], self.seeded["bc"]
+        rid, e_bc, pending_record = ids["B"], self.entity_of(ids["B"]), self.pending[0].record_a_id
+        return {
+            "delete_entity": lambda t: s.delete_entity(e_bc, t, DOMAIN),
+            "delete_source_record": lambda t: s.delete_source_record(rid, t, DOMAIN),
+            "update_candidate_status": lambda t: s.update_candidate_status(bc, t, DOMAIN, "rejected", "intruder", now_iso()),
+            "set_record_entity": lambda t: s.set_record_entity(rid, t, DOMAIN, "an-entity-of-the-intruder"),
+            "supersede_pending_candidates": lambda t: s.supersede_pending_candidates(t, DOMAIN, pending_record),
+            "delete_staged": lambda t: s.delete_staged(rid, t, DOMAIN),
+            "delete_blocking_keys": lambda t: s.delete_blocking_keys(rid, t, DOMAIN),
+            "delete_record_history": lambda t: s.delete_record_history(self.seeded["h"], t, DOMAIN),
+            "update_source_record": lambda t: s.update_source_record(rid, t, DOMAIN, {"first_name": "Intruder"}, "intruder-hash", 99),
+            "set_processing_status": lambda t: s.set_processing_status([rid], t, DOMAIN, "failed", "intruder"),
+        }
+
+    def fingerprint(self, probes):
+        return {name: repr(call(self.tenant)) for name, call in probes.items()}
+
+    def test_no_write_made_under_another_tenant_changes_anything(self):
+        other = self.tenant + "_other"
+        reads = self.probes()
+        writes = self.write_probes()
+        before = self.fingerprint(reads)
+        for name, call in writes.items():
+            try:
+                call(other)
+            except Exception:                                                              # refusing is as good as ignoring: what matters is that nothing changed
+                pass
+            self.assertEqual(self.fingerprint(reads), before, f"{name}, made under another tenant, changed this tenant's data")
+        # the control: the same KIND of write by the OWNER does change what the fingerprint sees, so "unchanged" above means something
+        writes["update_candidate_status"](self.tenant)
+        self.assertNotEqual(self.fingerprint(reads), before, "the fingerprint cannot see a status change, so it proved nothing")
+
+    def test_another_tenants_entities_with_lower_ids_do_not_use_up_this_tenants_pages(self):
+        """The entity pages select ids and THEN load them tenant-filtered. If the first step ignored the tenant, other tenants' ids would fill the page limit and be dropped, and this tenant
+        would see short or empty pages. Nothing leaks, but it is wrong. The other tenant's ids here sort BEFORE every id of this one."""
+        other = self.tenant + "_other"
+        self.seed_one_tenant()
+        mine = sorted(e.id for e in self.store.list_entities(self.tenant, DOMAIN))
+        self.assertGreaterEqual(len(mine), 3)
+        tag = uuid.uuid4().hex[:8]
+        for i in range(8):
+            self.store.save_entity(Entity(id=f"!!{tag}-{i}", tenant_id=other, domain=DOMAIN, status="active", attributes={"first_name": "Zed"}, source_record_ids=[],
+                                          created_at=now_iso(), updated_at=now_iso()))
+        self.assertEqual(sorted(e.id for e in self.store.entities_page(self.tenant, DOMAIN, len(mine))), mine)       # a page of exactly this tenant's size
+        walked, after = [], None
+        while True:                                                                                                  # and walked one at a time
+            page = self.store.entities_page(self.tenant, DOMAIN, 1, after_id=after)
+            if not page:
+                break
+            walked.append(page[0].id)
+            after = page[0].id
+        self.assertEqual(walked, mine)
+        self.assertEqual(sorted(e.id for e in self.store.list_entities(self.tenant, DOMAIN)), mine)
+        self.assertEqual(sorted(e.id for e in self.store.list_entities(self.tenant, DOMAIN, "active")), mine)
+        self.assertEqual(len(self.store.list_entities(other, DOMAIN)), 8)
+
+    def test_no_read_returns_another_tenants_data_even_given_the_right_ids(self):
+        other = self.tenant + "_other"
+        for name, call in self.probes().items():
+            self.assertFalse(self.empty(call(self.tenant)), f"{name}: even the owner gets nothing back, so this probe proves nothing")
+            self.assertTrue(self.empty(call(other)), f"{name} returned another tenant's data")
+
+    def test_every_store_method_that_takes_a_tenant_is_probed_or_listed_as_not_yet_probed(self):
+        import inspect
+        tenant_methods = {n for n, f in inspect.getmembers(type(self.store), inspect.isfunction) if not n.startswith("_") and "tenant_id" in inspect.signature(f).parameters}
+        reads = self.probes()
+        probed = set(reads) | set(self.write_probes())
+        self.assertEqual(sorted(probed - tenant_methods), [], "a probe names a method that does not take a tenant (or no longer exists)")
+        self.assertEqual(sorted(tenant_methods - probed - self.NOT_YET_PROBED), [],
+                         "a store method takes a tenant but is neither probed for isolation nor listed in NOT_YET_PROBED: probe it, or list it with a reason")
+        self.assertEqual(sorted(self.NOT_YET_PROBED - tenant_methods), [], "NOT_YET_PROBED lists a method that no longer exists or no longer takes a tenant")
+        self.assertEqual(sorted(self.NOT_YET_PROBED & probed), [], "NOT_YET_PROBED lists a method that IS probed")
+
+    # ---------------------------------------------------------------- the dialect helpers the kernel's tables will use, run on THIS backend
+    def test_the_dialect_helpers_behave_on_this_backend(self):
+        d = get_dialect(self.dialect_name)
+        table = f"probe_{uuid.uuid4().hex[:10]}"
+        self.exec_sql(f"CREATE TABLE {table} (k TEXT PRIMARY KEY, v INTEGER, w INTEGER, version INTEGER NOT NULL DEFAULT 0)")
+        self.addCleanup(lambda: self.exec_sql(f"DROP TABLE IF EXISTS {table}"))
+        read = lambda k: self.exec_sql(d.sql(f"SELECT v, w, version FROM {table} WHERE k = ?"), (k,))[0]
+        up = d.upsert(table, ["k", "v", "w"], ["k"])
+        self.exec_sql(up, ("a", 1, 1)); self.exec_sql(up, ("a", 2, 2))
+        self.assertEqual(read("a"), [(2, 2, 0)])                                                   # inserted, then updated
+        self.exec_sql(d.upsert(table, ["k", "v", "w"], ["k"], update=[]), ("a", 9, 9))
+        self.assertEqual(read("a"), [(2, 2, 0)])                                                   # DO NOTHING
+        for i in range(40):                                                                         # rows with many ties, for paging
+            self.exec_sql(d.sql(f"INSERT INTO {table} (k, v, w) VALUES (?, ?, ?)"), (f"k{i:03d}", i % 3, 0))
+        sql, params = d.in_list("k", ["k001", "k002", "zz"])
+        self.assertEqual(sorted(r[0] for r in self.exec_sql(f"SELECT k FROM {table} WHERE {sql}", params)[0]), ["k001", "k002"])
+        sql, params = d.in_list("k", [])
+        self.assertEqual(self.exec_sql(f"SELECT COUNT(*) FROM {table} WHERE {sql}", params)[0][0][0], 0)
+        want = [r[0] for r in self.exec_sql(f"SELECT k FROM {table} ORDER BY v DESC, k DESC")[0]]
+        seen, after = [], None
+        while True:                                                                                 # keyset paging, one row-value comparison, over ties
+            where = "" if after is None else "WHERE " + d.keyset_after(["v", "k"], descending=True)
+            page = self.exec_sql(f"SELECT k, v FROM {table} {where} ORDER BY v DESC, k DESC {d.limit_clause()}", ((after[1], after[0]) if after else ()) + (7,))[0]
+            if not page:
+                break
+            seen += [r[0] for r in page]
+            after = page[-1]
+        self.assertEqual(seen, want)
+        sql = d.versioned_update(table, ["v"], ["k"])                                              # two writers read version 0; only the first may write
+        first, second = self.exec_sql(sql, (10, "a", 0))[1], self.exec_sql(sql, (20, "a", 0))[1]
+        self.assertEqual((first, second), (1, 0))
+        self.assertEqual(read("a"), [(10, 2, 1)])
+        rows = self.exec_sql(f"SELECT k FROM {table} ORDER BY k {d.limit_clause()}{d.claim_suffix()}", (3,))[0]       # a claiming read is valid SQL here
+        self.assertEqual(len(rows), 3)
+
+
 class TestSqliteContract(Contract, unittest.TestCase):
+    dialect_name = "sqlite"
+
+    def exec_sql(self, sql, params=()):
+        """(rows as tuples, rows changed) on a fresh connection."""
+        conn = sqlite3.connect(self.path)
+        try:
+            cur = conn.execute(sql, params)
+            rows = [tuple(r) for r in cur.fetchall()] if cur.description else []
+            conn.commit()
+            return rows, cur.rowcount
+        finally:
+            conn.close()
+
     def make_store(self):
         from app.db import Store
         tmp = tempfile.mkdtemp()
@@ -249,6 +459,15 @@ class TestSqliteContract(Contract, unittest.TestCase):
 
 @unittest.skipUnless(HAVE_PSYCOPG2 and TEST_DB_URL, "Set TEST_DATABASE_URL to a SCRATCH Postgres database and `pip install psycopg2-binary` to run the contract on Postgres.")
 class TestPostgresContract(Contract, unittest.TestCase):
+    dialect_name = "postgres"
+
+    def exec_sql(self, sql, params=()):
+        """(rows as tuples, rows changed). NOT YET RUN against a server: this is the first thing to check if the dialect test fails there."""
+        with self.store._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params if params else None)
+            rows = [tuple(r.values()) if hasattr(r, "values") else tuple(r) for r in cur.fetchall()] if cur.description else []
+            return rows, cur.rowcount
+
     def make_store(self):
         from app.db_postgres import PostgresStore
         return PostgresStore(TEST_DB_URL), f"contract_{uuid.uuid4().hex[:10]}"

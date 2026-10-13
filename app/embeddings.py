@@ -35,6 +35,7 @@ import hashlib
 import math
 import os
 import re
+from functools import lru_cache
 from typing import Protocol
 
 
@@ -51,6 +52,37 @@ def _ngrams(text: str, n: int = 3) -> list[str]:
     return [padded[i:i + n] for i in range(len(padded) - n + 1)]
 
 
+def _embed_impl(text: str, n: int, buckets: int) -> dict[int, float]:
+    vec: dict[int, float] = {}
+    for gram in _ngrams(text, n):
+        h = int(hashlib.md5(gram.encode("utf-8")).hexdigest(), 16) % buckets
+        vec[h] = vec.get(h, 0.0) + 1.0
+    # L2-normalize so cosine similarity is just a dot product
+    norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+    return {k: v / norm for k, v in vec.items()}
+
+
+# A pure function of (text, n, buckets), and one of the two largest costs of scoring a pair (an MD5 per trigram). Cached, BOUNDED: an entry is about 2 KB, so the default is about
+# 35 MB per process. MDM_EMBEDDING_CACHE_SIZE=0 turns it off. The cached dict is SHARED and read-only: similarity() never mutates it, and embed() hands out copies.
+EMBEDDING_CACHE_DEFAULT = 16_384
+
+
+def _embedding_cache_size() -> int:
+    raw = os.environ.get("MDM_EMBEDDING_CACHE_SIZE")
+    if raw is None or raw.strip() == "":
+        return EMBEDDING_CACHE_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        raise ValueError(f"MDM_EMBEDDING_CACHE_SIZE must be a whole number (0 turns the cache off); got {raw!r}") from None
+    if n < 0:
+        raise ValueError(f"MDM_EMBEDDING_CACHE_SIZE must not be negative; got {n}")
+    return n
+
+
+_embed_cached = lru_cache(maxsize=_embedding_cache_size())(_embed_impl)
+
+
 class NgramHashEmbedding:
     """A sparse bag-of-char-trigrams vector, hashed into a fixed number of
     buckets (the 'hashing trick' — avoids needing a fitted vocabulary).
@@ -63,18 +95,13 @@ class NgramHashEmbedding:
         self.buckets = buckets
 
     def embed(self, text: str) -> dict[int, float]:
-        vec: dict[int, float] = {}
-        for gram in _ngrams(text, self.n):
-            h = int(hashlib.md5(gram.encode("utf-8")).hexdigest(), 16) % self.buckets
-            vec[h] = vec.get(h, 0.0) + 1.0
-        # L2-normalize so cosine similarity is just a dot product
-        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
-        return {k: v / norm for k, v in vec.items()}
+        """A fresh dict each call (the caller may do what it likes with it); the work behind it is cached."""
+        return dict(_embed_cached(text, self.n, self.buckets))
 
     def similarity(self, text_a: str, text_b: str) -> float:
         if not text_a or not text_b:
             return 0.0
-        va, vb = self.embed(text_a), self.embed(text_b)
+        va, vb = _embed_cached(text_a, self.n, self.buckets), _embed_cached(text_b, self.n, self.buckets)   # shared, read-only: never mutated here
         # dot product of two sparse, already-normalized vectors
         smaller, larger = (va, vb) if len(va) < len(vb) else (vb, va)
         return max(0.0, min(1.0, sum(v * larger.get(k, 0.0) for k, v in smaller.items())))

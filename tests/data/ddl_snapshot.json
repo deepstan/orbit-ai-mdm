@@ -1,0 +1,418 @@
+{
+ "postgres": {
+  "add_columns": [
+   [
+    "execute",
+    "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN quality_issues JSONB",
+    null
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"visits\" BIGINT",
+    null
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"balance\" NUMERIC",
+    null
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"joined\" TIMESTAMPTZ",
+    null
+   ]
+  ],
+  "context_basics": [
+   [
+    "execute",
+    "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "INSERT INTO t (a, b) VALUES (%s, %s)",
+    [
+     "x",
+     "y"
+    ]
+   ],
+   [
+    "execute",
+    "CREATE TABLE z (a TEXT)",
+    null
+   ],
+   [
+    "executemany",
+    "INSERT INTO t VALUES (%s)",
+    [
+     [
+      "p"
+     ],
+     [
+      "q"
+     ]
+    ]
+   ],
+   [
+    "execute",
+    "SELECT a FROM t WHERE b = %s",
+    [
+     "v"
+    ]
+   ]
+  ],
+  "new_table": [
+   [
+    "execute",
+    "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "CREATE TABLE \"entity_customer\" (\n    entity_id TEXT PRIMARY KEY,\n    tenant_id TEXT NOT NULL,\n    status TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    quality_issues JSONB,\n    \"first_name\" TEXT,\n    \"visits\" BIGINT,\n    \"balance\" NUMERIC,\n    \"joined\" TIMESTAMPTZ\n)",
+    null
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant\" ON \"entity_customer\"(tenant_id, status)",
+    null
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant_entity\" ON \"entity_customer\"(tenant_id, entity_id)",
+    null
+   ]
+  ],
+  "retype": [
+   [
+    "execute",
+    "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = %s",
+    [
+     "entity_customer__retype"
+    ]
+   ],
+   [
+    "execute",
+    "DROP TABLE \"entity_customer__retype\"",
+    null
+   ],
+   [
+    "execute",
+    "SELECT * FROM \"entity_customer\"",
+    null
+   ],
+   [
+    "execute",
+    "CREATE TABLE \"entity_customer__retype\" (\n    entity_id TEXT PRIMARY KEY,\n    tenant_id TEXT NOT NULL,\n    status TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    quality_issues JSONB,\n    \"first_name\" TEXT,\n    \"visits\" BIGINT,\n    \"balance\" NUMERIC,\n    \"joined\" TIMESTAMPTZ,\n    \"old_field\" TEXT\n)",
+    null
+   ],
+   [
+    "executemany",
+    "INSERT INTO \"entity_customer__retype\" (\"entity_id\", \"tenant_id\", \"status\", \"created_at\", \"updated_at\", \"quality_issues\", \"first_name\", \"visits\", \"balance\", \"joined\", \"old_field\") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+    [
+     [
+      "e0",
+      "t",
+      "active",
+      "2026-01-01",
+      "2026-01-02",
+      null,
+      "n0",
+      "0",
+      "0.50",
+      "2026-01-01 00:00:00+00:00",
+      "keep"
+     ],
+     [
+      "e1",
+      "t",
+      "active",
+      "2026-01-01",
+      "2026-01-02",
+      null,
+      "n1",
+      "1",
+      "1.50",
+      "2026-01-01 00:00:00+00:00",
+      "keep"
+     ]
+    ]
+   ],
+   [
+    "execute",
+    "SELECT COUNT(*) AS n FROM \"entity_customer__retype\"",
+    null
+   ],
+   [
+    "execute",
+    "DROP TABLE \"entity_customer\"",
+    null
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer__retype\" RENAME TO \"entity_customer\"",
+    null
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant\" ON \"entity_customer\"(tenant_id, status)",
+    null
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant_entity\" ON \"entity_customer\"(tenant_id, entity_id)",
+    null
+   ]
+  ]
+ },
+ "sqlite": {
+  "add_columns": [
+   [
+    "execute",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "PRAGMA table_info(entity_customer)",
+    []
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN quality_issues TEXT",
+    []
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"visits\" INTEGER",
+    []
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"balance\" NUMERIC",
+    []
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer\" ADD COLUMN \"joined\" TIMESTAMP",
+    []
+   ]
+  ],
+  "context_basics": [
+   [
+    "execute",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "PRAGMA table_info(entity_customer)",
+    []
+   ],
+   [
+    "execute",
+    "PRAGMA table_info(entity_customer)",
+    []
+   ],
+   [
+    "execute",
+    "INSERT INTO t (a, b) VALUES (?, ?)",
+    [
+     "x",
+     "y"
+    ]
+   ],
+   [
+    "execute",
+    "CREATE TABLE z (a TEXT)",
+    []
+   ],
+   [
+    "executemany",
+    "INSERT INTO t VALUES (?)",
+    [
+     [
+      "p"
+     ],
+     [
+      "q"
+     ]
+    ]
+   ],
+   [
+    "execute",
+    "SELECT a FROM t WHERE b = ?",
+    [
+     "v"
+    ]
+   ]
+  ],
+  "new_table": [
+   [
+    "execute",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "CREATE TABLE \"entity_customer\" (\n    entity_id TEXT PRIMARY KEY,\n    tenant_id TEXT NOT NULL,\n    status TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    quality_issues TEXT,\n    \"first_name\" TEXT,\n    \"visits\" INTEGER,\n    \"balance\" NUMERIC,\n    \"joined\" TIMESTAMP\n)",
+    []
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant\" ON \"entity_customer\"(tenant_id, status)",
+    []
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant_entity\" ON \"entity_customer\"(tenant_id, entity_id)",
+    []
+   ]
+  ],
+  "retype": [
+   [
+    "execute",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [
+     "entity_customer"
+    ]
+   ],
+   [
+    "execute",
+    "PRAGMA table_info(entity_customer)",
+    []
+   ],
+   [
+    "execute",
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [
+     "entity_customer__retype"
+    ]
+   ],
+   [
+    "execute",
+    "DROP TABLE \"entity_customer__retype\"",
+    []
+   ],
+   [
+    "execute",
+    "SELECT * FROM \"entity_customer\"",
+    []
+   ],
+   [
+    "execute",
+    "CREATE TABLE \"entity_customer__retype\" (\n    entity_id TEXT PRIMARY KEY,\n    tenant_id TEXT NOT NULL,\n    status TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL,\n    quality_issues TEXT,\n    \"first_name\" TEXT,\n    \"visits\" INTEGER,\n    \"balance\" NUMERIC,\n    \"joined\" TIMESTAMP,\n    \"old_field\" TEXT\n)",
+    []
+   ],
+   [
+    "executemany",
+    "INSERT INTO \"entity_customer__retype\" (\"entity_id\", \"tenant_id\", \"status\", \"created_at\", \"updated_at\", \"quality_issues\", \"first_name\", \"visits\", \"balance\", \"joined\", \"old_field\") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    [
+     [
+      "e0",
+      "t",
+      "active",
+      "2026-01-01",
+      "2026-01-02",
+      null,
+      "n0",
+      "0",
+      "0.50",
+      "2026-01-01T00:00:00+00:00",
+      "keep"
+     ],
+     [
+      "e1",
+      "t",
+      "active",
+      "2026-01-01",
+      "2026-01-02",
+      null,
+      "n1",
+      "1",
+      "1.50",
+      "2026-01-01T00:00:00+00:00",
+      "keep"
+     ]
+    ]
+   ],
+   [
+    "execute",
+    "SELECT COUNT(*) AS n FROM \"entity_customer__retype\"",
+    []
+   ],
+   [
+    "execute",
+    "DROP TABLE \"entity_customer\"",
+    []
+   ],
+   [
+    "execute",
+    "ALTER TABLE \"entity_customer__retype\" RENAME TO \"entity_customer\"",
+    []
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant\" ON \"entity_customer\"(tenant_id, status)",
+    []
+   ],
+   [
+    "execute",
+    "CREATE INDEX IF NOT EXISTS \"idx_entity_customer_tenant_entity\" ON \"entity_customer\"(tenant_id, entity_id)",
+    []
+   ]
+  ]
+ }
+}

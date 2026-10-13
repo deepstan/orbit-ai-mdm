@@ -28,8 +28,9 @@ from __future__ import annotations
 import json
 import re
 
-from .fieldtypes import SQL_TYPES, canonical_type, cast_value, to_db
+from .fieldtypes import cast_value, to_db
 from .migrations.runner import MigrationContext, MigrationError
+from .sql_dialect import get_dialect
 
 SYSTEM_COLUMNS = ("entity_id", "tenant_id", "status", "created_at", "updated_at", "quality_issues")
 RESERVED_FIELD_NAMES = set(SYSTEM_COLUMNS) | {"domain", "id"}  # a field with one of these names would collide with a system column
@@ -62,28 +63,15 @@ def normalize_columns(fields) -> list:
     return [(f, "text") if isinstance(f, str) else (f[0], f[1]) for f in fields]
 
 
-def _issues_sql(backend: str) -> str:
-    return "JSONB" if backend == "postgres" else "TEXT"
-
-
-def _issues_param(backend: str, value):
-    if value is None or value == "":
-        return None
-    if backend == "postgres":
-        from psycopg2.extras import Json
-        return Json(json.loads(value) if isinstance(value, str) else value)
-    return value if isinstance(value, str) else json.dumps(value)
-
-
 def create_table(ctx: MigrationContext, domain: str, columns: list, table: str | None = None, index: bool = True) -> None:
     name = table or table_name(domain)
     defs = ["entity_id TEXT PRIMARY KEY", "tenant_id TEXT NOT NULL", "status TEXT NOT NULL", "created_at TEXT NOT NULL",
-            "updated_at TEXT NOT NULL", f"quality_issues {_issues_sql(ctx.backend)}"]
-    defs += [f"{q(f)} {SQL_TYPES[ctx.backend][t]}" for f, t in columns]
+            "updated_at TEXT NOT NULL", f"quality_issues {ctx.dialect.json_type}"]
+    defs += [f"{q(f)} {ctx.dialect.column_type(t)}" for f, t in columns]
     ctx.execute(f"CREATE TABLE {q(name)} (\n    " + ",\n    ".join(defs) + "\n)")
     if index:
-        ctx.execute(f"CREATE INDEX IF NOT EXISTS {q('idx_' + table_name(domain) + '_tenant')} ON {q(name)}(tenant_id, status)")
-        ctx.execute(f"CREATE INDEX IF NOT EXISTS {q('idx_' + table_name(domain) + '_tenant_entity')} ON {q(name)}(tenant_id, entity_id)")   # a page of entities is a range of this
+        ctx.execute(ctx.dialect.create_index_if_not_exists(q('idx_' + table_name(domain) + '_tenant'), q(name), "tenant_id, status"))
+        ctx.execute(ctx.dialect.create_index_if_not_exists(q('idx_' + table_name(domain) + '_tenant_entity'), q(name), "tenant_id, entity_id"))   # a page of entities is a range of this
 
 
 def retype_table(ctx: MigrationContext, domain: str, columns: list, have: dict) -> None:
@@ -91,15 +79,15 @@ def retype_table(ctx: MigrationContext, domain: str, columns: list, have: dict) 
     name = table_name(domain)
     tmp = name + "__retype"
     wanted = {f for f, _ in columns}
-    extras = [(c, canonical_type(ctx.backend, raw)) for c, raw in have.items() if c not in SYSTEM_COLUMNS and c not in wanted]
+    extras = [(c, ctx.dialect.canonical_type(raw)) for c, raw in have.items() if c not in SYSTEM_COLUMNS and c not in wanted]
     every = list(columns) + extras
     if ctx.table_exists(tmp):
-        ctx.execute(f"DROP TABLE {q(tmp)}")
+        ctx.execute(ctx.dialect.drop_table(q(tmp)))
     rows = ctx.query(f"SELECT * FROM {q(name)}")
     create_table(ctx, domain, every, table=tmp, index=False)
     out = []
     for r in rows:
-        values = [r.get(c) for c in SYSTEM_COLUMNS[:5]] + [_issues_param(ctx.backend, r.get("quality_issues"))]
+        values = [r.get(c) for c in SYSTEM_COLUMNS[:5]] + [ctx.dialect.json_param(r.get("quality_issues"))]
         for c, t in every:
             v = r.get(c)
             typed = None if v is None else cast_value(v, t)[0]  # cannot be cast -> NULL; reindex re-derives it from staging
@@ -109,10 +97,10 @@ def retype_table(ctx: MigrationContext, domain: str, columns: list, have: dict) 
     ctx.executemany(f"INSERT INTO {q(tmp)} ({names}) VALUES ({', '.join('?' for _ in range(len(SYSTEM_COLUMNS) + len(every)))})", out)
     if ctx.query(f"SELECT COUNT(*) AS n FROM {q(tmp)}")[0]["n"] != len(rows):
         raise MigrationError(f"Retyping {name} lost rows; nothing was changed")
-    ctx.execute(f"DROP TABLE {q(name)}")
-    ctx.execute(f"ALTER TABLE {q(tmp)} RENAME TO {q(name)}")
-    ctx.execute(f"CREATE INDEX IF NOT EXISTS {q('idx_' + name + '_tenant')} ON {q(name)}(tenant_id, status)")
-    ctx.execute(f"CREATE INDEX IF NOT EXISTS {q('idx_' + name + '_tenant_entity')} ON {q(name)}(tenant_id, entity_id)")
+    ctx.execute(ctx.dialect.drop_table(q(name)))
+    ctx.execute(ctx.dialect.rename_table(q(tmp), q(name)))
+    ctx.execute(ctx.dialect.create_index_if_not_exists(q('idx_' + name + '_tenant'), q(name), "tenant_id, status"))
+    ctx.execute(ctx.dialect.create_index_if_not_exists(q('idx_' + name + '_tenant_entity'), q(name), "tenant_id, entity_id"))
 
 
 def ensure_table(ctx: MigrationContext, domain: str, fields) -> list:
@@ -129,14 +117,14 @@ def ensure_table(ctx: MigrationContext, domain: str, fields) -> list:
         return [f for f, _ in columns]
     have = ctx.column_types(name)
     added = [f for f, _ in columns if f not in have]
-    if any(f in have and canonical_type(ctx.backend, have[f]) != t for f, t in columns):
+    if any(f in have and ctx.dialect.canonical_type(have[f]) != t for f, t in columns):
         retype_table(ctx, domain, columns, have)
         return added
     if "quality_issues" not in have:
-        ctx.execute(f"ALTER TABLE {q(name)} ADD COLUMN quality_issues {_issues_sql(ctx.backend)}")
+        ctx.execute(ctx.dialect.add_column(q(name), "quality_issues", ctx.dialect.json_type))
     for f, t in columns:
         if f not in have:
-            ctx.execute(f"ALTER TABLE {q(name)} ADD COLUMN {q(f)} {SQL_TYPES[ctx.backend][t]}")
+            ctx.execute(ctx.dialect.add_column(q(name), q(f), ctx.dialect.column_type(t)))
     return added
 
 
@@ -164,8 +152,8 @@ def schema_gaps(backend, domain: str, fields):
                 return None
             have = ctx.column_types(name)
             return {"missing": [f for f, _ in columns if f not in have],
-                    "retype": [(f, canonical_type(backend.name, have[f]), t) for f, t in columns
-                               if f in have and canonical_type(backend.name, have[f]) != t],
+                    "retype": [(f, get_dialect(backend.name).canonical_type(have[f]), t) for f, t in columns
+                               if f in have and get_dialect(backend.name).canonical_type(have[f]) != t],
                     "system": "quality_issues" not in have}
         finally:
             backend.finish_read(conn)

@@ -79,6 +79,9 @@ class DomainConfig:
     blocking_unless: list = field(default_factory=list)
     # Fields compared as DATES (agree / nearly agree / disagree) rather than by string similarity or exactly.
     mismatch_date: list = field(default_factory=list)
+    # Per field: the similarity BELOW which two values DISAGREE (and a mismatch penalty applies). Default 0.6, and 0.8 for a given name (app/matching.py): the
+    # band between this and 0.85 is 'partial', which carries no penalty, so a low value lets unrelated names through.
+    disagree_below: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
 
     def keyspecs(self) -> list:

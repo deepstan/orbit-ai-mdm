@@ -237,7 +237,7 @@ class TestRealtimeAndBatchDiffer(Base):
         self.assertEqual(batch_calls, 1)  # six records, one entity, one rebuild
 
     def test_the_golden_records_are_identical_either_way(self):
-        seq = self.chain(5) + [("crm", "X1", {"first_name": "Bo", "last_name": "Chen", "email": "bo@y.com"}),
+        seq = self.chain(5) + [("crm", "X1", {"first_name": "Bobby", "last_name": "Chen", "email": "bo@y.com"}),   # Bobby and Bob are both 'robert' once standardized; "Bo" was only merged by the old no-penalty band
                                ("erp", "X2", {"first_name": "Bob", "last_name": "Chen", "email": "bo@y.com", "city": "Reno"}),
                                ("crm", "X3", {"first_name": "Cy", "last_name": "Wu", "phone": "212-555-0000"})]
         other = Store(os.path.join(self.tmp, "b.db"))
