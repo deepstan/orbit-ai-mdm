@@ -212,6 +212,75 @@ def section_pages(base: str, steward: str) -> None:
         check("a cursor for the queue is refused by the entity list: 400", got == 400, str(got))
 
 
+def section_steward_agent(base: str, admin: str, steward: str) -> None:
+    """An AI agent's key: it reads what a steward reads (the review queue, the group-aware evidence, a record's history, the audit sample), may RECORD a recommendation about a review
+    item (which changes nothing about the item), and can change nothing else."""
+    print("\n7b. A steward agent: reads like a steward, changes nothing; the evidence endpoints")
+    ann = {"first_name": "Agent", "last_name": "Checker", "email": "agent.checker@example.com", "phone": "404-555-0142", "address_line1": "1 Probe Way", "city": "Atlanta", "state": "GA", "postal_code": "30301"}
+    maybe = {**ann, "email": "other.checker@example.com", "phone": "", "last_name": "Checkerr"}
+    for sid, attrs in (("agent-a1", ann), ("agent-a2", ann), ("agent-b", maybe)):
+        status_of("POST", f"{base}/v1/customer/records", {"source_system": "validate", "source_record_id": sid, "attributes": attrs}, steward)
+    agent = make_key(base, admin, "steward_agent", "Agent-1")
+    check("an administrator can issue a key with the role steward_agent", bool(agent))
+    if not agent:
+        return
+    s, queue, _ = call("GET", f"{base}/v1/customer/review-queue?limit=200", key=agent)
+    check("the agent reads the review queue", s == 200 and isinstance(queue.get("items"), list), f"{s}")
+    mine = next((i for i in (queue.get("items") or []) if (i.get("record_a") or {}).get("attributes", {}).get("last_name") == "Checkerr"
+                 or (i.get("record_b") or {}).get("attributes", {}).get("last_name") == "Checkerr"), None)
+    check("... and finds the review item this check created", mine is not None, "no item for the probe record: the matcher did not queue it")
+    if mine:
+        s, ev, _ = call("GET", f"{base}/v1/customer/review-queue/{mine['candidate_id']}/evidence", key=agent)
+        check("the evidence endpoint answers the agent", s == 200 and {"candidate", "record_a", "record_b", "group_a", "group_b", "separations", "history"} <= set(ev), f"{s} {list(ev)[:8] if isinstance(ev, dict) else ev}")
+        sizes = [(ev.get(k) or {}).get("member_count") for k in ("group_a", "group_b")] if isinstance(ev, dict) else []
+        check("... it is GROUP-aware: one of the groups holds the two probe records", s == 200 and 2 in sizes, f"group sizes {sizes}")
+        rec_id = (ev.get("record_a") or {}).get("id")
+        s, hist, _ = call("GET", f"{base}/v1/customer/records/{rec_id}/history", key=agent)
+        check("a record's history answers the agent", s == 200 and "record" in hist and "history" in hist, f"{s}")
+        check("the evidence of a candidate that does not exist is 404", status_of("GET", f"{base}/v1/customer/review-queue/cand_nope/evidence", key=agent) == 404)
+        check("the history of a record that does not exist is 404", status_of("GET", f"{base}/v1/customer/records/rec_nope/history", key=agent) == 404)
+        check("the evidence needs a key: 401", status_of("GET", f"{base}/v1/customer/review-queue/{mine['candidate_id']}/evidence") == 401)
+    check("the agent reads the audit sample", status_of("GET", f"{base}/v1/customer/audits", key=agent) == 200)
+    reader = make_key(base, admin, "api_consumer", "Reader-2")
+    check("a plain read-only key still may NOT read the audit sample: 403", status_of("GET", f"{base}/v1/customer/audits", key=reader) == 403)
+    waiting = call("GET", f"{base}/v1/customer/review-queue?limit=1", key=agent)[1].get("total")
+    if mine:
+        url = f"{base}/v1/customer/review-queue/{mine['candidate_id']}/recommendations"
+        proposal = {"recommendation": "confirm", "confidence": 0.9, "reasons": ["validate_api probe"], "evidence": ["group_b.members"], "model": "validate", "prompt_version": "v1"}
+        s, rec, _ = call("POST", url, proposal, agent)
+        check("the agent records a recommendation, under its key's name", s == 200 and rec.get("agent") == "agent:Agent-1" and rec.get("outcome") is None, f"{s} {rec}")
+        check("... which changes nothing: the same number of items are waiting and this one is still among them",
+              call("GET", f"{base}/v1/customer/review-queue?limit=200", key=agent)[1].get("total") == waiting, f"{waiting}")
+        s, listed, _ = call("GET", url, key=steward)
+        check("... and a steward reads it next to the item", s == 200 and [r.get("recommendation") for r in listed.get("items", [])] == ["confirm"], f"{s}")
+        check("a steward may NOT record one: 403", status_of("POST", url, proposal, steward) == 403)
+        check("a plain read-only key may NOT record one: 403", status_of("POST", url, proposal, reader) == 403)
+        check("a confidence of 7 is refused (400 or 422), nothing stored", status_of("POST", url, {**proposal, "confidence": 7, "model": "other"}, agent) in (400, 422))
+        check("a recommendation about an item that does not exist is 404", status_of("POST", f"{base}/v1/customer/review-queue/cand_nope/recommendations", proposal, agent) == 404)
+        s, stats, _ = call("GET", f"{base}/v1/customer/recommendations/stats", key=agent)
+        check("the agreement statistics are readable", s == 200 and "agreement_rate" in stats and stats.get("total", 0) >= 1, f"{s}")
+        s, page, _ = call("GET", f"{base}/v1/customer/recommendations?outcome=open&limit=5", key=agent)
+        check("the list of recommendations is a page: items, next_cursor, limit", s == 200 and {"items", "next_cursor", "limit"} <= set(page), f"{s}")
+    refused = {
+        "resolve a review item": ("POST", "/v1/customer/review-queue/cand_x/resolve", {"decision": "confirm"}),
+        "give an audit verdict": ("POST", "/v1/customer/audits/cand_x/verdict", {"verdict": "wrong"}),
+        "unmerge": ("POST", "/v1/customer/merges/cand_x/unmerge", {}),
+        "ingest a record": ("POST", "/v1/customer/records", {"source_system": "validate", "source_record_id": "agent-z", "attributes": ann}),
+        "ingest a batch": ("POST", "/v1/customer/records/batch", {"records": [{"source_system": "validate", "source_record_id": "agent-y", "attributes": ann}]}),
+        "delete an entity": ("DELETE", "/v1/customer/entities/ent_x", None),
+        "re-check the scorer": ("POST", "/v1/customer/scorer/check", {}),
+        "reset the scorer": ("POST", "/v1/customer/scorer/reset", {}),
+        "create an API key": ("POST", "/v1/admin/api-keys", {"role": "tenant_admin", "label": "sneaky"}),
+        "list API keys": ("GET", "/v1/admin/api-keys", None),
+        "read the audit log": ("GET", "/v1/admin/audit-log", None),
+        "read usage": ("GET", "/v1/admin/usage", None),
+    }
+    for label, (method, path, body) in refused.items():
+        check(f"the agent may not {label}: 403, not 500", status_of(method, f"{base}{path}", body, agent) == 403)
+    still = call("GET", f"{base}/v1/customer/review-queue?limit=1", key=agent)[1].get("total")
+    check("after all those attempts the same number of review items are waiting", waiting == still, f"{waiting} -> {still}")
+
+
 def section_limits(base: str, steward: str, body_limit: bool) -> None:
     print("\n7. Limits")
     batch = {"records": [{"source_system": "validate", "source_record_id": f"b{i}", "attributes": {"a": 1}} for i in range(10_001)]}
@@ -249,6 +318,7 @@ def full_run(base: str, admin: str, body_limit: bool) -> None:
     section_signing(base, admin, keys["steward"])
     section_audits_and_unmerge(base, admin, keys["steward"])
     section_pages(base, keys["steward"])
+    section_steward_agent(base, admin, keys["steward"])
     section_limits(base, keys["steward"], body_limit)
 
 

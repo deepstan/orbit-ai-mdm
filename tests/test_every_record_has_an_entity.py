@@ -16,6 +16,8 @@ import unittest
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+from legacy_engine import legacy_engine  # noqa: E402
 
 from app import benchmark, domain_config, offline
 from app.db import Store
@@ -110,6 +112,7 @@ class TestNobodyIsLeftWithoutAnEntity(Base):
         self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestReferenceMatcher(Base):
     RECORDS = [
         {"first_name": "Ann", "last_name": "Lee", "email": "a@x.com", "postal_code": "94107"},                      # 0
@@ -222,11 +225,19 @@ class TestProcessPendingSaysWhenThereIsMore(Base):
 
 
 class TestCli(Base):
-    def test_equivalence_command_passes(self):
-        r = subprocess.run([sys.executable, os.path.join(ROOT, "benchmark.py"), "equivalence", "--profile", "customer", "--scale", "1", "--orders", "2"],
-                           capture_output=True, text=True, cwd=ROOT)
+    def run_equivalence(self, **env):
+        return subprocess.run([sys.executable, os.path.join(ROOT, "benchmark.py"), "equivalence", "--profile", "customer", "--scale", "1", "--orders", "2"],
+                              capture_output=True, text=True, cwd=ROOT, env={**os.environ, **env})
+
+    def test_equivalence_command_passes_for_the_legacy_engines(self):
+        r = self.run_equivalence(MDM_ENGINE="legacy")          # the command compares the LEGACY pairwise engines with the pairwise reference
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PASS", r.stdout)
+
+    def test_on_the_kernel_the_command_refuses_and_says_which_engine_to_ask_for(self):
+        r = self.run_equivalence(MDM_ENGINE="kernel")          # the kernel is order-sensitive by design: it must not pretend to be checked against a pairwise reference
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("MDM_ENGINE=legacy", r.stderr)
 
 
 if __name__ == "__main__":

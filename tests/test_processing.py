@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import fake_web  # noqa: E402
 
-from app import domain_config, pipeline
+from app import domain_config, kernel, pipeline
 from app.db import Store
 from app.migrations import SQLiteMigrationBackend, run_migrations
 from app.migrations.versions import MIGRATIONS
@@ -52,15 +52,22 @@ class Base(unittest.TestCase):
     def state(self, rid="C1"):
         return self.sql("SELECT processing_status, processing_attempts, processing_error FROM source_records WHERE source_record_id = ?", (rid,))[0]
 
+    @staticmethod
+    def lookup_name():
+        """The store query that finds a record's candidates: the crash point of these tests. The kernel asks for the matches grouped by key (blocking_members); the legacy
+        pairwise step asks for the record ids (find_candidate_record_ids). Either way it is ONE lookup per record, made right before that record's matching."""
+        return "blocking_members" if kernel.engine() == "kernel" else "find_candidate_record_ids"
+
     def crash_on_nth_lookup(self, n):
-        real, calls = Store.find_candidate_record_ids, {"n": 0}
+        name = self.lookup_name()
+        real, calls = getattr(Store, name), {"n": 0}
 
         def flaky(store, *a, **k):
             calls["n"] += 1
             if calls["n"] == n:
                 raise RuntimeError("simulated crash")
             return real(store, *a, **k)
-        return mock.patch.object(Store, "find_candidate_record_ids", flaky)
+        return mock.patch.object(Store, name, flaky)
 
     def crash_when_marking_matched_once(self):
         real, fired = Store.set_processing_status, {"done": False}
@@ -79,7 +86,7 @@ class TestEveryRecordKnowsHowFarItGot(Base):
             with self.assertRaises(RuntimeError):
                 self.ingest("C1", ANN)  # realtime: the error reaches the caller
         status, attempts, error = self.state()
-        self.assertEqual((status, attempts), ("staged", 1))
+        self.assertEqual((status, attempts), ("landed", 1))      # what the failed record had written (its staging) is undone with it; it stays unfinished, with the attempt and the error recorded
         self.assertIn("simulated crash", error)
 
     def test_sending_it_again_resumes_it_instead_of_calling_it_a_duplicate(self):
@@ -94,18 +101,20 @@ class TestEveryRecordKnowsHowFarItGot(Base):
         self.assertEqual(self.sql("SELECT COUNT(*) FROM entity_customer")[0][0], 1)
         self.assertTrue(self.ingest("C1", ANN)["unchanged"])  # and NOW it is a finished duplicate
 
-    def test_a_crash_after_the_merge_but_before_the_record_was_marked_done_duplicates_nothing(self):
+    def test_a_crash_after_the_merge_but_before_the_record_was_marked_done_leaves_nothing_half_done_and_resumes_once(self):
+        """A record's matching is ATOMIC: the merge and everything else it wrote are undone with it, so the crash leaves no pair without its merge."""
         a = self.ingest("A", ANN)
         with self.crash_when_marking_matched_once():
             self.assertRaises(RuntimeError, self.ingest, "B", {**ANN, "city": "Reno"}, "erp")
-        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)  # the merge happened
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 0)          # the merge was undone WITH the record's other writes
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM entity_customer WHERE status = 'active'")[0][0], 1)
         again = self.ingest("B", {**ANN, "city": "Reno"}, "erp")
         self.assertTrue(again["resumed"])
-        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)   # not decided twice
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)           # decided once
         self.assertEqual(self.sql("SELECT COUNT(*) FROM entity_customer WHERE status = 'active'")[0][0], 1)
         self.assertEqual(again["matched_entity_id"], a["matched_entity_id"])
 
-    def test_a_crash_after_the_candidate_was_saved_but_before_the_merge_is_finished_on_resume(self):
+    def test_a_crash_between_saving_the_pair_and_merging_undoes_the_pair_too(self):
         a = self.ingest("A", ANN)
         real, fired = pipeline.merge_two_records, {"done": False}
 
@@ -116,10 +125,22 @@ class TestEveryRecordKnowsHowFarItGot(Base):
             return real(*args, **kwargs)
         with mock.patch.object(pipeline, "merge_two_records", flaky):
             self.assertRaises(RuntimeError, self.ingest, "B", {**ANN, "city": "Reno"}, "erp")
-        self.assertEqual(self.sql("SELECT status FROM match_candidates")[0][0], "confirmed")  # decided, but the merge never ran
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 0)           # no pair saved without its merge
         again = self.ingest("B", {**ANN, "city": "Reno"}, "erp")
-        self.assertEqual(again["matched_entity_id"], a["matched_entity_id"])                   # now it has
+        self.assertEqual(again["matched_entity_id"], a["matched_entity_id"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)
+
+    def test_a_pair_saved_as_confirmed_without_its_merge_is_still_finished_on_resume(self):
+        """Atomic matching makes this state rare, but a hard kill of an older version, or a bulk load, can still leave it, and resume must finish it, not decide it twice."""
+        from app.models import MatchCandidate
+        a = self.ingest("A", ANN)
+        b = ingest_record(self.store, "acme", "customer", "erp", "B", {**ANN, "city": "Reno"}, mode="batch")        # landed and staged, not matched
+        self.store.save_candidate(MatchCandidate(record_a_id=b["record_id"], record_b_id=a["record_id"], tenant_id="acme", domain="customer", score=0.97, match_type="deterministic",
+                                                 status="confirmed", decided_by="system:auto_merge"))
+        process_pending(self.store, "customer")
+        self.assertEqual(self.sql("SELECT COUNT(DISTINCT entity_id) FROM source_records WHERE entity_id IS NOT NULL")[0][0], 1)     # merged
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM match_candidates")[0][0], 1)                                               # not decided twice
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM entity_customer WHERE status = 'active'")[0][0], 1)
 
     def test_a_review_item_is_not_queued_twice_by_a_resume(self):
         home = {"first_name": "Jon", "address_line1": "12 Oak St", "city": "Austin", "postal_code": "73301"}
@@ -147,7 +168,7 @@ class TestEveryRecordKnowsHowFarItGot(Base):
     def test_a_record_that_keeps_failing_is_left_alone_after_max_attempts_and_shown(self):
         with self.crash_on_nth_lookup(1):
             self.assertRaises(RuntimeError, self.ingest, "C1", ANN)
-        always = mock.patch.object(Store, "find_candidate_record_ids", side_effect=RuntimeError("still broken"))
+        always = mock.patch.object(Store, self.lookup_name(), side_effect=RuntimeError("still broken"))
         with always:
             for _ in range(3):
                 process_pending(self.store, "customer", max_attempts=3)
@@ -174,7 +195,7 @@ class TestBatchRuns(Base):
         with self.crash_on_nth_lookup(3):
             run_batch(self.store, "acme", "customer", self.items())
         again = run_batch(self.store, "acme", "customer", self.items())
-        self.assertEqual({k: v for k, v in again.run["counts"].items() if v}, {"received": 4, "unchanged": 3, "resumed": 1, "standalone": 1, "golden_rebuilt": 1})
+        self.assertEqual({k: v for k, v in again.run["counts"].items() if v}, {"received": 4, "unchanged": 3, "resumed": 1, "standalone": 1})    # (a new one-record entity is written complete: nothing to rebuild at the end)
         self.assertEqual((self.sql("SELECT COUNT(*) FROM source_records")[0][0], self.sql("SELECT COUNT(*) FROM entity_customer")[0][0]), (4, 4))
         self.assertEqual(self.store.count_unfinished("customer"), (0, 0))
 
@@ -233,7 +254,7 @@ class TestRealtimeAndBatchDiffer(Base):
         with mock.patch.object(pipeline, "rebuild_golden_record", wraps=real) as spy:
             ingest_batch(other, "acme", "customer", self.chain())
             batch_calls = spy.call_count
-        self.assertGreaterEqual(realtime_calls, 6)
+        self.assertGreaterEqual(realtime_calls, 5)  # the first record creates the entity COMPLETE (no rebuild); each of the five merges after it is published at once
         self.assertEqual(batch_calls, 1)  # six records, one entity, one rebuild
 
     def test_the_golden_records_are_identical_either_way(self):
@@ -253,10 +274,10 @@ class TestRealtimeAndBatchDiffer(Base):
         with mock.patch.object(pipeline, "flush_golden", return_value=0):  # as if the process died before the end of the run
             run_batch(self.store, "acme", "customer", self.chain(3))
         self.assertEqual(self.sql("SELECT COUNT(*) FROM golden_dirty")[0][0], 1)
-        self.assertIsNone(self.sql("SELECT first_name FROM entity_customer")[0][0])  # the golden record is stale: nothing was published
+        self.assertEqual(self.sql("SELECT first_name, city FROM entity_customer")[0], ("Ann", "City0"))   # the entity was created COMPLETE from its first record, and is STALE: the merges after it are not in it yet
         out = process_pending(self.store, "customer")
         self.assertEqual((out["golden_rebuilt"], self.sql("SELECT COUNT(*) FROM golden_dirty")[0][0]), (1, 0))
-        self.assertEqual(self.sql("SELECT first_name FROM entity_customer")[0][0], "Ann")
+        self.assertEqual(self.sql("SELECT first_name, city FROM entity_customer")[0], ("Ann", "City2"))   # rebuilt from all three: the most recent city
 
     def test_a_crash_between_progress_flushes_is_repaired_by_process_pending_without_duplicating_anything(self):
         """Progress is written in groups. If the process dies before a group is saved, those records are still `staged` although they

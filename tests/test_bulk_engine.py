@@ -15,6 +15,8 @@ import unittest
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+from legacy_engine import legacy_engine  # noqa: E402
 
 from app import active_learning, benchmark, benchmark_person as bp, domain_config, offline
 from app.bulk import BulkLoadError, BulkPaused, _find, _input_chunks, bulk_load
@@ -99,6 +101,7 @@ class Base(unittest.TestCase):
             path, "SELECT record_a_id, record_b_id, status, score FROM match_candidates")}
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestSameStateAsTheRegularEngine(Base):
     def test_golden_records_staging_the_index_and_candidates_are_identical(self):
         rows = self.rows()
@@ -390,7 +393,7 @@ class TestResumeAndDryRun(Base):
         csv_path, db, work = os.path.join(self.tmp, "in.csv"), os.path.join(self.tmp, "cli.db"), os.path.join(self.tmp, "cliwork")
         with open(csv_path, "w") as f:
             f.write("id,first,last,email\n" + "".join(f"{i},P{i},Q{i % 5},p{i % 40}@x.com\n" for i in range(60)))
-        base = ("--tenant", TENANT, "--domain", "customer", "--file", csv_path, "--db", db, "--id-column", "id", "--mapping", "first_name=first,last_name=last,email=email", "--bulk")
+        base = ("--tenant", TENANT, "--domain", "customer", "--file", csv_path, "--db", db, "--id-column", "id", "--mapping", "first_name=first,last_name=last,email=email", "--legacy-bulk")
         run = lambda *a: subprocess.run([sys.executable, os.path.join(ROOT, "bulk_ingest.py"), *base, *a], capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(run("--dry-run").returncode, 2)                          # no workdir given
         dry = run("--dry-run", "--workdir", work)
@@ -457,6 +460,7 @@ class TestTrial(Base):
         self.assertEqual(bp.bulk_trial(1500, d, log=lambda m: None)["records"], 1500)            # the same parameters simply find the work finished
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestEnginesTrial(Base):
     def test_the_two_engines_leave_identical_results_and_both_are_scored_against_the_truth(self):
         d = tempfile.mkdtemp()
@@ -526,11 +530,11 @@ class TestCommand(Base):
         with open(csv_path, "w") as f:
             f.write("id,first,last,email\n1,Ann,Lee,a@x.com\n2,Ann,Lee,a@x.com\n3,Cy,Wu,c@z.com\n4,Di,Fox,d@y.com\n")
         args = ("--tenant", TENANT, "--domain", "customer", "--file", csv_path, "--db", db, "--id-column", "id", "--mapping", "first_name=first,last_name=last,email=email")
-        r = self.run_cli(*args, "--bulk", "--workers", "2")
+        r = self.run_cli(*args, "--legacy-bulk", "--workers", "2")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("4 records -> 3 entities", r.stdout)
         self.assertEqual(self.q(db, "SELECT COUNT(*) AS n FROM entity_customer WHERE status = 'active'")[0]["n"], 3)
-        again = self.run_cli(*args, "--bulk")
+        again = self.run_cli(*args, "--legacy-bulk")
         self.assertEqual(again.returncode, 2)
         self.assertIn("already has", again.stderr)
 

@@ -15,6 +15,7 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
+from legacy_engine import legacy_engine  # noqa: E402
 
 from test_bulk_engine import ROOT, TENANT, Base  # noqa: E402
 from app.bulk import BulkLoadError, bulk_load  # noqa: E402
@@ -77,6 +78,7 @@ class Onb(Base):
         return out
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestMatchesTheRegularEngine(Onb):
     def test_customers_onto_a_bulk_loaded_base(self):
         store, path, oracle, result, cut = self.both(self.rows())
@@ -231,6 +233,7 @@ class TestExistingEntitiesMerge(Onb):
         self.assertEqual(self.snapshot(path), before)
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestManyBridges(Onb):
     """The generated datasets never make a new record link two existing entities, so this one is built to: many people whose existing records
     are separate (one knows only an email, another only a phone) and whose new record knows both. Compared with the regular engine record by record."""
@@ -432,7 +435,7 @@ class TestCommandLine(Onb):
             with open(os.path.join(self.tmp, name), "w") as f:
                 f.write("id,first,last,email\n" + "".join(",".join(r) + "\n" for r in rows))
         run = lambda name, *a: subprocess.run([sys.executable, os.path.join(ROOT, "bulk_ingest.py"), "--tenant", TENANT, "--domain", "customer", "--file", os.path.join(self.tmp, name),
-                                                "--db", db, "--id-column", "id", "--source-system", name, "--mapping", "first_name=first,last_name=last,email=email", "--bulk", *a],
+                                                "--db", db, "--id-column", "id", "--source-system", name, "--mapping", "first_name=first,last_name=last,email=email", "--legacy-bulk", *a],
                                                capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(run("one.csv").returncode, 0)
         refused = run("two.csv")

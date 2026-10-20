@@ -107,7 +107,7 @@ class TestFreshDatabase(unittest.TestCase):
         # `entities` (one table, JSON attributes) was replaced by entity_<domain> tables (migration 009)
         self.assertEqual(set(migrated_schema) - set(legacy_schema), {"blocking_index_state", "standardized_records",
                                                                       "entity_customer", "entity_product", "entity_vendor",
-                                                                      "source_record_history", "pipeline_runs", "golden_dirty", "merge_audits"})
+                                                                      "source_record_history", "pipeline_runs", "golden_dirty", "merge_audits", "agent_recommendations"})
         self.assertNotIn("entities", migrated_schema)
         for table, (cols, idx) in {t: v for t, v in legacy_schema.items() if t != "entities"}.items():
             m_cols, m_idx = migrated_schema[table]
@@ -305,6 +305,10 @@ class TestSafetyRails(unittest.TestCase):
                  "dd386f4b70c95f4a636a09111e8631199385e6f48e723e0ae55d16fcbed641eb"),
             16: ("4a6119737568721f6832eebfd2f844a91013dcd5d3b5e0d78fcc54a56337be8c",
                  "4a6119737568721f6832eebfd2f844a91013dcd5d3b5e0d78fcc54a56337be8c"),
+            17: ("07356567c8259700f9aacee28a157334ec5cb432ff795f364236cc4e8688283f",
+                 "67f358e222366c4868f3c1ee8ac036d1f0f0a98a6b36d394d266d55c7feb4506"),
+            18: ("e2a6df7aec61951bbd83b14300070c3db31610e3dd3272e9880fbdca39ec1f27",
+                 "e2a6df7aec61951bbd83b14300070c3db31610e3dd3272e9880fbdca39ec1f27"),
         }
         self.assertEqual(set(pinned), {m.version for m in MIGRATIONS},
                          "A migration was added or removed: pin the new one's checksums here.")

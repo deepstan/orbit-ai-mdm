@@ -69,6 +69,7 @@ TENANT_SCOPED_TABLES = [
     "blocking_keys",
     "source_record_history",
     "merge_audits",
+    "agent_recommendations",
     "pipeline_runs",
     "golden_dirty",
     "standardized_records",

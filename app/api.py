@@ -41,6 +41,9 @@ from .models import DEFAULT_TENANT
 from .pipeline import ingest_record, resolve_candidate, run_batch, MODES
 from .domain_config import load_configured_domains
 from .indexing import IndexStaleError
+from . import evidence, recommendations
+from .auth import ROLES
+from .models import Recommendation
 from .store_factory import get_store
 
 app = FastAPI(
@@ -177,6 +180,8 @@ class BatchIngestRequest(BaseModel):
 
 class ResolveCandidateRequest(BaseModel):
     decision: str = Field(..., pattern="^(confirm|reject)$")
+    suggestion_viewed: Optional[bool] = Field(default=None, description="True if the person had opened an assistant's suggestion for this item before deciding; False if one was there and they did not look; omit if unknown. "
+                                                                         "Recorded so that agreement between an assistant and people can be measured on the decisions it did not influence.")
     decided_by: Optional[str] = Field(default=None, description="IGNORED. The decision is recorded under the authenticated key's name; this is kept only so older clients still work.")
 
 
@@ -184,6 +189,15 @@ class AuditVerdictRequest(BaseModel):
     verdict: str = Field(..., pattern="^(correct|wrong)$")
     unmerge: bool = False      # a 'wrong' verdict may also split the entity on the spot
     reason: Optional[str] = None
+
+
+class ProposeDecisionRequest(BaseModel):
+    recommendation: str = Field(..., pattern="^(confirm|reject|needs_human)$")
+    confidence: float = Field(..., ge=0, le=1, description="How sure the agent is, 0 to 1. It is later compared with how often the agent agrees with the person who decides.")
+    reasons: list[str] = Field(default_factory=list, max_length=10, description="Why, in short plain sentences (each at most 300 characters).")
+    evidence: list[str] = Field(default_factory=list, max_length=20, description="Which parts of the evidence it relied on, by name (for example 'group_b.members'); not copies of the data.")
+    model: str = Field(default="", max_length=80)
+    prompt_version: str = Field(default="", max_length=40)
 
 
 class UnmergeRequest(BaseModel):
@@ -368,16 +382,103 @@ def review_queue(domain: str, limit: int = 50, cursor: Optional[str] = None, pri
             "total": store.count_pending(principal.tenant_id, domain)}
 
 
+@app.get("/v1/{domain}/review-queue/{candidate_id}/evidence", tags=["stewardship"])
+def review_evidence(domain: str, candidate_id: str, principal: Principal = Depends(get_principal)):
+    """Everything needed to decide one review item, GROUP-aware: both records, both groups (members, golden record, size), whether a person ever separated these records or their
+    entities, the history of what each record used to say, and the record's other pairs. Read-only; protected fields are masked as in the review queue."""
+    _validate_domain(domain)
+    check_permission(principal, "view", domain=domain)
+    result = evidence.build_pair_evidence(store, principal.tenant_id, domain, candidate_id, mask=lambda attrs: protection.mask_attributes(domain, attrs))
+    if result is None:
+        raise HTTPException(404, "candidate not found")
+    return result
+
+
+@app.get("/v1/{domain}/records/{record_id}/history", tags=["stewardship"])
+def record_history(domain: str, record_id: str, principal: Principal = Depends(get_principal)):
+    """A record as it is now and every earlier version a change replaced (newest data first in `record`, oldest first in `history`). Read-only; protected fields are masked."""
+    _validate_domain(domain)
+    check_permission(principal, "view", domain=domain)
+    result = evidence.record_history(store, principal.tenant_id, domain, record_id, mask=lambda attrs: protection.mask_attributes(domain, attrs))
+    if result is None:
+        raise HTTPException(404, "record not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# What a stewardship AGENT recommends. A recommendation CHANGES NOTHING: it is recorded under the key's name, shown next to the review item, and compared with what a person later
+# decides. Resolving an item is still resolve_review_queue, which this permission does not include.
+# ---------------------------------------------------------------------------
+@app.post("/v1/{domain}/review-queue/{candidate_id}/recommendations", tags=["stewardship"])
+def propose_decision(domain: str, candidate_id: str, req: ProposeDecisionRequest, principal: Principal = Depends(get_principal)):
+    """Record what an agent recommends for a review item that is still waiting: confirm, reject or needs_human, with how sure it is and why. Changes nothing about the item.
+    Proposing again (same key, model and prompt version) replaces the earlier recommendation. The agent is the KEY's name, never a field of the request."""
+    _validate_domain(domain)
+    check_permission(principal, "propose_decision", domain=domain)
+    problems = recommendations.check_proposal(req.recommendation, req.confidence, req.reasons, req.evidence, req.model, req.prompt_version)
+    if problems:
+        raise HTTPException(400, "; ".join(problems))
+    candidate = store.get_candidate(candidate_id, principal.tenant_id, domain)
+    if candidate is None:
+        raise HTTPException(404, "candidate not found")
+    if candidate.status != "pending":
+        raise HTTPException(409, f"this item is already {candidate.status}: a recommendation can only be made about an item still waiting for a person")
+    stored = store.save_recommendation(Recommendation(candidate_id=candidate_id, recommendation=req.recommendation, confidence=float(req.confidence), reasons=req.reasons,
+                                                      evidence=req.evidence, agent=f"agent:{principal.label}", model=req.model, prompt_version=req.prompt_version,
+                                                      tenant_id=principal.tenant_id, domain=domain))
+    audit.log_action(store, principal.tenant_id, action="propose_decision", actor=principal.label, domain=domain,       # the reasons are not logged: they may quote the data
+                     details={"candidate_id": candidate_id, "recommendation": req.recommendation, "confidence": float(req.confidence), "agent": stored.agent, "model": req.model,
+                              "prompt_version": req.prompt_version})
+    return recommendations.as_dict(stored)
+
+
+@app.get("/v1/{domain}/review-queue/{candidate_id}/recommendations", tags=["stewardship"])
+def item_recommendations(domain: str, candidate_id: str, principal: Principal = Depends(get_principal)):
+    """What agents have recommended for one review item, newest first (and the outcome, once a person has decided it)."""
+    _validate_domain(domain)
+    check_permission(principal, "view", domain=domain)
+    if store.get_candidate(candidate_id, principal.tenant_id, domain) is None:
+        raise HTTPException(404, "candidate not found")
+    return {"candidate_id": candidate_id, "items": [recommendations.as_dict(r) for r in store.list_recommendations_for(principal.tenant_id, domain, candidate_id)]}
+
+
+@app.get("/v1/{domain}/recommendations", tags=["stewardship"])
+def list_recommendations(domain: str, outcome: Optional[str] = None, limit: int = 50, cursor: Optional[str] = None, principal: Principal = Depends(get_principal)):
+    """A page of recommendations, newest first: {"items", "next_cursor", "limit"}. `outcome`: open (nobody has decided the item yet), agreed, disagreed or human_decided."""
+    _validate_domain(domain)
+    check_permission(principal, "view", domain=domain)
+    if outcome is not None and outcome != "open" and outcome not in recommendations.OUTCOMES:
+        raise HTTPException(400, f"outcome must be open or one of {list(recommendations.OUTCOMES)}")
+    limit = paging.clamp_limit(limit, default=50, maximum=200)
+    try:
+        position = paging.decode(cursor, {"t": str, "i": str}) if cursor else None
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    page = store.recommendations_page(principal.tenant_id, domain, limit + 1, after=(position["t"], position["i"]) if position else None, outcome=outcome)
+    more, page = len(page) > limit, page[:limit]
+    return {"items": [recommendations.as_dict(r) for r in page], "next_cursor": paging.encode({"t": page[-1].created_at, "i": page[-1].id}) if more else None, "limit": limit}
+
+
+@app.get("/v1/{domain}/recommendations/stats", tags=["stewardship"])
+def recommendation_stats(domain: str, principal: Principal = Depends(get_principal)):
+    """How often the agents agreed with the people who decided, by what they recommended and by how sure they were: the evidence for how far an agent can be trusted."""
+    _validate_domain(domain)
+    check_permission(principal, "view", domain=domain)
+    return recommendations.summarize(store.recommendation_counts(principal.tenant_id, domain))
+
+
 @app.post("/v1/{domain}/review-queue/{candidate_id}/resolve", tags=["stewardship"])
 def resolve(domain: str, candidate_id: str, req: ResolveCandidateRequest,
             principal: Principal = Depends(get_principal)):
     _validate_domain(domain)
     check_permission(principal, "resolve_review_queue", domain=domain)
     try:
-        result = resolve_candidate(store, principal.tenant_id, domain, candidate_id, req.decision, human_actor(principal))   # the key's name, never the request's
+        result = resolve_candidate(store, principal.tenant_id, domain, candidate_id, req.decision, human_actor(principal), req.suggestion_viewed)   # the key's name, never the request's
     except ValueError as e:
         raise HTTPException(400, str(e))
     details = {"candidate_id": candidate_id, "decision": req.decision, "decided_by": human_actor(principal)}
+    if req.suggestion_viewed is not None:
+        details["suggestion_viewed"] = bool(req.suggestion_viewed)
     if req.decided_by and req.decided_by != details["decided_by"]:
         details["claimed_decided_by"] = req.decided_by   # kept for the record: what the client SAID, which was not used
     audit.log_action(store, principal.tenant_id, action="resolve_review_queue", actor=principal.label, domain=domain, details=details)
@@ -392,7 +493,7 @@ def resolve(domain: str, candidate_id: str, req: ResolveCandidateRequest,
 def audit_page(domain: str, limit: int = 50, principal: Principal = Depends(get_principal)):
     """A random sample of the system's automatic merges for a person to check (the model's promotions first), with how the checks have come out so far."""
     _validate_domain(domain)
-    check_permission(principal, "resolve_review_queue", domain=domain)
+    check_permission(principal, "view_audits", domain=domain)       # reading the sample; judging it (verdict, unmerge) still needs resolve_review_queue
     queue = stewardship.audit_queue(store, principal.tenant_id, domain, mask=lambda attrs: protection.mask_attributes(domain, attrs), limit=max(1, min(limit, 200)))
     return {"summary": stewardship.audit_summary(store, principal.tenant_id, domain), **queue}
 
@@ -463,7 +564,7 @@ def create_api_key(req: CreateApiKeyRequest, principal: Principal = Depends(get_
         label = valid_key_label(req.label)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    if req.role not in ("tenant_admin", "domain_admin", "data_steward", "api_consumer"):
+    if req.role not in ROLES:
         raise HTTPException(400, f"Unknown role '{req.role}'")
 
     from .auth import generate_api_key

@@ -31,7 +31,7 @@ from app import audit  # noqa: E402
 from app import learned_scorer as ls  # noqa: E402
 from app import monitor  # noqa: E402
 from app.bulk import bulk_load  # noqa: E402
-from app.models import Entity, MatchCandidate, now_iso  # noqa: E402
+from app.models import ApiKeyRecord, Entity, MatchCandidate, Recommendation, UsageEvent, now_iso  # noqa: E402
 from app.pipeline import ingest_record, merge_two_records  # noqa: E402
 from app.sql_dialect import get_dialect  # noqa: E402
 from app.stewardship import audit_queue, audit_summary, give_verdict  # noqa: E402
@@ -221,12 +221,13 @@ class Contract:
     # Another database may have no such feature, or a different one. So every read is asked for ANOTHER tenant's data using that tenant's REAL ids, and must come back empty.
     # The tenant-taking methods the isolation tests do NOT exercise. A visible list of debt: a new method must be probed or added here with a reason, and removing a name is progress.
     NOT_YET_PROBED = frozenset({
-        # reads that need data this test does not seed (audits, API keys, runs, usage, history)
-        "audit_counts", "audited_wrong", "pending_audits", "list_merge_audits", "list_api_keys", "list_usage_events", "list_runs", "iter_raw_attributes",
-        "separation_violations", "unfinished_in",
-        # writes that need set-up of their own (a run, an onboarding, a bulk token, an API key, an audit sample)
-        "apply_onboarding", "create_run", "flag_merge_audits", "record_merge_audit", "record_processing_failure", "revoke_api_key", "rollback_bulk", "sample_merge_audit", "save_blocking_keys",
+        # three, each needing a state this test cannot reach by the ordinary routes:
+        "separation_violations",        # reports records a person separated that are NOW in one entity: it returns something only if the engine's own guarantee has been broken
+        "apply_onboarding",             # applies a whole legacy-engine onboarding plan (reassignments, entities, lineage, history, updates): it needs a plan that engine produced
+        "rollback_bulk",                # deletes what ONE legacy bulk load (a token) wrote: it needs such a load to roll back
     })
+
+    CREATES_UNDER_THE_ACTING_TENANT = frozenset({"create_run", "save_blocking_keys"})      # these write the ACTING tenant's own rows by design (a run of its own, keys of its own)
 
     @staticmethod
     def empty(x):
@@ -250,6 +251,23 @@ class Contract:
         self.ingest("H", {**history, "city": "Macon"})                                      # a changed record keeps its earlier version in the record history
         audit.log_action(self.store, self.tenant, action="probe", actor="test", domain=DOMAIN, details={})
         unmerge_pair(self.store, self.tenant, DOMAIN, ab, "jane", "different people")
+        self.rec_candidate = self.pending[1].id                                              # an item with a recommendation waiting (the first pending one is used by a write probe)
+        self.store.save_recommendation(Recommendation(candidate_id=self.rec_candidate, recommendation="confirm", confidence=0.9, reasons=["probe"], agent="agent:probe", model="m", prompt_version="v",
+                                                      tenant_id=self.tenant, domain=DOMAIN))
+        # what the audit, key, usage, run and processing-state methods need to have something to return
+        tag = uuid.uuid4().hex[:8]
+        system_merge = lambda n: MatchCandidate(id=f"cand_aud_{tag}_{n}", record_a_id=ids["B"], record_b_id=ids["C"], tenant_id=self.tenant, domain=DOMAIN, score=0.95, match_type="deterministic",
+                                                status="confirmed", decided_by="system:rule", decided_at=now_iso())
+        self.audit_pending, self.audit_wrong, self.audit_unflagged = system_merge("pending"), system_merge("wrong"), system_merge("unflagged")
+        self.store.save_candidates_batch([self.audit_pending, self.audit_wrong, self.audit_unflagged])
+        self.store.flag_merge_audits(self.tenant, DOMAIN, [self.audit_pending.id, self.audit_wrong.id])        # two merges a person is asked to check, one of them judged wrong; a third nobody asked about
+        self.store.record_merge_audit(self.audit_wrong.id, self.tenant, DOMAIN, "wrong", "steward:probe")
+        key = ApiKeyRecord(tenant_id=self.tenant, role="data_steward", key_hash=f"hash_{tag}", label="probe")
+        self.store.save_api_key(key)
+        self.key_id = key.id
+        self.store.record_usage_event(UsageEvent(tenant_id=self.tenant, event_type="probe", domain=DOMAIN))
+        self.store.create_run(f"run_{tag}", self.tenant, DOMAIN, "batch", "probe", now_iso())
+        self.store.set_processing_status([h], self.tenant, DOMAIN, "staged")                                    # one record landed but not matched: unfinished work
         self.seeded = {"ids": ids, "ab": ab, "bc": bc, "h": h}
         return ids, ab, bc
 
@@ -298,6 +316,20 @@ class Contract:
             "get_matching_many": lambda t: s.get_matching_many(t, DOMAIN, rids),
             "count_auto_merges": lambda t: s.count_auto_merges(t, DOMAIN),
             "human_labeled_candidates": lambda t: s.human_labeled_candidates(t, DOMAIN),
+            "list_recommendations_for": lambda t: s.list_recommendations_for(t, DOMAIN, self.rec_candidate),
+            "recommendations_page": lambda t: (s.recommendations_page(t, DOMAIN, 50), s.recommendations_page(t, DOMAIN, 50, outcome="open")),
+            "recommendation_counts": lambda t: s.recommendation_counts(t, DOMAIN),
+            "iter_blocking_keys": lambda t: list(s.iter_blocking_keys(t, DOMAIN, 3)),
+            "count_blocking_keys": lambda t: s.count_blocking_keys(t, DOMAIN),
+            "audit_counts": lambda t: s.audit_counts(t, DOMAIN),
+            "audited_wrong": lambda t: s.audited_wrong(t, DOMAIN),
+            "pending_audits": lambda t: s.pending_audits(t, DOMAIN, 10),
+            "list_merge_audits": lambda t: (s.list_merge_audits(t, DOMAIN), s.list_merge_audits(t, DOMAIN, pending_only=True)),
+            "list_api_keys": lambda t: s.list_api_keys(t),
+            "list_usage_events": lambda t: s.list_usage_events(t),
+            "list_runs": lambda t: s.list_runs(DOMAIN, t),
+            "iter_raw_attributes": lambda t: [batch for batch in s.iter_raw_attributes(DOMAIN, t)],
+            "unfinished_in": lambda t: s.unfinished_in(t, DOMAIN),
         }
 
     def write_probes(self):
@@ -315,6 +347,15 @@ class Contract:
             "delete_record_history": lambda t: s.delete_record_history(self.seeded["h"], t, DOMAIN),
             "update_source_record": lambda t: s.update_source_record(rid, t, DOMAIN, {"first_name": "Intruder"}, "intruder-hash", 99),
             "set_processing_status": lambda t: s.set_processing_status([rid], t, DOMAIN, "failed", "intruder"),
+            "record_recommendation_outcomes": lambda t: s.record_recommendation_outcomes(t, DOMAIN, self.rec_candidate, "reject", "intruder", now_iso()),
+            "delete_recommendations": lambda t: s.delete_recommendations(t, DOMAIN, [self.rec_candidate]),
+            "create_run": lambda t: s.create_run(f"run_intruder_{uuid.uuid4().hex[:6]}", t, DOMAIN, "batch", "intruder", now_iso()),
+            "flag_merge_audits": lambda t: s.flag_merge_audits(t, DOMAIN, [self.audit_unflagged.id]),                  # must not flag the owner's merge
+            "record_merge_audit": lambda t: s.record_merge_audit(self.audit_pending.id, t, DOMAIN, "wrong", "steward:intruder"),     # must not judge the owner's flagged merge
+            "sample_merge_audit": lambda t: s.sample_merge_audit(t, DOMAIN, 1.0, seed=1),                             # sampling every automatic merge must not reach the owner's
+            "record_processing_failure": lambda t: s.record_processing_failure(self.seeded["h"], t, DOMAIN, "intruder"),
+            "revoke_api_key": lambda t: s.revoke_api_key(self.key_id, t, now_iso()),
+            "save_blocking_keys": lambda t: s.save_blocking_keys(t, DOMAIN, self.seeded["ids"]["A"], {"k:intruder"}),
         }
 
     def fingerprint(self, probes):
@@ -325,12 +366,18 @@ class Contract:
         reads = self.probes()
         writes = self.write_probes()
         before = self.fingerprint(reads)
+        other_before = {n: repr(read(other)) for n, read in reads.items()}
         for name, call in writes.items():
             try:
                 call(other)
             except Exception:                                                              # refusing is as good as ignoring: what matters is that nothing changed
                 pass
             self.assertEqual(self.fingerprint(reads), before, f"{name}, made under another tenant, changed this tenant's data")
+            now_other = {n: repr(read(other)) for n, read in reads.items()}
+            if name not in self.CREATES_UNDER_THE_ACTING_TENANT:             # and it must not leave junk behind UNDER the other tenant either: a row for this tenant's id, filed under another, can block this tenant's own later write
+                changed = sorted(n for n in now_other if now_other[n] != other_before[n])
+                self.assertEqual(changed, [], f"{name}, made under another tenant with this tenant's ids, left something behind under that other tenant")
+            other_before = now_other
         # the control: the same KIND of write by the OWNER does change what the fingerprint sees, so "unchanged" above means something
         writes["update_candidate_status"](self.tenant)
         self.assertNotEqual(self.fingerprint(reads), before, "the fingerprint cannot see a status change, so it proved nothing")
@@ -411,6 +458,171 @@ class Contract:
         rows = self.exec_sql(f"SELECT k FROM {table} ORDER BY k {d.limit_clause()}{d.claim_suffix()}", (3,))[0]       # a claiming read is valid SQL here
         self.assertEqual(len(rows), 3)
 
+
+    # ---------------------------------------------------------------- the unit of work: store.batch() and store.savepoint()
+    def test_a_batch_commits_at_the_end_and_a_failed_one_leaves_nothing(self):
+        mine = lambda: sorted(r.source_record_id for r in self.store.list_source_records(self.tenant, DOMAIN))
+        with self.store.batch(DOMAIN):
+            self.ingest("U1", A)
+            self.assertEqual(mine(), ["U1"])                                  # inside the batch it reads its own writes
+        self.assertEqual(mine(), ["U1"])
+        with self.assertRaises(RuntimeError):
+            with self.store.batch(DOMAIN):
+                self.ingest("U2", B)
+                raise RuntimeError("boom")
+        self.assertEqual(mine(), ["U1"])                                      # the failed batch left NOTHING, landing included
+
+    def test_a_savepoint_undoes_only_its_own_block_and_the_batch_carries_on(self):
+        with self.store.batch(DOMAIN):
+            self.ingest("V1", A)
+            with self.assertRaises(RuntimeError):
+                with self.store.savepoint():
+                    self.ingest("V2", B)
+                    raise RuntimeError("boom")
+            self.ingest("V3", C)
+        self.assertEqual(sorted(r.source_record_id for r in self.store.list_source_records(self.tenant, DOMAIN)), ["V1", "V3"])
+
+    def test_a_savepoint_outside_a_batch_does_nothing_and_batches_nest(self):
+        with self.store.savepoint():
+            self.assertFalse(self.store.in_batch())
+        with self.store.batch(DOMAIN):
+            with self.store.batch(DOMAIN):
+                self.assertTrue(self.store.in_batch())
+            self.assertTrue(self.store.in_batch())
+        self.assertFalse(self.store.in_batch())
+
+    def test_the_golden_table_check_cannot_run_inside_a_batch_and_says_how_to_fix_it(self):
+        fresh, tenant = self.make_store()                                      # a store object that has not checked the golden table yet
+        with self.assertRaises(RuntimeError) as caught:
+            with fresh.batch():
+                fresh.save_entity(Entity(attributes={}, status="active", tenant_id=tenant, domain=DOMAIN))
+        self.assertIn("store.batch(domain=", str(caught.exception))
+        with fresh.batch(DOMAIN):                                              # naming the domain checks the table BEFORE the transaction opens
+            fresh.save_entity(Entity(attributes={}, status="active", tenant_id=tenant, domain=DOMAIN))
+        self.assertEqual(len(fresh.list_entities(tenant, DOMAIN, "active")), 1)
+
+    def test_the_lookup_of_held_records_gives_the_latest_for_each_key_across_systems_and_chunks(self):
+        for i in range(30):
+            self.ingest(f"K{i}", {**A, "email": f"k{i}@x.com"}, system="crm")
+        self.ingest("K1", {**A, "email": "k1@other.com"}, system="erp")                    # the same id in ANOTHER system is another record
+        keys = [("crm", f"K{i}") for i in range(30)] + [("erp", "K1"), ("crm", "NOPE"), ("erp", "NOPE")]
+        held = self.store.find_source_records_by_keys(self.tenant, DOMAIN, keys)
+        self.assertEqual(len(held), 31)                                                      # missing keys are simply absent
+        self.assertEqual(held[("crm", "K1")].attributes["email"], "k1@x.com")
+        self.assertEqual(held[("erp", "K1")].attributes["email"], "k1@other.com")
+        many = self.store.find_source_records_by_keys(self.tenant, DOMAIN, [("crm", f"X{i}") for i in range(2500)] + [("crm", "K5")])    # more keys than one IN list may carry
+        self.assertEqual(list(many), [("crm", "K5")])
+        self.assertEqual(self.store.find_source_records_by_keys(self.tenant, DOMAIN, []), {})
+
+    def test_new_records_keys_can_be_added_without_a_delete_and_old_ones_still_replaced(self):
+        rec = self.ingest("F1", A)
+        rid = rec["record_id"]
+        keys = lambda: sorted(k for k in self.store.blocking_keys_of(self.tenant, DOMAIN, [rid]).get(rid, set()))
+        before = keys()
+        self.store.replace_blocking_keys_batch([(self.tenant, DOMAIN, rid, {"zz:one", "zz:two"})])               # replace: the old keys go
+        self.assertEqual(keys(), ["zz:one", "zz:two"])
+        self.store.replace_blocking_keys_batch([(self.tenant, DOMAIN, rid, {"zz:three"})], fresh=True)           # fresh: nothing is deleted, the new key is added
+        self.assertEqual(keys(), ["zz:one", "zz:three", "zz:two"])
+        self.assertTrue(before)
+
+
+    # ---------------------------------------------------------------- agent recommendations
+    def rec(self, candidate_id, recommendation="confirm", confidence=0.9, agent="agent:a", model="m", prompt_version="v1", tenant=None):
+        return Recommendation(candidate_id=candidate_id, recommendation=recommendation, confidence=confidence, reasons=["r1"], evidence=["group_b.members"], agent=agent, model=model,
+                              prompt_version=prompt_version, tenant_id=tenant or self.tenant, domain=DOMAIN)
+
+    def test_a_recommendation_is_stored_replaced_by_the_same_agent_and_kept_apart_from_another(self):
+        cid = self.pending_candidates(1)[0].id
+        first = self.store.save_recommendation(self.rec(cid, "confirm", 0.9))
+        again = self.store.save_recommendation(self.rec(cid, "reject", 0.6))                       # the same agent, model and prompt version: replaced
+        self.store.save_recommendation(self.rec(cid, "needs_human", 0.3, prompt_version="v2"))      # another prompt version: a second opinion
+        self.store.save_recommendation(self.rec(cid, "confirm", 0.8, agent="agent:b"))              # another agent
+        self.assertEqual((again.id, again.recommendation, again.confidence), (first.id, "reject", 0.6))
+        got = self.store.list_recommendations_for(self.tenant, DOMAIN, cid)
+        self.assertEqual(sorted((r.agent, r.prompt_version, r.recommendation) for r in got), [("agent:a", "v1", "reject"), ("agent:a", "v2", "needs_human"), ("agent:b", "v1", "confirm")])
+        self.assertEqual(got[0].reasons, ["r1"])
+        self.assertEqual(got[0].evidence, ["group_b.members"])
+
+    def test_the_table_itself_refuses_a_recommendation_that_is_not_one_and_a_confidence_outside_0_to_1(self):
+        cid = self.pending_candidates(1)[0].id
+        for bad in (self.rec(cid, "merge_them_all"), self.rec(cid, "confirm", 1.5), self.rec(cid, "confirm", -0.1)):
+            with self.assertRaises(Exception):
+                self.store.save_recommendation(bad)
+
+    def test_a_decision_gives_every_open_recommendation_its_outcome_once(self):
+        cid, other = (c.id for c in self.pending_candidates(2))
+        self.store.save_recommendation(self.rec(cid, "confirm", agent="agent:a"))
+        self.store.save_recommendation(self.rec(cid, "reject", agent="agent:b"))
+        self.store.save_recommendation(self.rec(cid, "needs_human", agent="agent:c"))
+        self.store.save_recommendation(self.rec(other, "confirm", agent="agent:a"))
+        self.assertEqual(self.store.record_recommendation_outcomes(self.tenant, DOMAIN, cid, "confirm", "steward:Pat", now_iso()), 3)
+        by_agent = {r.agent: (r.outcome, r.outcome_decision, r.outcome_by) for r in self.store.list_recommendations_for(self.tenant, DOMAIN, cid)}
+        self.assertEqual(by_agent, {"agent:a": ("agreed", "confirm", "steward:Pat"), "agent:b": ("disagreed", "confirm", "steward:Pat"), "agent:c": ("human_decided", "confirm", "steward:Pat")})
+        self.assertEqual([r.outcome for r in self.store.list_recommendations_for(self.tenant, DOMAIN, other)], [None])           # another item: untouched
+        self.assertEqual(self.store.record_recommendation_outcomes(self.tenant, DOMAIN, cid, "reject", "steward:Lee", now_iso()), 0)   # decided once: a second decision changes nothing
+        self.assertEqual({r.outcome for r in self.store.list_recommendations_for(self.tenant, DOMAIN, cid)}, {"agreed", "disagreed", "human_decided"})
+
+    def test_the_page_walks_newest_first_exactly_once_and_filters_by_outcome(self):
+        cands = self.pending_candidates(4)
+        for i, c in enumerate(cands):
+            self.store.save_recommendation(self.rec(c.id, agent=f"agent:{i}"))
+        self.store.record_recommendation_outcomes(self.tenant, DOMAIN, cands[0].id, "confirm", "steward:Pat", now_iso())
+        everything = self.store.recommendations_page(self.tenant, DOMAIN, 100)
+        self.assertEqual(len(everything), 4)
+        self.assertEqual([r.id for r in everything], [r.id for r in sorted(everything, key=lambda r: (r.created_at, r.id), reverse=True)])
+        walked, after = [], None
+        while True:
+            page = self.store.recommendations_page(self.tenant, DOMAIN, 1, after=after)
+            if not page:
+                break
+            walked.append(page[0].id)
+            after = (page[0].created_at, page[0].id)
+        self.assertEqual(walked, [r.id for r in everything])
+        self.assertEqual(len(self.store.recommendations_page(self.tenant, DOMAIN, 100, outcome="open")), 3)
+        self.assertEqual(len(self.store.recommendations_page(self.tenant, DOMAIN, 100, outcome="agreed")), 1)
+
+    def test_the_counts_group_by_what_was_said_what_happened_and_how_sure(self):
+        a, b = (c.id for c in self.pending_candidates(2))
+        self.store.save_recommendation(self.rec(a, "confirm", 0.9))
+        self.store.save_recommendation(self.rec(b, "reject", 0.4))
+        self.store.record_recommendation_outcomes(self.tenant, DOMAIN, a, "confirm", "steward:Pat", now_iso())
+        self.assertEqual(sorted(self.store.recommendation_counts(self.tenant, DOMAIN), key=str), sorted([("confirm", "agreed", 0.9, None, 1), ("reject", None, 0.4, None, 1)], key=str))
+
+    def test_whether_the_person_had_opened_the_suggestion_is_kept_with_the_outcome_and_counted_apart(self):
+        a, b, c = (x.id for x in self.pending_candidates(3))
+        for cid in (a, b, c):
+            self.store.save_recommendation(self.rec(cid, "confirm", 0.9))
+        for cid, viewed in ((a, True), (b, False), (c, None)):
+            self.store.record_recommendation_outcomes(self.tenant, DOMAIN, cid, "confirm", "steward:Pat", now_iso(), viewed)
+        seen = {cid: self.store.list_recommendations_for(self.tenant, DOMAIN, cid)[0].outcome_seen for cid in (a, b, c)}
+        self.assertEqual(seen, {a: True, b: False, c: None})                              # three different answers: opened it, did not, not known
+        self.assertEqual(sorted(self.store.recommendation_counts(self.tenant, DOMAIN), key=str), sorted([("confirm", "agreed", 0.9, True, 1), ("confirm", "agreed", 0.9, False, 1),
+                                                                                                          ("confirm", "agreed", 0.9, None, 1)], key=str))
+        self.assertEqual(self.store.record_recommendation_outcomes(self.tenant, DOMAIN, a, "reject", "steward:Lee", now_iso(), False), 0)       # decided once: the first answer stands
+        self.assertTrue(self.store.list_recommendations_for(self.tenant, DOMAIN, a)[0].outcome_seen)
+
+    def test_the_index_can_be_read_a_page_at_a_time_in_key_order_distinct_and_counted(self):
+        a, b, c = "rec_idx_a", "rec_idx_b", "rec_idx_c"                                           # the index is just keys against record ids
+        entries = [(self.tenant, DOMAIN, a, {"k:b", "k:a", "k:shared"}), (self.tenant, DOMAIN, b, {"k:c", "k:shared"}), (self.tenant, DOMAIN, c, {"k:d"})]
+        self.store.replace_blocking_keys_batch(entries)
+        everything = [k for page in self.store.iter_blocking_keys(self.tenant, DOMAIN, 1_000) for k in page]
+        mine = [k for k in everything if k.startswith("k:")]
+        self.assertEqual(mine, ["k:a", "k:b", "k:c", "k:d", "k:shared"])                           # distinct (k:shared once), in key order
+        paged = list(self.store.iter_blocking_keys(self.tenant, DOMAIN, 2))
+        self.assertTrue(all(len(p) <= 2 for p in paged) and len(paged) > 1)                          # really a page at a time
+        self.assertEqual([k for p in paged for k in p], everything)                                  # and the same keys in the same order whatever the page size
+        self.assertGreaterEqual(self.store.count_blocking_keys(self.tenant, DOMAIN), 6)
+        self.assertEqual(list(self.store.iter_blocking_keys("a-tenant-with-nothing", DOMAIN, 2)), [])
+        self.assertEqual(self.store.count_blocking_keys("a-tenant-with-nothing", DOMAIN), 0)
+
+    def test_deleting_recommendations_for_some_candidates_leaves_the_rest(self):
+        a, b = (c.id for c in self.pending_candidates(2))
+        self.store.save_recommendation(self.rec(a))
+        self.store.save_recommendation(self.rec(b))
+        self.assertEqual(self.store.delete_recommendations(self.tenant, DOMAIN, [a]), 1)
+        self.assertEqual((len(self.store.list_recommendations_for(self.tenant, DOMAIN, a)), len(self.store.list_recommendations_for(self.tenant, DOMAIN, b))), (0, 1))
+        self.assertEqual(self.store.delete_recommendations(self.tenant, DOMAIN, []), 0)
+        self.assertEqual(self.store.delete_recommendations(self.tenant, DOMAIN, [f"c{i}" for i in range(1200)] + [b]), 1)         # more ids than one IN list may carry
 
 class TestSqliteContract(Contract, unittest.TestCase):
     dialect_name = "sqlite"

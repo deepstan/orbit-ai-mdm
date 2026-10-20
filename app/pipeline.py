@@ -12,7 +12,7 @@ import logging
 import os
 from dataclasses import dataclass, replace
 
-from . import active_learning, learned_scorer, llm_adjudication
+from . import active_learning, kernel, learned_scorer, llm_adjudication
 from .db import Store
 from .domains import get_domain_config
 from .indexing import ensure_index_ready
@@ -45,6 +45,9 @@ class Ctx:
     # dies between flushes, those records are still `staged`, so they are resumed, and resuming is idempotent (see _process_record).
     done_ids: list | None = None       # records matched but not yet marked 'matched'
     dirty_rows: list | None = None     # golden-dirty marks not yet saved
+    lineage_rows: list | None = None   # batch/resume: lineage of golden records created in this transaction, written once at its end (None = write at once)
+    has_separations: bool | None = None  # batch/resume: asked once per transaction, not once per record (reset at the start of each)
+    key_filter: object | None = None     # a SINGLE-WRITER bulk load only (app/keyfilter.py): which of a new record's keys can be held by another record. None = look every key up
 
 
 REALTIME = Ctx()
@@ -56,8 +59,8 @@ def _llm_in_batch() -> bool:
     return os.environ.get("MDM_LLM_IN_BATCH", "").strip().lower() in ("1", "true", "yes")
 
 
-def batch_ctx(mode: str = "batch") -> Ctx:
-    return Ctx(mode=mode, defer_golden=set(), allow_llm=_llm_in_batch(), done_ids=[], dirty_rows=[])
+def batch_ctx(mode: str = "batch", key_filter=None) -> Ctx:
+    return Ctx(mode=mode, defer_golden=set(), allow_llm=_llm_in_batch(), done_ids=[], dirty_rows=[], lineage_rows=[], key_filter=key_filter)
 
 
 def _publish_golden(store: Store, tenant_id: str, domain: str, entity_id: str, reason: str, ctx: Ctx) -> None:
@@ -81,6 +84,9 @@ FLUSH_EVERY = 100
 def flush_progress(store: Store, tenant_id: str, domain: str, ctx: Ctx) -> None:
     """Writes the batched progress. Golden-dirty marks go FIRST: a record is never marked finished while the note that its golden
     record needs rebuilding is still unsaved."""
+    if ctx.lineage_rows:
+        store.add_lineage_batch(ctx.lineage_rows)     # one write for every entity this transaction created
+        ctx.lineage_rows.clear()
     if ctx.dirty_rows:
         store.mark_golden_dirty(ctx.dirty_rows)
         ctx.dirty_rows.clear()
@@ -146,32 +152,57 @@ class Run:
 def _process_record(store: Store, tenant_id: str, domain: str, config, rec: SourceRecord, fingerprint: str, ctx: Ctx, *,
                     staged: tuple | None = None, resume: bool = False, learned_model=_UNSET) -> dict:
     """Everything after raw landing: stage, index, match, merge/queue/standalone. Safe to run again on a record that stopped
-    partway (staging and keys are replaced, and with resume=True pairs already decided are not decided twice). If it fails the
-    failure is recorded on the record and re-raised; the record stays unfinished and is picked up again."""
+    partway (staging and keys are replaced, and with resume=True pairs already decided are not decided twice). If it fails, whatever this record had
+    written is rolled back (a savepoint, when a batch is open), THEN the failure is recorded on the record and re-raised: the record stays unfinished and is picked up again."""
     try:
-        if staged is None:
-            std_new, cleansed = stage_record(domain, config, rec.attributes)
-            store.save_staged_batch([(tenant_id, domain, rec.id, std_new, cleansed, fingerprint)])
-        else:
-            std_new = staged[0]
-        new_keys = blocking_keys(std_new, config)
-        # ONE record's keys at a time, right before that record's own matching step: a record must never see the keys of
-        # records that arrive AFTER it (see run_batch). Replacing, not inserting, is what makes resuming safe.
-        store.replace_blocking_keys_batch([(tenant_id, domain, rec.id, new_keys)])
-        if staged is None:  # (a batch has already marked all its new records 'staged' in one write)
-            store.set_processing_status([rec.id], tenant_id, domain, "staged")
-        model = active_learning.load_model(tenant_id, domain) if learned_model is _UNSET else learned_model
-        known = store.list_candidate_pairs(tenant_id, domain, rec.id) if resume else None
-        result = _route_record(store, tenant_id, domain, config, rec, std_new, new_keys, model,
-                               existing_entity=rec.entity_id, ctx=ctx, known_pairs=known)
-        if ctx.done_ids is not None:
-            ctx.done_ids.append(rec.id)
-        else:
-            store.set_processing_status([rec.id], tenant_id, domain, "matched")
-        return result
+        with store.savepoint():
+            if staged is None:
+                std_new, cleansed = stage_record(domain, config, rec.attributes)
+                store.save_staged_batch([(tenant_id, domain, rec.id, std_new, cleansed, fingerprint)])
+            else:
+                std_new, cleansed = staged[0], staged[1]
+            new_keys = blocking_keys(std_new, config)
+            maybe_shared = None                      # None: look every key up
+            if ctx.key_filter is not None:
+                real = {k for k in new_keys if k != NO_BLOCK_KEY}
+                if staged is not None and not resume and rec.entity_id is None:    # a brand-new record: only OTHER records can hold its keys, and the filter knows which may
+                    maybe_shared = ctx.key_filter.check_and_add(real)
+                else:                                                               # changed, resumed or held: look everything up, but remember its keys for the records after it
+                    ctx.key_filter.add(real)
+            # ONE record's keys at a time, right before that record's own matching step: a record must never see the keys of
+            # records that arrive AFTER it (see run_batch). Replacing, not inserting, is what makes resuming safe.
+            store.replace_blocking_keys_batch([(tenant_id, domain, rec.id, new_keys)], fresh=staged is not None and not resume)    # a new record in a batch has no keys to delete
+            if staged is None:  # (a batch has already marked all its new records 'staged' in one write)
+                store.set_processing_status([rec.id], tenant_id, domain, "staged")
+            model = active_learning.load_model(tenant_id, domain) if learned_model is _UNSET else learned_model
+            known = store.list_candidate_pairs(tenant_id, domain, rec.id) if resume else None
+            result = _route_record(store, tenant_id, domain, config, rec, std_new, new_keys, model,
+                                   existing_entity=rec.entity_id, ctx=ctx, known_pairs=known, cleansed=cleansed, maybe_shared=maybe_shared)
+            if ctx.done_ids is not None:
+                ctx.done_ids.append(rec.id)
+            else:
+                store.set_processing_status([rec.id], tenant_id, domain, "matched")
+            return result
     except Exception as e:
         store.record_processing_failure(rec.id, tenant_id, domain, f"{type(e).__name__}: {e}"[:500])
         raise
+
+
+COMMIT_EVERY = max(1, int(os.environ.get("MDM_BATCH_COMMIT", "200")))     # records matched per transaction in a batch run: one commit for all of them
+
+
+def _unit_of_work(store: Store, domain: str, fn):
+    """Runs fn() in ONE transaction (for a single record it is a batch of one). If fn raises AFTER the failure was recorded on the record, the transaction is still committed so
+    that record survives, and the error is raised to the caller."""
+    error = None
+    with store.batch(domain):
+        try:
+            result = fn()
+        except Exception as e:
+            error = e
+    if error is not None:
+        raise error
+    return result
 
 
 def _accepted(rec: SourceRecord) -> dict:
@@ -227,16 +258,17 @@ def ingest_record(store: Store, tenant_id: str, domain: str, source_system: str,
     fingerprint = ensure_index_ready(store, domain, config)  # refuses if the domain's config changed and derived data wasn't rebuilt
     existing = store.find_source_record(tenant_id, domain, source_system, source_record_id)
     if existing is not None:  # idempotent: the same source record again is a no-op, a resume, or a new version, never a duplicate row
-        return _ingest_existing(store, tenant_id, domain, config, existing, attributes, fingerprint, REALTIME)
+        return _unit_of_work(store, domain, lambda: _ingest_existing(store, tenant_id, domain, config, existing, attributes, fingerprint, REALTIME))
     rec = SourceRecord(source_system=source_system, source_record_id=source_record_id, attributes=attributes,
                        tenant_id=tenant_id, domain=domain, content_hash=content_hash(attributes))
     store.save_source_record(rec)  # RAW landing: exactly as received, never rewritten
     if mode == "batch":
         std_new, cleansed = stage_record(domain, config, rec.attributes)
-        store.save_staged_batch([(tenant_id, domain, rec.id, std_new, cleansed, fingerprint)])
-        store.set_processing_status([rec.id], tenant_id, domain, "staged")
+        with store.batch(domain):
+            store.save_staged_batch([(tenant_id, domain, rec.id, std_new, cleansed, fingerprint)])
+            store.set_processing_status([rec.id], tenant_id, domain, "staged")
         return _accepted(rec)
-    return _process_record(store, tenant_id, domain, config, rec, fingerprint, REALTIME)
+    return _unit_of_work(store, domain, lambda: _process_record(store, tenant_id, domain, config, rec, fingerprint, REALTIME))
 
 
 @dataclass
@@ -246,7 +278,7 @@ class BatchRun:
 
 
 def run_batch(store: Store, tenant_id: str, domain: str, records: list[tuple[str, str, dict]], *, max_errors: int | None = None,
-              defer: bool = False, triggered_by: str = "api", run: Run | None = None) -> BatchRun:
+              defer: bool = False, triggered_by: str = "api", run: Run | None = None, key_filter=None) -> BatchRun:
     """BATCH ingest of many records of one tenant+domain, as one logged run (pipeline_runs).
 
     What differs from realtime, on purpose:
@@ -267,53 +299,66 @@ def run_batch(store: Store, tenant_id: str, domain: str, records: list[tuple[str
     own = run is None
     if own:
         run = Run.start(store, tenant_id, domain, "batch", triggered_by)
-    ctx = batch_ctx("batch")
+    ctx = batch_ctx("batch", key_filter=key_filter if os.environ.get("MDM_ENGINE", "kernel") != "legacy" else None)    # only the kernel looks keys up through it
     results: list = []
     try:
-        held = store.find_source_records_by_keys(tenant_id, domain, [(ss, srid) for ss, srid, _ in records])
-        seen, plan = set(), []
-        for ss, srid, attrs in records:
-            if (ss, srid) in held or (ss, srid) in seen:
-                plan.append(None)
-            else:
-                seen.add((ss, srid))
-                plan.append(SourceRecord(source_system=ss, source_record_id=srid, attributes=attrs, tenant_id=tenant_id,
-                                         domain=domain, content_hash=content_hash(attrs)))
-        recs = [r for r in plan if r is not None]
-        store.save_source_records_batch(recs)
-        staged = {rec.id: stage_record(domain, config, rec.attributes) for rec in recs}
-        store.save_staged_batch([(tenant_id, domain, rid, m, c, fingerprint) for rid, (m, c) in staged.items()])
-        store.set_processing_status([r.id for r in recs], tenant_id, domain, "staged")
+        with store.batch(domain):       # LANDING: raw, staged and marked 'staged' in ONE commit, durable before any matching starts
+            held = store.find_source_records_by_keys(tenant_id, domain, [(ss, srid) for ss, srid, _ in records])
+            seen, plan = set(), []
+            for ss, srid, attrs in records:
+                if (ss, srid) in held or (ss, srid) in seen:
+                    plan.append(None)
+                else:
+                    seen.add((ss, srid))
+                    plan.append(SourceRecord(source_system=ss, source_record_id=srid, attributes=attrs, tenant_id=tenant_id,
+                                             domain=domain, content_hash=content_hash(attrs)))
+            recs = [r for r in plan if r is not None]
+            store.save_source_records_batch(recs)
+            staged = {rec.id: stage_record(domain, config, rec.attributes) for rec in recs}
+            store.save_staged_batch([(tenant_id, domain, rid, m, c, fingerprint) for rid, (m, c) in staged.items()])
+            store.set_processing_status([r.id for r in recs], tenant_id, domain, "staged")
         learned_model = active_learning.load_model(tenant_id, domain)  # once for the batch: the model doesn't change mid-run
 
-        for (ss, srid, attrs), rec in zip(records, plan):
-            if run.aborted:
-                result = {"record_id": rec.id if rec else None, "deferred": True, "skipped": "the run was aborted"}
-            else:
-                try:
-                    if rec is None:
-                        existing = store.find_source_record(tenant_id, domain, ss, srid)  # fresh: an earlier item may have changed it
-                        result = _ingest_existing(store, tenant_id, domain, config, existing, attrs, fingerprint, ctx)
-                    elif defer:
-                        result = _accepted(rec)
-                    else:
-                        result = _process_record(store, tenant_id, domain, config, rec, fingerprint, ctx,
-                                                 staged=staged[rec.id], learned_model=learned_model)
-                except Exception as e:
-                    result = {"record_id": rec.id if rec else None, "error": f"{type(e).__name__}: {e}"[:300]}
-                    run.error(ss, srid, result["error"])
-                    if max_errors is not None and run.counts["errors"] + 1 > max_errors:
-                        run.aborted = True
-            run.tally(result)
-            results.append(result)
-            if len(ctx.done_ids) >= FLUSH_EVERY:
-                flush_progress(store, tenant_id, domain, ctx)
+        work = list(zip(records, plan))
+        for start in range(0, len(work), COMMIT_EVERY):
+            committed = False
+            ctx.has_separations = None      # asked again at the start of every transaction
+            try:
+                with store.batch(domain):   # MATCHING: this many records, their progress and their golden-dirty marks, in ONE transaction. A record that fails rolls back only itself
+                    for (ss, srid, attrs), rec in work[start:start + COMMIT_EVERY]:
+                        if run.aborted:
+                            result = {"record_id": rec.id if rec else None, "deferred": True, "skipped": "the run was aborted"}
+                        else:
+                            try:
+                                if rec is None:
+                                    existing = store.find_source_record(tenant_id, domain, ss, srid)  # fresh: an earlier item may have changed it
+                                    result = _ingest_existing(store, tenant_id, domain, config, existing, attrs, fingerprint, ctx)
+                                elif defer:
+                                    result = _accepted(rec)
+                                else:
+                                    result = _process_record(store, tenant_id, domain, config, rec, fingerprint, ctx,
+                                                             staged=staged[rec.id], learned_model=learned_model)
+                            except Exception as e:
+                                result = {"record_id": rec.id if rec else None, "error": f"{type(e).__name__}: {e}"[:300]}
+                                run.error(ss, srid, result["error"])
+                                if max_errors is not None and run.counts["errors"] + 1 > max_errors:
+                                    run.aborted = True
+                        run.tally(result)
+                        results.append(result)
+                    flush_progress(store, tenant_id, domain, ctx)
+                committed = True
+            finally:
+                if not committed:           # the transaction rolled back: its progress was never saved, so it must not be saved now
+                    ctx.done_ids.clear()
+                    ctx.dirty_rows.clear()
+                    ctx.lineage_rows.clear()
     except BaseException:
         run.aborted = True
         raise
     finally:
-        flush_progress(store, tenant_id, domain, ctx)
-        run.counts["golden_rebuilt"] += flush_golden(store, domain, ctx.defer_golden)
+        with store.batch(domain):
+            flush_progress(store, tenant_id, domain, ctx)
+            run.counts["golden_rebuilt"] += flush_golden(store, domain, ctx.defer_golden)
         if own:
             run.finish()
     return BatchRun(results, run.summary())
@@ -342,22 +387,34 @@ def process_pending(store: Store, domain: str, *, limit: int = 1000, max_attempt
         ctx.defer_golden.update((t, e) for t, e in leftovers if t == tenant_id)  # already marked dirty in the database
         model = active_learning.load_model(tenant_id, domain)
         try:
-            for rec in by_tenant.get(tenant_id, []):
+            recs = by_tenant.get(tenant_id, [])
+            for start in range(0, len(recs), COMMIT_EVERY):
+                committed = False
+                ctx.has_separations = None
                 try:
-                    result = _process_record(store, tenant_id, domain, config, rec, fingerprint, ctx, resume=True, learned_model=model)
-                    result["resumed"] = True
-                except Exception as e:
-                    result = {"record_id": rec.id, "error": f"{type(e).__name__}: {e}"[:300]}
-                    run.error(rec.source_system, rec.source_record_id, result["error"])
-                run.tally(result)
-                if len(ctx.done_ids) >= FLUSH_EVERY:
-                    flush_progress(store, tenant_id, domain, ctx)
+                    with store.batch(domain):       # one transaction for this many records; a record that fails rolls back only itself
+                        for rec in recs[start:start + COMMIT_EVERY]:
+                            try:
+                                result = _process_record(store, tenant_id, domain, config, rec, fingerprint, ctx, resume=True, learned_model=model)
+                                result["resumed"] = True
+                            except Exception as e:
+                                result = {"record_id": rec.id, "error": f"{type(e).__name__}: {e}"[:300]}
+                                run.error(rec.source_system, rec.source_record_id, result["error"])
+                            run.tally(result)
+                        flush_progress(store, tenant_id, domain, ctx)
+                    committed = True
+                finally:
+                    if not committed:
+                        ctx.done_ids.clear()
+                        ctx.dirty_rows.clear()
+                        ctx.lineage_rows.clear()
         except BaseException:
             run.aborted = True
             raise
         finally:
-            flush_progress(store, tenant_id, domain, ctx)
-            run.counts["golden_rebuilt"] += flush_golden(store, domain, ctx.defer_golden)
+            with store.batch(domain):
+                flush_progress(store, tenant_id, domain, ctx)
+                run.counts["golden_rebuilt"] += flush_golden(store, domain, ctx.defer_golden)
             summaries.append(run.finish())
     return {"finished": sum(s["counts"]["resumed"] for s in summaries), "errors": sum(s["counts"]["errors"] for s in summaries),
             "golden_rebuilt": sum(s["counts"]["golden_rebuilt"] for s in summaries), "runs": summaries,
@@ -370,7 +427,19 @@ NO_BLOCK_KEY = "__no_block__"
 
 def _route_record(store: Store, tenant_id: str, domain: str, config, rec: SourceRecord,
                    std_new: dict, new_keys: set[str], learned_model, existing_entity: str | None = None,
-                   ctx: Ctx | None = None, known_pairs: dict | None = None) -> dict:
+                   ctx: Ctx | None = None, known_pairs: dict | None = None, cleansed: dict | None = None, maybe_shared: set | None = None) -> dict:
+    """The matching decision: which entity does this record belong to? ONE engine for every way a record arrives (realtime, batch, resume, update): the group-based kernel
+    (app/kernel_router.py). MDM_ENGINE=legacy selects the older pairwise step below, for rollback and for comparison."""
+    if kernel.engine() == "kernel":
+        from .kernel_router import route_record
+        return route_record(store, tenant_id, domain, config, rec, std_new, new_keys, learned_model, existing_entity=existing_entity, ctx=ctx, known_pairs=known_pairs, cleansed=cleansed,
+                            maybe_shared=maybe_shared)
+    return _route_record_legacy(store, tenant_id, domain, config, rec, std_new, new_keys, learned_model, existing_entity=existing_entity, ctx=ctx, known_pairs=known_pairs)
+
+
+def _route_record_legacy(store: Store, tenant_id: str, domain: str, config, rec: SourceRecord,
+                         std_new: dict, new_keys: set[str], learned_model, existing_entity: str | None = None,
+                         ctx: Ctx | None = None, known_pairs: dict | None = None) -> dict:
     """The matching/routing logic shared by ingest_record() and
     ingest_batch() -- assumes `rec` and its blocking keys are ALREADY
     persisted (both callers handle that themselves, one record at a
@@ -610,7 +679,7 @@ def rebuild_golden_record(store: Store, tenant_id: str, domain: str, entity_id: 
 
 
 def resolve_candidate(store: Store, tenant_id: str, domain: str, candidate_id: str,
-                       decision: str, decided_by: str) -> dict:
+                       decision: str, decided_by: str, suggestion_viewed: bool | None = None) -> dict:
     candidate = store.get_candidate(candidate_id, tenant_id, domain)
     if not candidate:
         raise ValueError(f"No such candidate: {candidate_id}")
@@ -626,7 +695,9 @@ def resolve_candidate(store: Store, tenant_id: str, domain: str, candidate_id: s
             raise ValueError(f"Cannot confirm {candidate_id}: a person separated records in these two entities ({blocked_by}), and merging them would undo that")
 
     status = "confirmed" if decision == "confirm" else "rejected"
-    store.update_candidate_status(candidate_id, tenant_id, domain, status, decided_by, now_iso())
+    decided_at = now_iso()
+    store.update_candidate_status(candidate_id, tenant_id, domain, status, decided_by, decided_at)
+    store.record_recommendation_outcomes(tenant_id, domain, candidate_id, decision, decided_by, decided_at, suggestion_viewed)   # an agent's recommendation is judged against what the person decided
 
     entity_id = None
     if decision == "confirm":

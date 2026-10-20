@@ -14,6 +14,7 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
+from legacy_engine import legacy_engine  # noqa: E402
 
 from test_bulk_engine import ROOT, TENANT  # noqa: E402
 from test_onboarding import ANN_A, ANN_B, Onb  # noqa: E402
@@ -70,6 +71,7 @@ class Delta(Onb):
         return out
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestMatchesTheRegularEngine(Delta):
     def test_a_mixed_feed_of_new_changed_and_unchanged_records(self):
         rows = self.rows(scale=4)
@@ -338,7 +340,7 @@ class TestCommandLine(Delta):
             with open(os.path.join(self.tmp, name), "w") as f:
                 f.write("id,first,last,email\n" + "".join(",".join(r) + "\n" for r in rows))
         run = lambda name, *a: subprocess.run([sys.executable, os.path.join(ROOT, "bulk_ingest.py"), "--tenant", TENANT, "--domain", "customer", "--file", os.path.join(self.tmp, name),
-                                                "--db", db, "--id-column", "id", "--source-system", "crm", "--mapping", "first_name=first,last_name=last,email=email", "--bulk", *a],
+                                                "--db", db, "--id-column", "id", "--source-system", "crm", "--mapping", "first_name=first,last_name=last,email=email", "--legacy-bulk", *a],
                                                capture_output=True, text=True, cwd=ROOT)
         self.assertEqual(run("one.csv").returncode, 0)
         refused = run("two.csv", "--onboard")

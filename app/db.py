@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 from . import fieldtypes, golden, protect
 from .migrations import SQLiteMigrationBackend, apply_or_verify, auto_migrate_enabled
-from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent, now_iso
+from .sql_dialect import get_dialect
+from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, Recommendation, SourceRecord, UsageEvent, now_iso
 
 
 
@@ -27,6 +29,7 @@ class Store:
         self.path = path
         self._auto_migrate = auto_migrate
         self._entity_synced: dict = {}
+        self._tls = threading.local()      # the batch (unit of work) of THIS thread: one Store object is shared by every request thread
         parent = Path(path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
@@ -34,13 +37,77 @@ class Store:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        shared = getattr(self._tls, "conn", None)
+        if shared is not None:          # inside a batch: the batch commits (or rolls back), not every call
+            yield shared
+            return
+        conn = sqlite3.connect(self.path, timeout=30)    # (a batch elsewhere may hold the write lock for a moment)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+
+    # --- units of work ------------------------------------------------
+    @staticmethod
+    def _tx(conn, *statements: str) -> None:
+        """Transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT ...): standard SQL, and the ONLY place the units of work execute any (the portability ratchet counts it once)."""
+        for statement in statements:
+            conn.execute(statement)
+
+    def in_batch(self) -> bool:
+        return getattr(self._tls, "conn", None) is not None
+
+    @contextmanager
+    def batch(self, domain: str | None = None):
+        """ONE transaction for everything the block writes, committed at the end (or rolled back whole if the block raises). Every store call inside it shares one connection, so it
+        also costs one commit, not one per call. Reentrant: a batch inside a batch joins it. Per thread: other threads and other processes wait for the write lock until this one ends.
+        `domain` makes sure that domain's golden table has been checked BEFORE the transaction opens: that check uses a connection of its own and would wait for this one for ever."""
+        if domain is not None:
+            self._ensure_entity_table(domain)
+        tls = self._tls
+        if getattr(tls, "conn", None) is not None:
+            tls.depth += 1
+            try:
+                yield
+            finally:
+                tls.depth -= 1
+            return
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)   # autocommit mode: BEGIN and COMMIT are explicit, so savepoints behave
+        conn.row_factory = sqlite3.Row
+        self._tx(conn, "BEGIN IMMEDIATE")
+        tls.conn, tls.depth, tls.savepoints = conn, 1, 0
+        try:
+            yield
+            self._tx(conn, "COMMIT")
+        except BaseException:
+            try:
+                self._tx(conn, "ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            tls.conn, tls.depth = None, 0
+            conn.close()
+
+    @contextmanager
+    def savepoint(self):
+        """Inside a batch: if the block raises, only ITS writes are undone and the exception goes on; the batch carries on. Outside a batch: does nothing (as before)."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            yield
+            return
+        self._tls.savepoints += 1
+        name = f"mdm_sp_{self._tls.savepoints}"
+        self._tx(conn, f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            self._tx(conn, f"ROLLBACK TO SAVEPOINT {name}", f"RELEASE SAVEPOINT {name}")
+            raise
+        else:
+            self._tx(conn, f"RELEASE SAVEPOINT {name}")
 
     def _init_schema(self, auto_migrate: bool | None = None) -> None:
         """The schema is owned by app/migrations (versioned, upgradable).
@@ -213,6 +280,9 @@ class Store:
         cols = self._entity_columns(domain)
         if cols is None or self._entity_synced.get(domain) == tuple(cols):
             return  # no config loaded for this domain (use the table as it is), or already checked
+        if self.in_batch():
+            raise RuntimeError(f"the golden table for domain {domain!r} has not been checked yet, and the check cannot run inside a batch (it opens its own connection and would wait "
+                               f"for this transaction for ever): open the batch with store.batch(domain={domain!r})")
         golden.ensure_or_verify(SQLiteMigrationBackend(self.path), domain, cols, auto_migrate_enabled(self._auto_migrate))
         self._entity_synced[domain] = tuple(cols)
 
@@ -528,19 +598,41 @@ class Store:
             ).fetchall()
         return [self._row_to_source_record(r) for r in rows]
 
-    def replace_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]]) -> None:
+    def replace_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]], fresh: bool = False) -> None:
         """entries: [(tenant_id, domain, record_id, keys), ...]. Swaps each
         record's keys for the new set; the whole batch is one transaction,
-        so a record is never left half-indexed."""
-        deletes = [(t, d, rid) for t, d, rid, _ in entries]
+        so a record is never left half-indexed. fresh=True: these records are NEW
+        and cannot hold keys yet, so nothing is deleted (one statement fewer)."""
+        deletes = [] if fresh else [(t, d, rid) for t, d, rid, _ in entries]
         inserts = [(t, d, rid, k) for t, d, rid, keys in entries for k in keys]
         with self._conn() as conn:
-            conn.executemany(
-                "DELETE FROM blocking_keys WHERE tenant_id = ? AND domain = ? AND record_id = ?", deletes)
+            if deletes:
+                conn.executemany(
+                    "DELETE FROM blocking_keys WHERE tenant_id = ? AND domain = ? AND record_id = ?", deletes)
             conn.executemany(
                 "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (?, ?, ?, ?)", inserts)
 
     # --- Bucket sizes and statistics (see matching.py / domains_cli.py blocking-stats) ---
+    def iter_blocking_keys(self, tenant_id: str, domain: str, page: int = 50_000):
+        """Every DISTINCT blocking key of a tenant and domain, as lists of at most `page`, in key order (keyset paging on the index: no offset, no whole-table read at once).
+        The key filter reads the index once, at the start of a load, with this."""
+        last = None
+        while True:
+            sql, params = "SELECT DISTINCT blocking_key FROM blocking_keys WHERE tenant_id = ? AND domain = ?", [tenant_id, domain]
+            if last is not None:
+                sql, params = sql + " AND blocking_key > ?", params + [last]
+            with self._conn() as conn:
+                rows = conn.execute(sql + " ORDER BY blocking_key LIMIT ?", (*params, page)).fetchall()
+            if not rows:
+                return
+            yield [r[0] for r in rows]
+            last = rows[-1][0]
+
+    def count_blocking_keys(self, tenant_id: str, domain: str) -> int:
+        """How many entries the index holds for a tenant and domain (to size the key filter). On a very large table this is a full scan: ask once."""
+        with self._conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM blocking_keys WHERE tenant_id = ? AND domain = ?", (tenant_id, domain)).fetchone()[0]
+
     def blocking_bucket_sizes(self, tenant_id: str, domain: str, keys: set[str]) -> dict[str, int]:
         """How many records hold each of these blocking keys (this tenant+domain). One indexed query."""
         if not keys:
@@ -635,12 +727,18 @@ class Store:
         return self._row_to_source_record(row) if row else None
 
     def find_source_records_by_keys(self, tenant_id: str, domain: str, keys) -> dict:
-        out = {}
+        """{(source_system, source_record_id): the latest record held} for the keys that are held. ONE query per source system per chunk of ids (it used to be one query per key)."""
+        by_system: dict = {}
+        for source_system, source_record_id in keys:
+            by_system.setdefault(source_system, []).append(source_record_id)
+        d, out = get_dialect("sqlite"), {}
         with self._conn() as conn:
-            for source_system, source_record_id in keys:
-                row = conn.execute(self._NATURAL, (tenant_id, domain, source_system, source_record_id)).fetchone()
-                if row:
-                    out[(source_system, source_record_id)] = self._row_to_source_record(row)
+            for source_system, ids in by_system.items():
+                for chunk in d.chunks(ids):
+                    cond, params = d.in_list("source_record_id", chunk)
+                    for row in conn.execute(f"SELECT * FROM source_records WHERE tenant_id = ? AND domain = ? AND source_system = ? AND {cond} "
+                                            f"ORDER BY ingested_at DESC, id DESC", (tenant_id, domain, source_system, *params)):
+                        out.setdefault((source_system, row["source_record_id"]), self._row_to_source_record(row))   # newest first: the first one seen is the latest
         return out
 
     def update_source_record(self, rec_id: str, tenant_id: str, domain: str, attributes: dict, content_hash: str, version: int) -> None:
@@ -1155,6 +1253,65 @@ class Store:
     def count_pending(self, tenant_id: str, domain: str) -> int:
         with self._conn() as conn:
             return conn.execute("SELECT COUNT(*) FROM match_candidates WHERE tenant_id = ? AND domain = ? AND status = 'pending'", (tenant_id, domain)).fetchone()[0]
+
+    # --- agent recommendations: what a stewardship agent thinks about a review item. They change nothing; a person's decision later records an OUTCOME on them ---
+    @staticmethod
+    def _recommendation_from_row(r) -> Recommendation:
+        return Recommendation(candidate_id=r["candidate_id"], recommendation=r["recommendation"], confidence=r["confidence"], agent=r["agent"], reasons=json.loads(r["reasons"]),
+                              evidence=json.loads(r["evidence"]), model=r["model"], prompt_version=r["prompt_version"], id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"],
+                              created_at=r["created_at"], outcome=r["outcome"], outcome_decision=r["outcome_decision"], outcome_by=r["outcome_by"], outcome_at=r["outcome_at"],
+                              outcome_seen=None if r["outcome_seen"] is None else bool(r["outcome_seen"]))
+
+    def save_recommendation(self, rec: Recommendation) -> Recommendation:
+        """One recommendation per (candidate, agent, model, prompt version): proposing again REPLACES it (a newer opinion of the same agent). Returns what is stored."""
+        sql = get_dialect("sqlite").upsert("agent_recommendations", ["id", "tenant_id", "domain", "candidate_id", "recommendation", "confidence", "reasons", "evidence", "agent", "model", "prompt_version", "created_at"], key=["tenant_id", "domain", "candidate_id", "agent", "model", "prompt_version"],
+                                           update=["recommendation", "confidence", "reasons", "evidence", "created_at"])
+        with self._conn() as conn:
+            conn.execute(sql, (rec.id, rec.tenant_id, rec.domain, rec.candidate_id, rec.recommendation, rec.confidence, json.dumps(rec.reasons), json.dumps(rec.evidence), rec.agent,
+                               rec.model, rec.prompt_version, rec.created_at))
+            row = conn.execute("SELECT * FROM agent_recommendations WHERE tenant_id = ? AND domain = ? AND candidate_id = ? AND agent = ? AND model = ? AND prompt_version = ?",
+                               (rec.tenant_id, rec.domain, rec.candidate_id, rec.agent, rec.model, rec.prompt_version)).fetchone()
+        return self._recommendation_from_row(row)
+
+    def list_recommendations_for(self, tenant_id: str, domain: str, candidate_id: str) -> list:
+        with self._conn() as conn:
+            return [self._recommendation_from_row(r) for r in conn.execute(
+                "SELECT * FROM agent_recommendations WHERE tenant_id = ? AND domain = ? AND candidate_id = ? ORDER BY created_at DESC, id DESC", (tenant_id, domain, candidate_id))]
+
+    def recommendations_page(self, tenant_id: str, domain: str, limit: int, after=None, outcome: str | None = None) -> list:
+        """The next `limit` recommendations, newest first, after `after` = (created_at, id) of the last one seen. outcome: 'open' (no person has decided yet), or an outcome."""
+        sql, params = "SELECT * FROM agent_recommendations WHERE tenant_id = ? AND domain = ?", [tenant_id, domain]
+        if outcome == "open":
+            sql += " AND outcome IS NULL"
+        elif outcome:
+            sql, params = sql + " AND outcome = ?", params + [outcome]
+        if after is not None:
+            sql, params = sql + " AND " + get_dialect("sqlite").keyset_after(["created_at", "id"], descending=True), params + [after[0], after[1]]
+        with self._conn() as conn:
+            return [self._recommendation_from_row(r) for r in conn.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT ?", (*params, limit))]
+
+    def record_recommendation_outcomes(self, tenant_id: str, domain: str, candidate_id: str, decision: str, decided_by: str, decided_at: str, suggestion_viewed: bool | None = None) -> int:
+        """A person decided this item: every recommendation still open for it gets its outcome (agreed, disagreed, or human_decided if it said needs_human). Returns how many."""
+        with self._conn() as conn:
+            return conn.execute("UPDATE agent_recommendations SET outcome = CASE WHEN recommendation = 'needs_human' THEN 'human_decided' WHEN recommendation = ? THEN 'agreed' ELSE 'disagreed' END, "
+                                "outcome_decision = ?, outcome_by = ?, outcome_at = ?, outcome_seen = ? WHERE tenant_id = ? AND domain = ? AND candidate_id = ? AND outcome IS NULL",
+                                (decision, decision, decided_by, decided_at, None if suggestion_viewed is None else int(bool(suggestion_viewed)), tenant_id, domain, candidate_id)).rowcount
+
+    def recommendation_counts(self, tenant_id: str, domain: str, limit: int = 20000) -> list:
+        """[(recommendation, outcome, confidence, how many)]: what the agreement statistics are made from."""
+        with self._conn() as conn:
+            return [(r["recommendation"], r["outcome"], r["confidence"], None if r["outcome_seen"] is None else bool(r["outcome_seen"]), r["n"]) for r in conn.execute(
+                "SELECT recommendation, outcome, confidence, outcome_seen, COUNT(*) AS n FROM agent_recommendations WHERE tenant_id = ? AND domain = ? "
+                "GROUP BY recommendation, outcome, confidence, outcome_seen LIMIT ?", (tenant_id, domain, limit))]
+
+    def delete_recommendations(self, tenant_id: str, domain: str, candidate_ids) -> int:
+        """Right to be forgotten: an agent's reasons may quote the data, so they go with it. Returns how many were deleted."""
+        d, n = get_dialect("sqlite"), 0
+        with self._conn() as conn:
+            for chunk in d.chunks(list(candidate_ids)):
+                cond, params = d.in_list("candidate_id", chunk)
+                n += conn.execute(f"DELETE FROM agent_recommendations WHERE tenant_id = ? AND domain = ? AND {cond}", (tenant_id, domain, *params)).rowcount
+        return n
 
     def get_source_records_batch(self, tenant_id: str, domain: str, record_ids) -> dict:
         """{record id: SourceRecord}: one query per 500, instead of one per record."""

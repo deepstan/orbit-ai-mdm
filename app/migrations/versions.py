@@ -453,6 +453,16 @@ _MERGE_AUDITS = (
 
 # Who MADE the merge ('rule': the rule score; 'promoted': the learned scorer), fixed when the merge is flagged. The candidate's own decided_by cannot be used for this
 # later: unmerging a pair rewrites it, and a promotion a person unmerged would then be counted against the RULE score instead of the model.
+_AGENT_RECOMMENDATIONS = (
+    "CREATE TABLE IF NOT EXISTS agent_recommendations (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, domain TEXT NOT NULL, candidate_id TEXT NOT NULL, "
+    "recommendation TEXT NOT NULL CHECK (recommendation IN ('confirm', 'reject', 'needs_human')), confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1), "
+    "reasons TEXT NOT NULL, evidence TEXT NOT NULL, agent TEXT NOT NULL, model TEXT NOT NULL, prompt_version TEXT NOT NULL, created_at TEXT NOT NULL, "
+    "outcome TEXT, outcome_decision TEXT, outcome_by TEXT, outcome_at TEXT)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_recs_unique ON agent_recommendations(tenant_id, domain, candidate_id, agent, model, prompt_version)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_recs_recent ON agent_recommendations(tenant_id, domain, created_at, id)",
+)
+
+
 def add_audit_made_by(ctx: MigrationContext) -> None:
     """Idempotent (an adopted database may already have the column): add merge_audits.made_by, fill it for the audits that exist from what their candidates say now
     (correct for every merge nobody has unmerged yet), and replace the old index with one that serves the audit page's queue and counts."""
@@ -462,6 +472,13 @@ def add_audit_made_by(ctx: MigrationContext) -> None:
                 "THEN 'promoted' ELSE 'rule' END WHERE made_by IS NULL")
     ctx.execute("DROP INDEX IF EXISTS idx_merge_audits_scope")
     ctx.execute("CREATE INDEX IF NOT EXISTS idx_merge_audits_queue ON merge_audits(tenant_id, domain, verdict, made_by, sampled_at)")
+
+
+def add_recommendation_outcome_seen(ctx: MigrationContext) -> None:
+    """Idempotent: agent_recommendations.outcome_seen, whether the person had OPENED the suggestion before deciding (1), had it available and did not look (0), or it is not known (NULL: a
+    decision made through a script, an older client, or before this column). Agreement with people is only an unbiased measure of an agent when they decided without seeing it."""
+    if "outcome_seen" not in ctx.columns("agent_recommendations"):
+        ctx.execute("ALTER TABLE agent_recommendations ADD COLUMN outcome_seen SMALLINT")
 
 
 def add_paging_indexes(ctx: MigrationContext) -> None:
@@ -537,6 +554,10 @@ MIGRATIONS = [
     Migration(14, "merge_audits", sqlite=_MERGE_AUDITS, postgres=_MERGE_AUDITS),
     Migration(15, "merge_audit_made_by", data_step=add_audit_made_by),
     Migration(16, "paging_indexes", data_step=add_paging_indexes),
+    # What a stewardship agent recommends for a review item, and later what the person decided: the evidence for how far an agent can be trusted.
+    Migration(17, "agent_recommendations", sqlite=_AGENT_RECOMMENDATIONS, postgres=_pg(_AGENT_RECOMMENDATIONS)),
+    # Whether the person opened the suggestion before deciding, so agreement can be measured on the decisions that were not influenced by it.
+    Migration(18, "recommendation_outcome_seen", data_step=add_recommendation_outcome_seen),
 ]
 
 

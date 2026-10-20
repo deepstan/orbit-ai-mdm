@@ -110,6 +110,29 @@ class MatchCandidate:
 
 
 @dataclass
+class Recommendation:
+    """What a stewardship AGENT thinks should happen to a review item. It changes NOTHING: it is stored, shown to a steward, and later compared with what the steward decided
+    (`outcome`), which is the evidence for deciding how far the agent can be trusted. One per (candidate, agent, model, prompt version): proposing again replaces it."""
+    candidate_id: str
+    recommendation: str            # confirm | reject | needs_human
+    confidence: float              # 0 to 1
+    agent: str                     # who proposed it: the KEY's name ("agent:<label>"), never something the request says
+    reasons: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)      # what it looked at (names of the evidence parts), not copies of the data
+    model: str = ""
+    prompt_version: str = ""
+    id: str = field(default_factory=lambda: new_id("reco_"))
+    tenant_id: str = DEFAULT_TENANT
+    domain: str = DEFAULT_DOMAIN
+    created_at: str = field(default_factory=now_iso)
+    outcome: Optional[str] = None            # None while the item waits; then agreed | disagreed | human_decided (it said needs_human)
+    outcome_decision: Optional[str] = None   # what the person decided: confirm | reject
+    outcome_by: Optional[str] = None
+    outcome_at: Optional[str] = None
+    outcome_seen: Optional[bool] = None      # True: the person opened the suggestion before deciding. False: it was there and they did not. None: not known
+
+
+@dataclass
 class LineageEvent:
     entity_id: str
     field: str

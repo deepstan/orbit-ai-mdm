@@ -2,8 +2,8 @@
 
 `../mdm-system-diagram.pdf` has two pages:
 
-1. **Today**: what is in the application (three engines sharing one pipeline; the store, dialect and governance layers).
-2. **Target**: the one-engine kernel (a prototype in `experiments/`), its state layer, the gates (P and S) and the settings.
+1. **Today**: what is in the application: ONE matching engine (the kernel) for every way a record arrives, what it keeps from before, the legacy engines kept for rollback, and the store, dialect and governance layers.
+2. **What remains**: the steps from one engine to the 100-million-record target (batched writes, fewer statements, Gate P on PostgreSQL, Gate S), and what is still prototype-only.
 
 Colors say how far each box has been PROVEN: green = in the application and tested; blue = prototype in `experiments/` (tested there); amber = built but never run on a PostgreSQL server; grey dashed = not built.
 

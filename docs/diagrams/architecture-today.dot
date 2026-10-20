@@ -1,6 +1,6 @@
 digraph today {
-  compound=true; rankdir=TB; nodesep=0.35; ranksep=0.55; fontname="Helvetica"; fontsize=22; labelloc=t;
-  label=<<B>MDM platform: what is IN THE APPLICATION today</B><BR/><FONT POINT-SIZE="13">updated 2026-10-14  |  one decision logic, three engines  |  the one-engine kernel (next page) is a prototype and has not replaced them</FONT>>;
+  compound=true; rankdir=TB; nodesep=0.35; ranksep=0.5; fontname="Helvetica"; fontsize=22; labelloc=t;
+  label=<<B>MDM platform: what is IN THE APPLICATION today</B><BR/><FONT POINT-SIZE="13">updated 2026-10-16  |  ONE matching engine, the kernel, decides every record however it arrives  |  the older engines remain only for rollback and comparison</FONT>>;
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.16,0.09"];
   edge [fontname="Helvetica", fontsize=9, color="#555555"];
 
@@ -10,51 +10,57 @@ digraph today {
   }
   subgraph cluster_api { label="API and access (FastAPI)"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
     api [label="REST API  /v1/{domain}/...\nauthentication required by default (MDM_DEV_MODE opens it)\nroles: tenant_admin, domain_admin, data_steward, api_consumer\ndomain-scoped keys; decisions signed with the key's name\nrequest size limits and a rate limit", fillcolor="#d9f2d9", color="#2e7d32"];
-    ui  [label="Stewardship console\nreview queue (paged), entity list,\naudit page, unmerge", fillcolor="#d9f2d9", color="#2e7d32"];
+    ui  [label="Stewardship console\nreview queue (paged), entity list,\naudit page, unmerge; the assistant's suggestion\n(closed until opened; never opened in a real browser)", fillcolor="#fff0cc", color="#b26a00"];
+    mcp [label="MCP server, READ-ONLY (for AI agents)\n11 read-only tools; --allow-propose adds one write: record a recommendation\n(changes nothing; compared later with what a person decides). The steward_agent role.\nwritten from the spec: never tried with a real MCP client", fillcolor="#fff0cc", color="#b26a00"];
   }
-  subgraph cluster_eng { label="THREE matching engines (same decisions, three drivers)"; style="rounded,filled"; fillcolor="#fffdf3"; color="#b26a00"; fontsize=13;
-    reg  [label="Regular engine\none record at a time\n(real time)", fillcolor="#d9f2d9", color="#2e7d32"];
-    bulk [label="Bulk engine\nset-based, parallel workers,\nscratch SQLite files in a temp folder", fillcolor="#d9f2d9", color="#2e7d32"];
-    delta[label="Onboarding and delta\na new source / changed records\n(set-based)", fillcolor="#d9f2d9", color="#2e7d32"];
+  subgraph cluster_doors { label="Every way a record arrives runs the SAME pipeline"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
+    d1 [label="realtime call", fillcolor="#d9f2d9", color="#2e7d32"];
+    d2 [label="batch / file load\n(--bulk, onboarding and delta are\nthis same operation: each record is\nnew, unchanged or changed)", fillcolor="#d9f2d9", color="#2e7d32"];
+    d3 [label="resume\n(process-pending)", fillcolor="#d9f2d9", color="#2e7d32"];
+    land [label="land -> stage -> match (status per record), history of changes, runs, golden-record publishing", fillcolor="#d9f2d9", color="#2e7d32"];
   }
-  subgraph cluster_pipe { label="The pipeline every engine uses"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    std  [label="Standardizer\nper-domain; nicknames mapped to one name", fillcolor="#d9f2d9", color="#2e7d32"];
-    blk  [label="Blocking keys + bucket caps", fillcolor="#d9f2d9", color="#2e7d32"];
-    scr  [label="Scorer\ndeterministic identifiers + fuzzy similarity\n+ mismatch penalties (given names: line 0.75)\nsimilarity and embedding caches (bounded)", fillcolor="#d9f2d9", color="#2e7d32"];
-    lrn  [label="Learned scorer (policy B)\npromotes review pairs; 10% audited;\nautomatic rollback", fillcolor="#d9f2d9", color="#2e7d32"];
-    llm  [label="LLM adjudication\n(optional; off in bulk)", fillcolor="#d9f2d9", color="#2e7d32"];
-    sep  [label="Separations\n(an unmerge is never re-merged,\nin every engine)", fillcolor="#d9f2d9", color="#2e7d32"];
-    surv [label="Survivorship (per domain)\n-> the golden record", fillcolor="#d9f2d9", color="#2e7d32"];
+  subgraph cluster_k { label="THE matching engine: the kernel  (app/kernel.py, app/kernel_router.py)"; style="rounded,filled"; fillcolor="#f3fbf3"; color="#2e7d32"; fontsize=14;
+    k1 [label="1  Find candidate GROUPS (entities)\nthe blocking index, mapped to entities; ranked by rarity;\nMDM_MAX_CANDIDATES limits how many are scored;\n--key-filter (one writer only) skips lookups that would find nothing", fillcolor="#d9f2d9", color="#2e7d32"];
+    k2 [label="2  Score the record against each group's feature set\nCorroboratedScorer: an identifier held by 3 other groups does not identify anyone;\na changed surname is not a different person when two identifiers and the first name agree", fillcolor="#d9f2d9", color="#2e7d32"];
+    k3 [label="3  Decide\njoin the best group | stay a new entity (+ review items)\n| merge two groups whose golden records match | a CHANGED record is matched again\nand can leave its group (never one a person tied there)", fillcolor="#d9f2d9", color="#2e7d32"];
+    k4 [label="4  Write in the product's own tables (no new tables), in a batch\nONE confirmed pair per join (an entity is a tree), pending pairs for a person,\nsuperseded pairs when a record leaves, golden record rebuilt by survivorship", fillcolor="#d9f2d9", color="#2e7d32"];
+    k1 -> k2 -> k3 -> k4;
+  }
+  subgraph cluster_hooks { label="Kept as before, called at the same points"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
+    h1 [label="Human decisions are constraints\nseparated pairs never proposed again; two separated entities never\nmerged automatically; a person's confirm holds a record", fillcolor="#d9f2d9", color="#2e7d32"];
+    h2 [label="Learned scorer (policy B), 2% audit sampling,\nLLM adjudication (optional), blending with the active-learning model", fillcolor="#d9f2d9", color="#2e7d32"];
+    h3 [label="Standardizer, nicknames, blocking keys, survivorship, lineage", fillcolor="#d9f2d9", color="#2e7d32"];
+  }
+  subgraph cluster_legacy { label="Legacy, kept for rollback and comparison"; style="rounded,filled,dashed"; fillcolor="#f4f4f4"; color="#777777"; fontsize=13;
+    lg1 [label="MDM_ENGINE=legacy\nthe old pairwise decision step", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
+    lg2 [label="--legacy-bulk: the set-based pair engine\nabout 12x faster on a first load, different decisions,\nparallel, resumable", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
   }
   subgraph cluster_gov { label="Governance"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
     alog [label="Hash-chained audit log", fillcolor="#d9f2d9", color="#2e7d32"];
+    runner [label="Agent runner (SHADOW MODE): asks a model about each waiting item and\nrecords a recommendation; a person still decides. One steward_agent key,\nHTTP only, a guard on every request, daily cap, kill switch. Never run with a real model", fillcolor="#fff0cc", color="#b26a00"];
+    replay [label="Replay (read-only): how would an agent have done on decisions\npeople already made? Evidence rebuilt as of the decision, answer hidden.\nTested on synthetic data; never run on real decisions", fillcolor="#fff0cc", color="#b26a00"];
     aud  [label="Merge audits (sampling)\n+ rollback", fillcolor="#d9f2d9", color="#2e7d32"];
-    lin  [label="Lineage of golden values", fillcolor="#d9f2d9", color="#2e7d32"];
     ten  [label="Tenant isolation\nevery query filters by tenant (48 of 48 removals caught by tests);\nPostgres row-level security is a second layer", fillcolor="#d9f2d9", color="#2e7d32"];
   }
   subgraph cluster_store { label="Storage layer"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    store[label="Store interface (98 methods)\nSqliteStore | PostgresStore\n(held to one interface by tests; one named exception)", fillcolor="#d9f2d9", color="#2e7d32"];
+    store[label="Store interface (107 methods)\nSqliteStore | PostgresStore\n(held to one interface by tests; one named exception)\nwrites in batches: ONE transaction per batch of records (store.batch);\na record's matching is atomic (a savepoint); realtime = a batch of one", fillcolor="#d9f2d9", color="#2e7d32"];
     dial [label="Dialect  (app/sql_dialect.py)\nschema text, placeholders, helpers;\nthe SQL sent is pinned by tests", fillcolor="#d9f2d9", color="#2e7d32"];
-    mig  [label="Migrations 1 to 16\n(append-only, checksummed)", fillcolor="#d9f2d9", color="#2e7d32"];
+    mig  [label="Migrations 1 to 18\n(append-only, checksummed)", fillcolor="#d9f2d9", color="#2e7d32"];
     sq   [shape=cylinder, label="SQLite\ndevelopment, tests,\nsmall installs", fillcolor="#d9f2d9", color="#2e7d32"];
     pg   [shape=cylinder, label="PostgreSQL\nproduction: complete in code\nbut NEVER RUN on a server", fillcolor="#fff0cc", color="#b26a00"];
   }
-  csv -> api; sf -> api [style=dashed];
-  ui -> api [dir=both];
-  api -> reg [lhead=cluster_eng]; 
-  reg -> std [ltail=cluster_eng, lhead=cluster_pipe];
-  std -> blk -> scr -> surv;
-  scr -> lrn [dir=both]; scr -> llm [style=dashed];
-  sep -> scr [style=dotted, constraint=false];
-  surv -> store [lhead=cluster_store];
-  alog -> store [dir=none, style=dotted, constraint=false]; aud -> store [dir=none, style=dotted, constraint=false];
-  lin -> surv [dir=back, style=dotted, constraint=false]; ten -> store [dir=none, style=dotted];
+  csv -> api; sf -> api [style=dashed]; ui -> api [dir=both]; mcp -> api [style=dashed, label="GET only"];
+  api -> d1; csv -> d2 [style=invis]; d1 -> land; d2 -> land; d3 -> land;
+  land -> k1 [lhead=cluster_k];
+  k3 -> h1 [style=dotted, dir=both, constraint=false]; k2 -> h2 [style=dotted, dir=both, constraint=false]; k1 -> h3 [style=dotted, dir=both, constraint=false];
+  k4 -> store [ltail=cluster_k];
+  lg1 -> k3 [style=dotted, label="alternative", constraint=false]; lg2 -> store [style=dotted, constraint=false];
+  alog -> store [dir=none, style=dotted, constraint=false]; aud -> store [dir=none, style=dotted, constraint=false]; ten -> store [dir=none, style=dotted];
   store -> dial; dial -> sq; dial -> pg; mig -> store [constraint=false];
-
-  subgraph cluster_leg { label="Legend"; style="rounded"; color="#999999"; fontsize=12; rank=sink;
+  subgraph cluster_leg { label="Legend"; style="rounded"; color="#999999"; fontsize=12;
     l1 [label="built and tested (on SQLite)", fillcolor="#d9f2d9", color="#2e7d32", fontsize=10];
     l2 [label="built; never run on a PostgreSQL server", fillcolor="#fff0cc", color="#b26a00", fontsize=10];
-    l3 [label="scaffold only", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed", fontsize=10];
-    l1 -> l2 -> l3 [style=invis, minlen=1];
+    l3 [label="legacy / scaffold only", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed", fontsize=10];
+    l1 -> l2 -> l3 [style=invis];
   }
 }

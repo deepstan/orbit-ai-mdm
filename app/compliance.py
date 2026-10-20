@@ -63,6 +63,9 @@ def purge_entity(store: Store, tenant_id: str, domain: str, entity_id: str, requ
         c for c in all_candidates if c.record_a_id in record_ids or c.record_b_id in record_ids
     ]
 
+    # An agent's REASONS may quote the data. A recommendation holds no decision worth keeping (the person's decision is on the candidate itself), so it is deleted.
+    recommendations_deleted = store.delete_recommendations(tenant_id, domain, [c.id for c in affected_candidates])
+
     for rec in source_records:
         store.delete_blocking_keys(rec.id, tenant_id, domain)
         store.clear_golden_dirty([(tenant_id, domain, entity_id)])
@@ -78,6 +81,7 @@ def purge_entity(store: Store, tenant_id: str, domain: str, entity_id: str, requ
             "source_records_deleted": len(source_records),
             "lineage_events_existed": len(lineage),
             "match_candidates_affected": len(affected_candidates),
+            "agent_recommendations_deleted": recommendations_deleted,
         },
     )
 

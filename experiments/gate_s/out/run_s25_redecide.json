@@ -1,0 +1,51 @@
+[
+  {
+    "workers": 1,
+    "mode": "sequential",
+    "f1": 0.9375890780886655,
+    "seconds": 34.24686930499979,
+    "records": 30835
+  },
+  {
+    "workers": 512,
+    "mode": "redecide",
+    "f1": 0.9377484437110928,
+    "delta_f1_points": 0.016,
+    "attempts": 30955,
+    "conflicts": 120,
+    "conflict_rate": 0.0039,
+    "false_alarm_share": 0.0,
+    "waves": 62,
+    "max_tries": 2,
+    "retried_records": 120,
+    "serialised": 0,
+    "rescored_groups": 13509,
+    "reused_scores": 51913,
+    "records_in_a_different_group_than_sequential": 6,
+    "hot_group_conflicts": 0,
+    "effective_parallelism": 510.0,
+    "seconds": 63.1,
+    "records": 30835
+  },
+  {
+    "workers": 4096,
+    "mode": "redecide",
+    "f1": 0.937689912593315,
+    "delta_f1_points": 0.01,
+    "attempts": 31853,
+    "conflicts": 1018,
+    "conflict_rate": 0.032,
+    "false_alarm_share": 0.0,
+    "waves": 9,
+    "max_tries": 3,
+    "retried_records": 1014,
+    "serialised": 0,
+    "rescored_groups": 77123,
+    "reused_scores": 135104,
+    "records_in_a_different_group_than_sequential": 63,
+    "hot_group_conflicts": 0,
+    "effective_parallelism": 3965.1,
+    "seconds": 64.9,
+    "records": 30835
+  }
+]

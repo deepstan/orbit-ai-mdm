@@ -1,54 +1,26 @@
-digraph target {
-  compound=true; rankdir=TB; nodesep=0.35; ranksep=0.5; fontname="Helvetica"; fontsize=22; labelloc=t;
-  label=<<B>Target design: ONE matching engine, many front doors</B><BR/><FONT POINT-SIZE="13">updated 2026-10-14  |  a PROTOTYPE in experiments/, not yet in the application  |  decided: follow Senzing and Reltio on updates and on merging groups</FONT>>;
+digraph next {
+  compound=true; rankdir=TB; nodesep=0.4; ranksep=0.55; fontname="Helvetica"; fontsize=22; labelloc=t;
+  label=<<B>WHAT REMAINS: from one engine to the 100-million-record target</B><BR/><FONT POINT-SIZE="13">updated 2026-10-16  |  the kernel is already the application's engine (previous page); these are the steps not yet built, in order  |  target: 100 million records in 12 hours = about 2,315 records per second</FONT>>;
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.16,0.09"];
-  edge [fontname="Helvetica", fontsize=9, color="#555555"];
-  proto="#dbe9ff"; 
-
-  subgraph cluster_doors { label="Front doors: all feed the SAME operation"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    d1 [label="Real-time arrival\n(API, one record)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    d2 [label="Update / delta\na changed record is matched again\nlike a fresh arrival (Senzing, Reltio)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    d3 [label="Bulk and onboarding\n= the same operation run by MANY workers\n(Gate S: NOT STARTED)", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
-    d4 [label="Reprocess / rematch\nhuman decisions kept as constraints\n(NOT BUILT)", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
+  edge [fontname="Helvetica", fontsize=10, color="#555555"];
+  now [label="TODAY, measured on SQLite, one core\nthe kernel writes in batches: 4,000 people in 5.6 s (715 records/s; 79 before), 50,000 in 101 s (490/s on average; the set-based legacy engine: 51 s)\n8 SQL statements per record (person; 16.8 before), 12 commits for 1,500 records; what is left on SQLite: Python overhead about 60%, statements 19%, scoring 18%, the kernel's own logic 3%\nthe rate still falls as the data grows (654 -> about 420 records/s): SQL write cost grows with the database; not solved", fillcolor="#d9f2d9", color="#2e7d32"];
+  s1 [label="DONE  Write in batches: one transaction per batch, a savepoint per record\nrealtime = a batch of one; a dying process loses at most the matching of the batch in flight (landing is durable)\nwritten for both databases; NEVER RUN on PostgreSQL", fillcolor="#d9f2d9", color="#2e7d32"];
+  s2 [label="DONE  Fewer statements: 16.8 -> 8.0 per record\na new entity written once with its golden record; lineage pooled per transaction; one lookup per chunk; no delete for new keys\nsame groups, pairs and golden records; on SQLite +4% to +15%; on PostgreSQL a round trip each (8.8 per record): unmeasured", fillcolor="#d9f2d9", color="#2e7d32"];
+  s2b [label="NEXT  A hot cache for the reads\n(blocking buckets, group members, staging: about 5 of the 8 statements left)\nprototype on SQLite (Gate P): 10.0 -> 0.78 statements per record, 194 -> 741 records/s", fillcolor="#dbe9ff", color="#1f4e9c"];
+  s3 [label="GATE P  records/second per worker on a REAL PostgreSQL\nbuilt (experiments/gate_p); run on SQLite only\nNEEDS YOUR SERVER: run it with a cache smaller than the data", fillcolor="#fff0cc", color="#b26a00"];
+  s4 [label="GATE S  many concurrent workers on one store\nSTEP 1 SIMULATED, PASSES: validate a read by RE-DECIDING, not by a group version\n(conflicts 0.1-12% at 8-4,096 workers; no hub entities in the data: the risk)\nSTEP 2 (real threads on PostgreSQL) NOT BUILT; needs Gate P's number first", fillcolor="#fff0cc", color="#b26a00"];
+  goal [label="100 million records in 12 hours\nabout 2,315 records/s overall", shape=box, fillcolor="#ffffff", color="#333333", style="rounded,filled,bold"];
+  now -> s1 -> s2 -> s2b -> s3 -> s4 -> goal;
+  subgraph cluster_rest { label="Also not in the application yet (prototype only, or not built)"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
+    r1 [label="Relationships between groups (households)\nlinked, not merged: prototype", fillcolor="#dbe9ff", color="#1f4e9c"];
+    r2 [label="Replayable event outbox for downstream systems\nprototype", fillcolor="#dbe9ff", color="#1f4e9c"];
+    r3 [label="'anchored' update setting\n(a record stays while it shares an identifier): prototype", fillcolor="#dbe9ff", color="#1f4e9c"];
+    r4 [label="Per-tenant engine setting\n(MDM_ENGINE is global today)", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
+    r5 [label="A disagreement report\nrecords where the kernel and the legacy engine differ, for a steward to label", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
+    r7 [label="Tier 3: an agent that may RESOLVE items\nthe read-only tier and recording a recommendation exist (page 1; the table is\nagent_recommendations) and so does the replay that tests an agent on past decisions;\nthe runner exists in shadow mode (it records, a person decides);\nauto-resolve is design only", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
+    r6 [label="The kernel on a live PostgreSQL\nits call pattern has never run there (runbook steps 6 to 8)", fillcolor="#fff0cc", color="#b26a00"];
   }
-  subgraph cluster_k { label="ONE engine:  resolve(record)   (experiments/kernel_v2.py; 34 tests)"; style="rounded,filled"; fillcolor="#f3f8ff"; color="#1f4e9c"; fontsize=14;
-    k1 [label="1  Standardize, make blocking keys", fillcolor="#d9f2d9", color="#2e7d32"];
-    k2 [label="2  Retrieve candidate GROUPS (never other records)\nkey cap 30; rank by rarity-weighted shared keys;\nscore only the top ~10 (a dial: calibrate per dataset)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    k3 [label="3  Score the record against each group's FEATURE SET\n(every value the group has seen; best match per field)\npluggable scorer: Corroborated (default: a changed surname is not a\ndifferent person when two identifiers + first name agree) | FrequencyAware | Rule | learned", fillcolor="#dbe9ff", color="#1f4e9c"];
-    k4 [label="4  Decide\njoin the best group | start a new group | queue a review\n| link a household | MERGE two groups whose goldens match (auto)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    k5 [label="5  Rebuild the golden record\n(a VIEW derived from the members by survivorship)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    k6 [label="6  Append events to the OUTBOX\n(replaying them rebuilds groups and links exactly)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    k1 -> k2 -> k3 -> k4 -> k5 -> k6;
-  }
-  subgraph cluster_state { label="State: behind ONE interface (same answers in every mode, proven by tests)"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    mem  [label="MemoryState\ndictionaries (the reference)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    sqls [label="SqlState\nhot cache (LRU, bounded) + pending writes\nflushed in ONE transaction per batch\n(naive 10.0 statements per record -> 0.78 batched, on SQLite)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    sqa  [label="SQLite adapter\n(tested)", fillcolor="#d9f2d9", color="#2e7d32"];
-    pga  [label="PostgreSQL adapter\nNEVER RUN on a server", fillcolor="#fff0cc", color="#b26a00"];
-    shim [label="PostgreSQL text run on SQLite\n(static check of the SQL emitted)", fillcolor="#d9f2d9", color="#2e7d32"];
-  }
-  subgraph cluster_res { label="Results"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    r1 [label="Groups + golden records", fillcolor="#dbe9ff", color="#1f4e9c"];
-    r2 [label="Relationships (households)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    r3 [label="Review items", fillcolor="#dbe9ff", color="#1f4e9c"];
-    r4 [label="Event outbox\n(for downstream systems and audits)", fillcolor="#dbe9ff", color="#1f4e9c"];
-    r5 [label="Audits, unmerge, learned scorer\non groups: NOT PORTED YET", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
-  }
-  subgraph cluster_gates { label="Gates: experiments that decide what is built next"; style="rounded,filled"; fillcolor="#fffdf3"; color="#b26a00"; fontsize=13;
-    gp [label="Gate P (Persistence)\nrecords/second per worker on a REAL Postgres\nBUILT; run on SQLite only.\nNEEDS YOUR SERVER: run it with a cache smaller than the data", fillcolor="#fff0cc", color="#b26a00"];
-    gs [label="Gate S (Scale)\nmany concurrent workers on one store: a version per group,\noptimistic commits, a redo queue (Senzing's pattern)\nNOT STARTED; waits for Gate P's number", fillcolor="#eeeeee", color="#777777", style="rounded,filled,dashed"];
-  }
-  subgraph cluster_set { label="Settings (each measured; each can be changed per customer)"; style="rounded,filled"; fillcolor="#fafafa"; color="#999999"; fontsize=13;
-    set [label="update_policy: rematch (default) | anchored (Ataccama-style)\nmerge_groups: auto (default) | propose | off\nscorer, key cap, ranking, top-N candidates, cache sizes", fillcolor="#dbe9ff", color="#1f4e9c"];
-  }
-  d1 -> k1 [lhead=cluster_k]; d2 -> k1; d3 -> k1 [style=dashed]; d4 -> k1 [style=dashed];
-  k3 -> mem [ltail=cluster_k, lhead=cluster_state, dir=both];
-  sqls -> sqa; sqls -> pga; sqls -> shim [style=dotted];
-  mem -> r1 [style=invis]; k6 -> r4 [constraint=false, style=dotted];
-  sqls -> r1 [lhead=cluster_res];
-  gp -> sqls [style=dashed, constraint=false, label="measures"]; gs -> k4 [style=dashed, constraint=false, label="needs a version\nper group"];
-  set -> k2 [style=dotted, constraint=false];
-
+  s4 -> r1 [style=invis]; 
   subgraph cluster_leg { label="Legend"; style="rounded"; color="#999999"; fontsize=12;
     l0 [label="in the application AND tested", fillcolor="#d9f2d9", color="#2e7d32", fontsize=10];
     l1 [label="prototype in experiments/ (tested there)", fillcolor="#dbe9ff", color="#1f4e9c", fontsize=10];

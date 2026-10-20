@@ -272,7 +272,7 @@ class TestTheMigration(Fresh):
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
         conn.close()
         self.assertIn("idx_entity_vendor_tenant_entity", names)
-        self.assertEqual(MIGRATIONS[-1].version, 16)
+        self.assertEqual([m.version for m in MIGRATIONS if m.name == "paging_indexes"], [16])        # the migration that makes the indexes for the tables that exist then
 
 
 if __name__ == "__main__":

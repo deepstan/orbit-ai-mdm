@@ -53,7 +53,8 @@ from contextlib import contextmanager
 
 from . import golden, protect
 from .migrations import PostgresMigrationBackend, apply_or_verify, auto_migrate_enabled
-from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, SourceRecord, UsageEvent, now_iso
+from .sql_dialect import get_dialect
+from .models import ApiKeyRecord, AuditLogEntry, Entity, LineageEvent, MatchCandidate, Recommendation, SourceRecord, UsageEvent, now_iso
 
 
 def _j(value):
@@ -117,6 +118,8 @@ class PostgresStore:
         self.database_url = database_url
         self._lock = threading.RLock()
         self._connection = None
+        self._batch_depth = 0      # > 0 while a batch is open; only the thread that holds self._lock can see or change it
+        self._savepoints = 0
         self._auto_migrate = auto_migrate
         self._entity_synced: dict = {}
         self._init_schema(auto_migrate)
@@ -151,15 +154,73 @@ class PostgresStore:
         """
         with self._lock:
             conn = self._get_connection()
+            batched = self._batch_depth > 0        # inside a batch the BATCH commits or rolls back (and a savepoint undoes one block), not every call
             try:
                 if tenant_id is not None:
                     with conn.cursor() as cur:
-                        cur.execute("SET LOCAL app.current_tenant_id = %s", (tenant_id,))
+                        cur.execute("SET LOCAL app.current_tenant_id = %s", (tenant_id,))      # set again on every call: it lasts for the whole transaction
                 yield conn
-                conn.commit()
+                if not batched:
+                    conn.commit()
             except Exception:
+                if not batched:
+                    conn.rollback()
+                raise
+
+    # --- units of work ------------------------------------------------
+    @staticmethod
+    def _tx(conn, *statements: str) -> None:
+        """Transaction control (SAVEPOINT ...): standard SQL, and the ONLY place the units of work execute any (the portability ratchet counts it once)."""
+        with conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+
+    def in_batch(self) -> bool:
+        return self._batch_depth > 0
+
+    @contextmanager
+    def batch(self, domain: str | None = None):
+        """ONE transaction for everything the block writes, committed at the end (or rolled back whole if the block raises): one commit, not one per store call. Reentrant. The store
+        keeps ONE connection, so other threads of this process wait on the lock until the batch ends (as they already waited per call). `domain`: see the SQLite store."""
+        if domain is not None:
+            self._ensure_entity_table(domain)
+        with self._lock:
+            if self._batch_depth > 0:
+                self._batch_depth += 1
+                try:
+                    yield
+                finally:
+                    self._batch_depth -= 1
+                return
+            conn = self._get_connection()
+            self._batch_depth, self._savepoints = 1, 0
+            try:
+                yield
+                conn.commit()
+            except BaseException:
                 conn.rollback()
                 raise
+            finally:
+                self._batch_depth = 0
+
+    @contextmanager
+    def savepoint(self):
+        """Inside a batch: if the block raises, only ITS writes are undone (this also clears Postgres's 'transaction aborted' state) and the exception goes on. Outside a batch: nothing."""
+        if self._batch_depth == 0:
+            yield
+            return
+        with self._lock:
+            conn = self._get_connection()
+            self._savepoints += 1
+            name = f"mdm_sp_{self._savepoints}"
+            self._tx(conn, f"SAVEPOINT {name}")
+            try:
+                yield
+            except BaseException:
+                self._tx(conn, f"ROLLBACK TO SAVEPOINT {name}", f"RELEASE SAVEPOINT {name}")
+                raise
+            else:
+                self._tx(conn, f"RELEASE SAVEPOINT {name}")
 
     def _init_schema(self, auto_migrate: bool | None = None) -> None:
         """The schema is owned by app/migrations. Runs on its own dedicated
@@ -300,6 +361,9 @@ class PostgresStore:
         cols = self._entity_columns(domain)
         if cols is None or self._entity_synced.get(domain) == tuple(cols):
             return
+        if self.in_batch():
+            raise RuntimeError(f"the golden table for domain {domain!r} has not been checked yet, and the check cannot run inside a batch (it opens its own connection and would wait "
+                               f"for this transaction for ever): open the batch with store.batch(domain={domain!r})")
         golden.ensure_or_verify(PostgresMigrationBackend(self.database_url), domain, cols, auto_migrate_enabled(self._auto_migrate))
         self._entity_synced[domain] = tuple(cols)
 
@@ -625,16 +689,37 @@ class PostgresStore:
             rows = cur.fetchall()
         return [self._row_to_source_record(r) for r in rows]
 
-    def replace_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]]) -> None:
-        deletes = [(t, d, rid) for t, d, rid, _ in entries]
+    def replace_blocking_keys_batch(self, entries: list[tuple[str, str, str, set[str]]], fresh: bool = False) -> None:
+        """fresh=True: these records are NEW and cannot hold keys yet, so nothing is deleted (one statement fewer)."""
+        deletes = [] if fresh else [(t, d, rid) for t, d, rid, _ in entries]
         inserts = [(t, d, rid, k) for t, d, rid, keys in entries for k in keys]
         with self._conn() as conn, conn.cursor() as cur:
-            cur.executemany(
-                "DELETE FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = %s", deletes)
+            if deletes:
+                cur.executemany(
+                    "DELETE FROM blocking_keys WHERE tenant_id = %s AND domain = %s AND record_id = %s", deletes)
             cur.executemany(
                 "INSERT INTO blocking_keys (tenant_id, domain, record_id, blocking_key) VALUES (%s, %s, %s, %s)", inserts)
 
     # --- Bucket sizes and statistics (see matching.py / domains_cli.py blocking-stats) ---
+    def iter_blocking_keys(self, tenant_id: str, domain: str, page: int = 50_000):
+        last = None
+        while True:
+            sql, params = "SELECT DISTINCT blocking_key FROM blocking_keys WHERE tenant_id = %s AND domain = %s", [tenant_id, domain]
+            if last is not None:
+                sql, params = sql + " AND blocking_key > %s", params + [last]
+            with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+                cur.execute(sql + " ORDER BY blocking_key LIMIT %s", (*params, page))
+                rows = cur.fetchall()
+            if not rows:
+                return
+            yield [r["blocking_key"] for r in rows]
+            last = rows[-1]["blocking_key"]
+
+    def count_blocking_keys(self, tenant_id: str, domain: str) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM blocking_keys WHERE tenant_id = %s AND domain = %s", (tenant_id, domain))
+            return cur.fetchone()["n"]
+
     def blocking_bucket_sizes(self, tenant_id: str, domain: str, keys: set[str]) -> dict[str, int]:
         if not keys:
             return {}
@@ -727,13 +812,19 @@ class PostgresStore:
         return self._row_to_source_record(row) if row else None
 
     def find_source_records_by_keys(self, tenant_id: str, domain: str, keys) -> dict:
-        out = {}
+        """{(source_system, source_record_id): the latest record held} for the keys that are held. ONE query per source system per chunk of ids (it used to be one query per key)."""
+        by_system: dict = {}
+        for source_system, source_record_id in keys:
+            by_system.setdefault(source_system, []).append(source_record_id)
+        d, out = get_dialect("postgres"), {}
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
-            for source_system, source_record_id in keys:
-                cur.execute(self._NATURAL, (tenant_id, domain, source_system, source_record_id))
-                row = cur.fetchone()
-                if row:
-                    out[(source_system, source_record_id)] = self._row_to_source_record(row)
+            for source_system, ids in by_system.items():
+                for chunk in d.chunks(ids):
+                    cond, params = d.in_list("source_record_id", chunk)
+                    cur.execute(f"SELECT * FROM source_records WHERE tenant_id = %s AND domain = %s AND source_system = %s AND {cond} "
+                                f"ORDER BY ingested_at DESC, id DESC", (tenant_id, domain, source_system, *params))
+                    for row in cur.fetchall():
+                        out.setdefault((source_system, row["source_record_id"]), self._row_to_source_record(row))   # newest first: the first one seen is the latest
         return out
 
     def update_source_record(self, rec_id: str, tenant_id: str, domain: str, attributes: dict, content_hash: str, version: int) -> None:
@@ -1196,6 +1287,63 @@ class PostgresStore:
         with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS n FROM match_candidates WHERE tenant_id = %s AND domain = %s AND status = 'pending'", (tenant_id, domain))
             return cur.fetchone()["n"]
+
+    # --- agent recommendations (see the SQLite store) ---
+    @staticmethod
+    def _recommendation_from_row(r) -> Recommendation:
+        return Recommendation(candidate_id=r["candidate_id"], recommendation=r["recommendation"], confidence=r["confidence"], agent=r["agent"], reasons=json.loads(r["reasons"]),
+                              evidence=json.loads(r["evidence"]), model=r["model"], prompt_version=r["prompt_version"], id=r["id"], tenant_id=r["tenant_id"], domain=r["domain"],
+                              created_at=r["created_at"], outcome=r["outcome"], outcome_decision=r["outcome_decision"], outcome_by=r["outcome_by"], outcome_at=r["outcome_at"],
+                              outcome_seen=None if r["outcome_seen"] is None else bool(r["outcome_seen"]))
+
+    def save_recommendation(self, rec: Recommendation) -> Recommendation:
+        sql = get_dialect("postgres").upsert("agent_recommendations", ["id", "tenant_id", "domain", "candidate_id", "recommendation", "confidence", "reasons", "evidence", "agent", "model", "prompt_version", "created_at"], key=["tenant_id", "domain", "candidate_id", "agent", "model", "prompt_version"],
+                                             update=["recommendation", "confidence", "reasons", "evidence", "created_at"])
+        with self._conn(tenant_id=rec.tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(sql, (rec.id, rec.tenant_id, rec.domain, rec.candidate_id, rec.recommendation, rec.confidence, json.dumps(rec.reasons), json.dumps(rec.evidence), rec.agent,
+                              rec.model, rec.prompt_version, rec.created_at))
+            cur.execute("SELECT * FROM agent_recommendations WHERE tenant_id = %s AND domain = %s AND candidate_id = %s AND agent = %s AND model = %s AND prompt_version = %s",
+                        (rec.tenant_id, rec.domain, rec.candidate_id, rec.agent, rec.model, rec.prompt_version))
+            return self._recommendation_from_row(cur.fetchone())
+
+    def list_recommendations_for(self, tenant_id: str, domain: str, candidate_id: str) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM agent_recommendations WHERE tenant_id = %s AND domain = %s AND candidate_id = %s ORDER BY created_at DESC, id DESC", (tenant_id, domain, candidate_id))
+            return [self._recommendation_from_row(r) for r in cur.fetchall()]
+
+    def recommendations_page(self, tenant_id: str, domain: str, limit: int, after=None, outcome: str | None = None) -> list:
+        sql, params = "SELECT * FROM agent_recommendations WHERE tenant_id = %s AND domain = %s", [tenant_id, domain]
+        if outcome == "open":
+            sql += " AND outcome IS NULL"
+        elif outcome:
+            sql, params = sql + " AND outcome = %s", params + [outcome]
+        if after is not None:
+            sql, params = sql + " AND " + get_dialect("postgres").keyset_after(["created_at", "id"], descending=True), params + [after[0], after[1]]
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute(sql + " ORDER BY created_at DESC, id DESC LIMIT %s", (*params, limit))
+            return [self._recommendation_from_row(r) for r in cur.fetchall()]
+
+    def record_recommendation_outcomes(self, tenant_id: str, domain: str, candidate_id: str, decision: str, decided_by: str, decided_at: str, suggestion_viewed: bool | None = None) -> int:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("UPDATE agent_recommendations SET outcome = CASE WHEN recommendation = 'needs_human' THEN 'human_decided' WHEN recommendation = %s THEN 'agreed' ELSE 'disagreed' END, "
+                        "outcome_decision = %s, outcome_by = %s, outcome_at = %s, outcome_seen = %s WHERE tenant_id = %s AND domain = %s AND candidate_id = %s AND outcome IS NULL",
+                        (decision, decision, decided_by, decided_at, None if suggestion_viewed is None else int(bool(suggestion_viewed)), tenant_id, domain, candidate_id))
+            return cur.rowcount
+
+    def recommendation_counts(self, tenant_id: str, domain: str, limit: int = 20000) -> list:
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            cur.execute("SELECT recommendation, outcome, confidence, outcome_seen, COUNT(*) AS n FROM agent_recommendations WHERE tenant_id = %s AND domain = %s "
+                        "GROUP BY recommendation, outcome, confidence, outcome_seen LIMIT %s", (tenant_id, domain, limit))
+            return [(r["recommendation"], r["outcome"], r["confidence"], None if r["outcome_seen"] is None else bool(r["outcome_seen"]), r["n"]) for r in cur.fetchall()]
+
+    def delete_recommendations(self, tenant_id: str, domain: str, candidate_ids) -> int:
+        d, n = get_dialect("postgres"), 0
+        with self._conn(tenant_id=tenant_id) as conn, conn.cursor() as cur:
+            for chunk in d.chunks(list(candidate_ids)):
+                cond, params = d.in_list("candidate_id", chunk)
+                cur.execute(f"DELETE FROM agent_recommendations WHERE tenant_id = %s AND domain = %s AND {cond}", (tenant_id, domain, *params))
+                n += cur.rowcount
+        return n
 
     def get_source_records_batch(self, tenant_id: str, domain: str, record_ids) -> dict:
         ids, out = list(dict.fromkeys(record_ids)), {}

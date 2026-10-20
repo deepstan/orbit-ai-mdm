@@ -15,6 +15,7 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
+from legacy_engine import legacy_engine  # noqa: E402
 
 from test_bulk_engine import ROOT, TENANT  # noqa: E402
 from test_labels_and_audits import Labels  # noqa: E402
@@ -55,6 +56,7 @@ class Promotion(Labels):
         return self.q(path, "SELECT candidate_id FROM merge_audits")
 
 
+@legacy_engine   # compares the LEGACY engines with each other (the kernel has its own tests: tests/test_kernel_engine.py)
 class TestPromotionIsTheSameEverywhere(Promotion):
     def test_every_engine_agrees_with_the_reference_when_a_scorer_is_live(self):
         scorer, _ = self.install(tenant=offline.TENANT)                                          # the equivalence engines run under their own tenant

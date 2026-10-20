@@ -27,6 +27,7 @@ never incur an API call, to control cost as the architecture doc specifies.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -35,7 +36,24 @@ from typing import Optional
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-MODEL = "claude-sonnet-4-6"  # keep in sync with whatever your account has access to
+MODEL = "claude-sonnet-4-6"  # the default only: set MDM_LLM_MODEL to a model your account can use (this name was a guess about what an account has access to, and nothing here ever ran against the real API)
+
+
+def model_name() -> str:
+    return os.environ.get("MDM_LLM_MODEL") or MODEL
+
+
+_warned = False
+
+
+def _deprecation_notice() -> None:
+    """Said once per process. This single-shot judge compares ONE record with the closest ONE member of a group (blind to the rest of the group), has never run against the real API, and is not
+    measured against what stewards decide. The agent runner (agent_runner.py, docs/agent-runner.md) replaces it: it sees whole groups, records a recommendation instead of deciding, is measured
+    (agreement, calibration, false merges) and has caps and a kill switch."""
+    global _warned
+    if not _warned:
+        _warned = True
+        logging.getLogger("mdm.llm_adjudication").warning("ENABLE_LLM_ADJUDICATION is DEPRECATED: it will be removed once the agent runner (agent_runner.py) has shadow-mode results to compare with. See docs/agent-runner.md")
 
 # Only the genuinely ambiguous band gets sent to the LLM. Below this,
 # fuzzy scoring already handles it (auto-merge or clear no-match); the
@@ -51,10 +69,13 @@ class AdjudicationResult:
 
 
 def is_enabled() -> bool:
-    return (
+    enabled = (
         os.environ.get("ENABLE_LLM_ADJUDICATION", "").lower() in ("1", "true", "yes")
         and bool(os.environ.get("ANTHROPIC_API_KEY"))
     )
+    if enabled:
+        _deprecation_notice()
+    return enabled
 
 
 def in_adjudication_band(score: float) -> bool:
@@ -97,7 +118,7 @@ def adjudicate(record_a: dict, record_b: dict, fuzzy_reasons: list[str], domain:
         return None
 
     payload = {
-        "model": MODEL,
+        "model": model_name(),
         "max_tokens": 300,
         "messages": [{"role": "user", "content": _build_prompt(record_a, record_b, fuzzy_reasons, domain)}],
     }

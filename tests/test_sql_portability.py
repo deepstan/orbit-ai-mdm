@@ -49,11 +49,11 @@ BASELINE = {'FEATURES': {'ON CONFLICT (upsert)': {'db.py': 4, 'db_postgres.py': 
                                            'sql_dialect.py': 1},
              'calls .execute( or .executemany(': {'benchmark_person.py': 9,
                                                   'bulk.py': 76,
-                                                  'db.py': 126,
-                                                  'db_postgres.py': 126,
+                                                  'db.py': 136,            # +1: Store._tx, the one place the unit of work (batch, savepoint) executes transaction control; +7: the agent_recommendations methods (standard SQL; the upsert and the paging go through the dialect); +2: iter_blocking_keys, count_blocking_keys (the key filter)
+                                                  'db_postgres.py': 136,   # +1: the same helper; +7: the agent_recommendations methods
                                                   'golden.py': 11,
                                                   'migrations/runner.py': 16,
-                                                  'migrations/versions.py': 18},
+                                                  'migrations/versions.py': 19},   # +1: migration 18 adds one column (guarded by ctx.columns, so it runs once)
              "branches on the backend's name": {'fieldtypes.py': 2, 'migrations/runner.py': 3, 'migrations/versions.py': 4, 'sql_dialect.py': 1}}}
 
 

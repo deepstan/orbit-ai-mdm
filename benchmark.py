@@ -102,6 +102,14 @@ def main() -> int:
     cmp_.add_argument("after")
     args = parser.parse_args()
 
+    if args.command in ("engines", "equivalence"):
+        from app import kernel
+        if kernel.engine() == "kernel":
+            print(f"`benchmark.py {args.command}` compares the LEGACY pairwise engines with each other and with the pairwise reference matcher (app/offline.py). The default engine is now the "
+                  f"kernel, which is order-sensitive by design and is not expected to equal that reference.\nRun it as:  MDM_ENGINE=legacy python3 benchmark.py {args.command} ...\n"
+                  f"(The kernel's own checks are tests/test_kernel_engine.py and experiments/hard_cases.py.)", file=sys.stderr)
+            return 2
+
     if args.command == "engines":
         from app import benchmark_person
         try:

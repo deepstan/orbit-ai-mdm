@@ -17,6 +17,9 @@ Roles (per the architecture doc's Section 7):
   - data_steward  : ingest + resolve the review queue within their
                     allowed domains. Can't retrain, manage keys, or purge.
   - api_consumer  : read-only within their allowed domains.
+  - steward_agent : for an AI agent working next to the stewards (see docs/mcp-server.md): read-only, like api_consumer, PLUS it may read the audit sample. It cannot
+                    ingest, resolve, unmerge, purge or administer anything. Its one write is `propose_decision`: it may RECORD a recommendation about a review item (which changes
+                    nothing and is later compared with what a person decided); it never has `resolve_review_queue` unless a person upgrades the key.
 
 No SSO provider (Auth0/Ory/Keycloak) integration here -- that needs a
 real running service this sandbox can't reach. API keys are the
@@ -32,13 +35,15 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Optional
 
-ROLES = ("tenant_admin", "domain_admin", "data_steward", "api_consumer")
+ROLES = ("tenant_admin", "domain_admin", "data_steward", "api_consumer", "steward_agent")
 
 # action -> roles allowed to perform it. Checked via has_permission() below.
 PERMISSIONS: dict[str, tuple[str, ...]] = {
     "ingest": ("tenant_admin", "domain_admin", "data_steward"),
     "resolve_review_queue": ("tenant_admin", "domain_admin", "data_steward"),
-    "view": ("tenant_admin", "domain_admin", "data_steward", "api_consumer"),
+    "view": ("tenant_admin", "domain_admin", "data_steward", "api_consumer", "steward_agent"),
+    "view_audits": ("tenant_admin", "domain_admin", "data_steward", "steward_agent"),
+    "propose_decision": ("tenant_admin", "domain_admin", "steward_agent"),     # RECORD a recommendation about a review item; it changes nothing (resolving one is resolve_review_queue)   # read the sample of automatic merges (to check them is resolve_review_queue)
     "retrain": ("tenant_admin", "domain_admin"),
     "manage_api_keys": ("tenant_admin",),
     "purge": ("tenant_admin",),          # right-to-be-forgotten

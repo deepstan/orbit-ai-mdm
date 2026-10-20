@@ -45,5 +45,5 @@ Checked by deliberate breakage: 11 of 11 breakages of the dialect, the schema co
 * **PostgreSQL has never run.** The PostgreSQL halves of the new contract tests (`exec_sql`, the helpers, the probes) are unrun code: if one fails on a real server, read it as a bug in that test first.
 * **`db_postgres.py` was not rewritten** to use the dialect helpers: its 12 upserts and 14 array lookups are unchanged, because changing that file blind would risk the one thing the pinned SQL guards. They move when a server is available to test the result.
 * The 20 methods in `NOT_YET_PROBED` (11 reads that need data the test does not seed, 9 writes that need set-up of their own) are untested for isolation.
-* `bulk.py` runs on local scratch SQLite files whatever the store is (it is retired by the single-engine design); `setup_rls.py` is PostgreSQL-only by nature.
+* `bulk.py` (now the legacy `--legacy-bulk` engine) runs on local scratch SQLite files whatever the store is; the kernel, which is the default engine, calls only the store methods that already existed, so it needed no new SQL and no dialect work; `setup_rls.py` is PostgreSQL-only by nature.
 * `MigrationContext` still branches on how to CALL each driver (cursor against connection): driver plumbing, not SQL text.

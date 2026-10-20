@@ -34,77 +34,13 @@ from app.standardize import standardize  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------ 5. the scorer interface
-@dataclass
-class Result:
-    score: float
-    match_type: str
-    reasons: list = field(default_factory=list)
-    contributions: list = field(default_factory=list)
-
-
-class Context:
-    """What a scorer may ask about the world besides the two sides: how many OTHER groups hold an identifier value."""
-
-    def __init__(self, holders: dict, exclude: frozenset):
-        self._holders, self._exclude = holders, exclude
-
-    def others_holding(self, f: str, v: str) -> int:
-        return len(self._holders.get((f, v), set()) - self._exclude)
+# The scorers (Result, Context, RuleScorer, FrequencyAwareScorer, CorroboratedScorer) live in app/kernel.py: they are what the application runs, and this prototype is measured
+# against the SAME code, so the two cannot drift apart. The Scorer protocol below documents the interface.
+from app.kernel import Context, CorroboratedScorer, FrequencyAwareScorer, Result, RuleScorer  # noqa: E402
 
 
 class Scorer(Protocol):
     def score(self, record: dict, view: dict, ctx: Context) -> Result: ...
-
-
-class RuleScorer:
-    """The current scorer, unchanged."""
-
-    def __init__(self, config):
-        self.config = config
-
-    def score(self, record: dict, view: dict, ctx: Context) -> Result:
-        sb = score_pair(record, view, self.config)
-        return Result(sb.score, sb.match_type, list(sb.reasons), list(sb.contributions))
-
-
-class FrequencyAwareScorer(RuleScorer):
-    """An identifier that many groups hold does not identify anyone: an exact match on it is capped below auto-merge UNLESS the names corroborate (both first and last
-    name present on both sides and agreeing). A record that is only an email, or only a phone, cannot be auto-merged into any of the groups that happen to hold it."""
-
-    def __init__(self, config, shared_by: int = 3, cap: float = 0.80):
-        super().__init__(config)
-        self.shared_by, self.cap = shared_by, cap
-
-    @staticmethod
-    def _names_corroborate(record: dict, view: dict) -> bool:
-        return all(record.get(f) and view.get(f) and similarity(record[f], view[f]) >= 0.85 for f in ("first_name", "last_name"))
-
-    def score(self, record: dict, view: dict, ctx: Context) -> Result:
-        r = super().score(record, view, ctx)
-        if r.match_type != "deterministic" or self._names_corroborate(record, view):
-            return r
-        for f in self.config.deterministic_fields:
-            v = record.get(f)
-            n = ctx.others_holding(f, v) if v and view.get(f) == v else 0
-            if n >= self.shared_by and r.score > self.cap:
-                r.reasons.append(f"{f} is held by {n} other groups: it does not identify anyone")
-                r.score = self.cap
-        return r
-
-
-class CorroboratedScorer(FrequencyAwareScorer):
-    """A changed SURNAME must not undo an otherwise certain match. When two identifiers agree (email AND phone) and the first name agrees, a different last name is a changed name
-    (marriage, divorce), so the last-name penalty is given back. Two different people who share an email and a phone have different first names, so they stay penalised."""
-
-    def score(self, record: dict, view: dict, ctx: Context) -> Result:
-        r = super().score(record, view, ctx)
-        if r.match_type != "deterministic" or not any("last_name disagrees" in x for x in r.reasons):
-            return r
-        agreeing = [f for f in self.config.deterministic_fields if record.get(f) and record.get(f) == view.get(f)]
-        if len(agreeing) >= 2 and similarity(record.get("first_name", ""), view.get("first_name", "")) >= 0.85:
-            r.score = min(r.score + self.config.mismatch_penalties.get("last_name", 0.0), matching.DETERMINISTIC_SCORE)
-            r.reasons.append(f"last_name differs, but {' and '.join(agreeing)} agree and so does the first name: a changed name, not a different person")
-        return r
 
 
 # ------------------------------------------------------------------------------------------------ the kernel

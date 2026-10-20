@@ -58,7 +58,7 @@ class TestTheQueue(Audited):
     def test_it_says_in_advance_whether_a_merge_can_be_unmerged_and_what_would_move(self):
         by_id = {i["candidate_id"]: i for i in self.queue()["items"]}
         self.assertEqual(by_id[self.ab]["unmerge"], {"possible": True, "moves": 2, "stays": 1})
-        self.ingest("D", D)                                                                         # D joins A, B and C: A-B is now also joined through D
+        self.ingest_tied_every_way("D", D)                                                          # D joins A, B and C: A-B is now also joined through D
         by_id = {i["candidate_id"]: i for i in self.queue()["items"]}
         self.assertFalse(by_id[self.ab]["unmerge"]["possible"])
         self.assertIn("still joined through other confirmed pairs", by_id[self.ab]["unmerge"]["why"])
@@ -86,7 +86,7 @@ class TestVerdicts(Audited):
         self.assertEqual(self.store.get_candidate(self.ab, TENANT, DOMAIN).decided_by, "unmerge:jane")
 
     def test_when_it_cannot_unmerge_the_verdict_is_kept_and_the_reason_given(self):
-        self.ingest("D", D)
+        self.ingest_tied_every_way("D", D)
         r = give_verdict(self.store, TENANT, DOMAIN, self.ab, "wrong", "jane", unmerge=True)
         self.assertEqual(r["verdict"], "wrong")
         self.assertFalse(r["unmerge"]["ok"])

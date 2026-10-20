@@ -198,6 +198,22 @@
   .badge.model { color: var(--warn); border-color: var(--warn); }
   .more { text-align: center; margin: 14px 0; }
   .note { font-size: 12px; color: var(--muted, #8a93a6); }
+  /* the assistant's suggestion: advisory, and CLOSED until a steward chooses to read it. "merge" and "not a match" look the same on purpose: it must not nudge. */
+  details.suggest { margin: 12px 18px 0 18px; border: 1px dashed var(--border); border-radius: 6px; background: var(--panel-alt); }
+  details.suggest > summary { cursor: pointer; padding: 8px 12px; font-size: 12px; color: var(--text-dim); list-style: none; }
+  details.suggest > summary::-webkit-details-marker { display: none; }
+  details.suggest > summary::before { content: '\25B8  '; }
+  details.suggest[open] > summary::before { content: '\25BE  '; }
+  details.suggest[open] > summary { color: var(--text); border-bottom: 1px dashed var(--border); }
+  .suggest-body { padding: 4px 12px 10px 12px; font-size: 13px; }
+  .opinion { padding: 10px 0; border-top: 1px solid var(--border); }
+  .opinion:first-child { border-top: 0; }
+  .verdict { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 12px; border: 1px solid var(--accent-dim); color: var(--accent); background: rgba(63,169,245,0.08); }
+  .verdict.unsure { border-color: var(--warn); color: var(--warn); background: rgba(224,169,62,0.08); }
+  .opinion .conf { font-family: var(--mono); font-size: 12px; color: var(--text-dim); margin-left: 8px; }
+  .opinion ul { margin: 6px 0 0 0; padding-left: 18px; }
+  .opinion .meta { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+  .suggest-note { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -287,6 +303,7 @@ function renderTabs(counts) {
 
 function switchDomain(domain) {
   currentDomain = domain;
+  suggestionHints = new Set(); suggestionsLoaded = {}; suggestionErrors = new Set(); suggestionsOpen = new Set(); suggestionsViewed = new Set(); suggestionStats = null;
   resetPages();
   loadAll();
 }
@@ -319,6 +336,95 @@ function renderContributions(list) {
   return `<table class="contrib"><thead><tr><th>field</th><th>evidence</th><th>similarity</th><th>points</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The assistant's suggestions (docs/agent-runner.md). ADVISORY: a model's recorded opinion about an item, which changed nothing and can be wrong.
+//  * It is shown only when a steward OPENS it. Until then the page holds nothing of what it says (only that one exists), so "closed" means "not seen".
+//  * Whether it was opened before the decision is sent with the decision (suggestion_viewed), so that agreement with the assistant can be measured on the decisions it did NOT influence.
+//  * It is deliberately plain: merge and not-a-match look the same, there is no "accept" button, and the two real buttons are not touched by it.
+//  * What it says was written by a model reading source data, so it is untrusted like any other data and goes through esc().
+// ---------------------------------------------------------------------------------------------------------------------------------
+let suggestionHints = new Set();      // candidate ids for which an opinion exists (known without reading it)
+let suggestionsLoaded = {};           // candidate id -> its opinions, fetched only once a steward has opened the panel
+let suggestionErrors = new Set();
+let suggestionsOpen = new Set();      // panels open right now (kept across the 8-second refresh)
+let suggestionsViewed = new Set();    // opened at least once on this page: the decision then says suggestion_viewed: true
+let suggestionStats = null;
+const VERDICTS = { confirm: 'Same entity: merge', reject: 'Not a match', needs_human: "Can't tell: needs a person" };
+
+function renderOpinion(r) {
+  const label = VERDICTS[r.recommendation] || r.recommendation;
+  const conf = Number(r.confidence);
+  const reasons = (r.reasons || []).map(x => `<li>${esc(x)}</li>`).join('');
+  const meta = [r.agent, r.model, r.prompt_version, r.created_at].filter(x => x).map(esc).join(' \u00B7 ');
+  return `<div class="opinion">
+      <span class="verdict ${r.recommendation === 'needs_human' ? 'unsure' : ''}">${esc(label)}</span><span class="conf">${Number.isFinite(conf) ? esc(Math.round(conf * 100)) + '% sure' : ''}</span>
+      ${reasons ? `<ul>${reasons}</ul>` : ''}
+      <div class="meta">${meta}</div>
+    </div>`;
+}
+
+function suggestionFooter() {
+  let track = '';
+  if (suggestionStats && suggestionStats.decided > 0) {
+    track = ` So far its suggestions have matched stewards' decisions in ${esc(suggestionStats.agreed)} of ${esc(suggestionStats.decided)} decided cases` +
+            (suggestionStats.decided < 30 ? ' (too few to say how reliable it is).' : '.');
+  }
+  return `<div class="suggest-note">An AI model's opinion, recorded for you to consider. It changed nothing and it can be wrong. You decide.${track}</div>`;
+}
+
+function renderSuggestion(candidateId) {
+  if (!suggestionHints.has(candidateId) && !suggestionsLoaded[candidateId]) return '';
+  const open = suggestionsOpen.has(candidateId);
+  let body = '';
+  if (open) {                              // the text is put in the page ONLY for a panel that is open
+    const items = suggestionsLoaded[candidateId];
+    if (suggestionErrors.has(candidateId)) body = '<div class="note">Could not load the suggestion.</div>';
+    else if (!items) body = '<div class="note">Loading\u2026</div>';
+    else body = items.length ? items.map(renderOpinion).join('') + suggestionFooter() : '<div class="note">There is no suggestion for this item now.</div>';
+  }
+  return `<details class="suggest" data-id="${esc(candidateId)}" ${open ? 'open' : ''} ontoggle="onSuggestionToggle(this)">
+      <summary>Assistant's suggestion<span class="badge">available &middot; advisory</span></summary><div class="suggest-body">${body}</div></details>`;
+}
+
+// Fires when a steward opens or closes a panel (and, in some browsers, once for a panel that was drawn already open: it must therefore do nothing the second time).
+function onSuggestionToggle(el) {
+  const id = el.dataset.id;
+  if (el.open) {
+    suggestionsOpen.add(id);
+    suggestionsViewed.add(id);
+    if (!(id in suggestionsLoaded) && !suggestionErrors.has(id)) return loadSuggestion(id);
+  } else {
+    suggestionsOpen.delete(id);            // closing does not un-see it: it stays in suggestionsViewed
+  }
+}
+
+async function loadSuggestion(id) {
+  try {
+    const data = await fetchJSON(`/v1/${currentDomain}/review-queue/${encodeURIComponent(id)}/recommendations`);
+    suggestionsLoaded[id] = (data && data.items) || [];
+    if (!suggestionStats) {
+      try {
+        const st = await fetchJSON(`/v1/${currentDomain}/recommendations/stats`);
+        suggestionStats = { decided: st.decided, agreed: st.agreed };
+      } catch (e) { suggestionStats = { decided: 0, agreed: 0 }; }
+    }
+  } catch (e) {
+    suggestionErrors.add(id);
+  }
+  renderQueue();
+}
+
+async function refreshSuggestionHints() {
+  let ids;
+  try {
+    const page = await fetchJSON(`/v1/${currentDomain}/recommendations?outcome=open&limit=200`);
+    ids = ((page && page.items) || []).map(r => r.candidate_id);
+  } catch (e) { return; }                // could not ask: keep what is known (a panel someone is reading must not vanish because of one failed request). No suggestions at all is an empty list, not an error
+  const same = ids.length === suggestionHints.size && ids.every(i => suggestionHints.has(i));
+  suggestionHints = new Set(ids);
+  if (!same) renderQueue();
+}
+
 function renderCandidate(c) {
   const reasonsHtml = c.reasons.map(r => `<li>${esc(r)}</li>`).join('');
   return `
@@ -333,6 +439,7 @@ function renderCandidate(c) {
         ${renderRecord(c.record_a)}
         ${renderRecord(c.record_b)}
       </div>
+      ${renderSuggestion(c.candidate_id)}
       <div class="actions">
         <button class="action-btn confirm" onclick="resolve('${c.candidate_id}', 'confirm')">Confirm match &amp; merge</button>
         <button class="action-btn reject" onclick="resolve('${c.candidate_id}', 'reject')">Not a match</button>
@@ -342,11 +449,17 @@ function renderCandidate(c) {
 
 async function resolve(candidateId, decision) {
   try {
+    // true: the steward opened the suggestion before deciding; false: one was there and they did not look; left out: there was none. The server keeps it with the outcome.
+    const payload = {decision};
+    if (suggestionsViewed.has(candidateId)) payload.suggestion_viewed = true;
+    else if (suggestionHints.has(candidateId)) payload.suggestion_viewed = false;
     await fetchJSON(`/v1/${currentDomain}/review-queue/${candidateId}/resolve`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({decision})   // who decided is the signed-in key's name, decided by the server
+      body: JSON.stringify(payload)   // who decided is the signed-in key's name, decided by the server
     });
+    for (const set of [suggestionHints, suggestionsOpen, suggestionsViewed, suggestionErrors]) set.delete(candidateId);
+    delete suggestionsLoaded[candidateId];
     showToast(decision === 'confirm' ? 'Merged into golden record' : 'Marked as not a match');
     resetPages();   // a decision changes what is on every page: start again from the first
     await loadAll();
@@ -499,6 +612,7 @@ async function loadAudits() {
 
 async function loadAll() {
   const pendingCount = await loadQueue();
+  await refreshSuggestionHints();
   await loadEntities();
   try { await loadAudits(); } catch (e) { /* a role that may not audit just sees no panel content */ }
 

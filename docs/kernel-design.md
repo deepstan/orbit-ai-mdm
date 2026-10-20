@@ -1,7 +1,70 @@
 # The matching kernel: design
 
-Status: **a validated prototype and a design, not yet the product.** The prototype is `experiments/kernel_v2.py` (in memory, on the real standardizer, blocking, scorer and
-survivorship). Section 8 says what has and has not been measured. Nothing in `app/` has been replaced yet.
+Status (2026-10-14): **the application runs this design as its matching engine** (section 0). The prototype that measured it is `experiments/kernel_v2.py`; sections 1 to 11 are the design
+and the evidence, and say in each place what has and has not been measured. Where this document says "the prototype" it means that experiment; where it says "the application" it means `app/`.
+
+## 0. As built: the kernel is the application's matching engine
+
+**What was replaced.** One function: `pipeline._route_record`, the step that answers "which entity does this record belong to?". It was a pairwise step (every candidate record scored against the
+new one, a pair saved for each). It is now `app/kernel_router.py` (the database part) over `app/kernel.py` (the pure part: scorers, how a group looks to the matcher). Everything around the step is
+unchanged and is shared by every way a record can arrive: landing, staging, the processing states and resume, history of changed records, golden-record publishing, runs, the review queue, a steward's
+confirm and reject, unmerge, audits, lineage, the learned scorer. The old step is kept, selectable with `MDM_ENGINE=legacy`, for rollback and for comparison.
+
+**No new tables and no migration.** A group is built on demand from what the product already stores: the entity's records, their staged forms, the blocking index. So the kernel always sees current
+membership: a steward's confirm, an unmerge, a purge or a legacy bulk load cannot leave it stale, and data made by either engine can be continued by the other (a test proves it). This is why
+section 5's tables are NOT needed for the first integration; they remain the design for the persistent, batched version (section 7c).
+
+| Design (sections 2 to 4) | As built in the application |
+|---|---|
+| a group | an entity: its `entity_<domain>` row and the records whose `entity_id` it is; pseudo-groups for a record with no entity yet (an interrupted run) |
+| the group's feature set | rebuilt from the members' staged forms on every use (no stored index); a record is compared with the group's value NEAREST to its own for each field |
+| golden record as a derived view | survivorship as before; the golden record's MATCHING form is taken from the member that wins each field, not by standardizing the golden values again (a golden value can be typed or hashed) |
+| candidate retrieval | the existing record-level blocking index, mapped to entities; groups ranked by rarity-weighted shared keys; `MDM_MAX_CANDIDATES` limits how many are scored (default: all) |
+| value-frequency table | counted over the candidate records of each arrival (not stored): an identifier held by 3 OTHER groups is capped at 0.80 unless the names corroborate |
+| scorer | `CorroboratedScorer` by default (the frequency rule, and a changed surname does not undo a certain match); `MDM_KERNEL_SCORER=frequency\|rule` selects the others |
+| join | the record joins the best group scoring auto-merge, with ONE confirmed pair to the group's closest member: an entity is a TREE of pairs, so unmerge always has one pair to remove |
+| two groups that are one | a record that matched two groups strongly joins the better; if the two groups' golden records match each other they are merged (one `group_merge` pair; Senzing and Reltio do this), otherwise the other group is queued for a person |
+| a possible match | pending pairs for a person (at most `MDM_REVIEW_CAP`, default 5); the record is still an entity of its own, as before |
+| update (decided by the owner: as Senzing and Reltio) | the changed record is matched again like a new one, so it can LEAVE its group (its system pairs are superseded, the members who stay are kept connected, both golden records are rebuilt) or move to another; **a record a person tied to its group never leaves** |
+| human decisions are constraints | a pair a person separated is never proposed again and is never the "evidence" pair of a review; two entities with a separation between them are never merged automatically; the old wording of the reason is kept |
+| learned scorer, audit sampling, LLM adjudication, blending with the learned model | the same functions as before, called at the same points |
+| relationships (households), event outbox, `anchored` update policy | **NOT in the application**: prototype only |
+
+**Settings** (environment; a bad value stops the program with a message, it is never ignored):
+
+| Variable | Values | Default | |
+|---|---|---|---|
+| `MDM_ENGINE` | `kernel`, `legacy` | `kernel` | `legacy` is the old pairwise step |
+| `MDM_MERGE_GROUPS` | `auto`, `propose`, `off` | `auto` | `propose`: the groups are queued for a person instead of merged (Ataccama); `off`: neither |
+| `MDM_MAX_CANDIDATES` | a number, 0 = all | all | a speed dial: scoring only the best N groups costs accuracy that grows with the data (section 7d) |
+| `MDM_RANK` | `idf`, `keys` | `idf` | how groups are ranked when the limit is set |
+| `MDM_KERNEL_SCORER` | `corroborated`, `frequency`, `rule` | `corroborated` | |
+| `MDM_REVIEW_CAP` | a number | 5 | review items for one record |
+| `MDM_BATCH_COMMIT` | a number | 200 | records matched per transaction in a batch run, and the most a dying process can lose |
+
+**What changed for a user.** (1) A changed record can leave its group (before: it never could). (2) Fewer pair rows: a join saves one pair, not one per similar record, so the `match_candidates` counts
+are smaller than the legacy engine's for the same data (the people benchmark's auto-merged count is a count of tree edges now). (3) `stayed: true` in the result of a changed record that still belongs
+where it was (it is not reported as merged: it was already there). (4) `bulk_ingest.py --bulk` is the same code path as a normal load; the set-based engine is `--legacy-bulk`, and its own
+options (`--workers`, `--workdir`, `--dry-run`, `--resume`, `--budget`, `--lineage`) are refused with `--bulk` instead of being ignored.
+
+**Measured, on the application (SQLite, one core).** 200 customers: 165 entities, 35 automatic merges, 1 review item, **the same as the legacy engine**, through either loader path. 4,000 people: 3,744
+entities (legacy 3,743), 256 confirmed pairs, 61 pending (legacy 65 pending). **Speed, before and after the writes were batched:** 4,000 people 50.8 s (79 records/s) before, **5.3 s (748/s)** after; 50,000 people about 10.5 minutes before, **about 101 s (490/s on average)** after, the same 46,650 entities and 3,350 confirmed and 745 pending pairs; the set-based engine takes 51 s. The rate falls with the data (654/s over the first 10,000 records, about 420/s over the last 25,000): Why it falls (investigated 2026-10-15): the SQL time per record rises from 0.70 ms on an empty database to 2.10 ms at 50,000 records while the number of calls per record stays flat; the growth is in COMMIT (+0.59 ms per record), the insert into blocking_keys (+0.26), marking records matched (+0.24) and the lineage insert (+0.15). Ruled out as the main cause by experiment: the transaction size (200, 1,000 and 2,000 records per commit: the same speed), SQLite's cache size and WAL (inside the +-10% run-to-run noise), skipping lineage (about +14%, noisy), and keying the phone exactly instead of with every adjacent-digit swap (the key table shrinks 46%, +5%, and on this synthetic data the same entities, the same 3,350 confirmed pairs and 744 against 745 pending). So the cause is only partly explained; `experiments/sql_time_by_statement.py` is the tool to rerun it, and the next measurement belongs on PostgreSQL. **Profile of 1,500 people, before:** SQLite commits 40% (12.6 per record), SQLite statements 33%, a new connection per store call 7%, scoring 3%, the kernel's own decision logic under 1%. **After:** 12 commits in all (commits 0.1%), statements 19%, scoring, similarity and standardizing 18%, the kernel's own logic 3%, and about 60% Python overhead (row parsing, JSON, dataclasses, store code). So the slowdown against the set-based engine was never the kernel: it was the store's one-commit-per-call pattern, which is what Gate P measured and removed in the prototype.
+
+**Does the integrated engine keep the prototype's accuracy?** `experiments/app_engine_benchmark.py` runs the hard-cases benchmark (with life-event updates) on the APPLICATION's engine, kernel against legacy, two seeds: precision 0.994 against 0.941, recall 0.896 against 0.906, F1 0.942 against 0.923; wrong merges after an update that turns a record into someone else 0 against 36. The prototype measured F1 0.946; the small gap is probably the integration's use of the existing record-level blocking index and its way of deriving a group's golden values, not confirmed. Where the kernel is weaker: it is more cautious, so after a life event it missed 6 same-person pairs against 1 (the old engine never splits a record from its group). On the 4,000-person file the kernel and the set-based engine put the same 267 pairs together; the set-based engine also merged 2 more (by chaining) and the kernel none it did not. **Neither is "correct" in an absolute sense:** the truth is known only in a benchmark I generated, and I wrote some of the kernel's rules after seeing its failures, so its score is optimistic. Which is better depends on what a wrong merge costs against a missed one; a steward labelling the disagreements on real data would settle it.
+
+**Batching the writes (built, 2026-10-15).** `store.batch()` is one transaction for everything its block writes (reentrant; per thread on SQLite, and on PostgreSQL it holds the store's one connection); `store.savepoint()` undoes one block inside it. `run_batch` and `process_pending` first LAND the records (raw and staged: one commit, durable before any matching), then match them in transactions of `MDM_BATCH_COMMIT` records (default 200); each record's matching runs under a savepoint, so a failing record rolls back only itself and is recorded as unfinished with its error. A single realtime `ingest_record` is the same unit of work with one record (landing, then one transaction: 4 connections instead of about 25; a batch of 200 records opens 9 instead of about 5,000). **What it changes:** matching is ATOMIC. A process that dies loses at most the matching of the batch in flight (up to 200 records; landing is durable), nothing is left half done (no pair without its merge), and `process-pending`, or running the command again, finishes with the groups an uninterrupted run gives (tested at several batch sizes and crash points). The tests that asserted partial durable states (a pair saved but not merged) were rewritten to assert that nothing half-done survives, and the replay of a pair saved without its merge is still tested by building that state by hand. **What it cost to get right:** creating or checking a golden table goes through the migration runner, which opens its OWN connection and would wait for the batch's write lock for ever (the first probe hung on it): the check is now made before the transaction opens (`store.batch(domain=...)`), and inside a batch it raises a message saying so. **Not yet run on PostgreSQL**, where every statement is also a network round trip.
+
+**Fewer statements (built, 2026-10-15).** A record in a batch cost 16.8 SQL statements (person) and now costs 8.0 (customers 12.7; realtime 22.8 with landing and the index checks): a new one-record entity is written once with its golden record, computed from the record already in memory (it took six statements); lineage rows are pooled and written once per transaction; the held-record lookup is one query per chunk (it was one per record, in both stores); a new record's blocking keys are inserted without a delete (`replace_blocking_keys_batch(fresh=True)`); separations are asked once per transaction in a batch. Same groups, pairs and golden records (all 3,744 identical, ids and timestamps normalised). **One behavior change:** an entity created and then changed by a merge inside one batch records both lineage steps (A, then A to B), as realtime always did; before, a batch recorded only the final value (30 of 3,744 entities). On SQLite the speed gain is small (+4% from scratch, up to +15% onto a large base, within the noise) because a statement is nearly free there; the saving is a network round trip each on PostgreSQL (8.8 per record), unmeasured. What remains of the 8 statements is mostly reads (blocking buckets and members, which groups the candidates belong to, the groups' records and staging): a hot cache for those is the next step.
+
+**The key filter (built, 2026-10-19; off by default).** Of a record's 8.0 statements, 2.8 are reads and ~1.9 of those are the two blocking lookups, and **92% of records share none of their 14 keys with any other record** (4,000 people), so for them both lookups find only the record itself. A read cache cannot skip them (it cannot say "nothing is there" without holding the whole index, which at 100 million records is 1.4 billion keys); a **Bloom filter of the keys already indexed** can: "definitely never seen" means no lookup, "maybe" means ask as before (`app/keyfilter.py`, `bulk_ingest.py --key-filter`). Measured on 4,000 people: statements per record 8.04 to 6.21, reads 2.81 to 0.98, 95% of keys never looked up; groups, golden records and pairs identical. **It is only valid with ONE writer** (nothing else may write that tenant and domain during the load: a key added behind its back would be a lost candidate), it is loaded from the existing index first and gives up cleanly if that is too big, and a false "maybe" costs only a lookup. What is left of the 6.2 statements is mostly WRITES (5.2): the next lever is writing in larger groups or pipelining, which can only be tested on PostgreSQL. Not run on PostgreSQL. Writing it found that the engine was slightly non-deterministic: two identical loads could differ on a genuine tie, because ties were broken by random ids. **Fixed (2026-10-19):** every tie is now settled by what a record IS (its source system and source record id), candidate weights are rounded, and a tie across the candidate cut-off is resolved before cutting; identical loads in separate processes with different hash seeds now give identical groups, golden records and pairs (`tests/test_determinism.py`), so Gate S step 2 has a reproducible sequential run to compare with. One tie is still settled by an id: which of two entities survives a merge when both were created in the same microsecond.
+
+**What was found by running the old tests against it** (27 of 855 failed at first): two real bugs, both fixed and both pinned by tests. (1) On resume, a record whose pair had been saved and whose entity
+merge had been replayed was given a SECOND entity. (2) After an unmerge, the group holding the separated partner was queued for review through its closest member, which could be the very record the person had
+separated: the pair a person said was not the same was proposed again. The other failures were tests of the legacy engines against each other (12, now pinned to `MDM_ENGINE=legacy`), tests that needed
+two paths between records (3, now built the realistic way: a steward confirms a redundant pair), and tests that injected a crash into a lookup only the legacy step makes (7, now engine-neutral).
+
+**Tests.** `tests/test_batch_writes.py` (18 tests, including the statement counts and the lineage guarantee: the same groups at every batch size and one at a time, a process dying mid-batch, one failing record, another thread never seeing a half-written batch, the connection counts; checked by breaking the code 8 ways, and the contract on both databases is in `tests/test_store_contract.py`); `tests/test_kernel_engine.py` (30 tests through the real entry points; 14 deliberate breakages of the engine were tried and every one is caught, after two test weaknesses were found and fixed);
+the experiment's 55 tests, now against the SAME scorer code as the application; the existing suite.
 
 ## 1. What this must be, and the constraints
 
@@ -70,7 +133,7 @@ No wrong merges were added: the household and Jr/Sr cases are unchanged. The 8 t
 5. **A pluggable scorer.** `score(record, view, context) -> Result`. `RuleScorer` is today's scorer unchanged; `FrequencyAwareScorer` adds the identifier rule. A probabilistic scorer
    (Fellegi-Sunter weights learned without labels, with term frequency; per-field log-weights stay explainable) or the learned model can be dropped in.
 
-## 5. Persistent data model (to build)
+## 5. Persistent data model (the DESIGN for the batched version; the application's first integration needs none of it, section 0)
 
 `groups(id, tenant, domain, status, created_at)`; `group_members` is `source_records.entity_id` (unchanged); `group_features(group, field, value, n_records)`;
 `group_keys(key, group)` (the blocking index, keyed to groups: smaller than today's per-record index); `value_holders(field, value, n_groups)` (maintained incrementally, or derived from `group_features`);
@@ -107,6 +170,8 @@ and no separate bulk pipeline. This is how the entity-resolution specialists do 
 3. work that a concurrent change makes necessary but that need not block (a group merge that became possible because a golden changed meanwhile; a second look at an ambiguous candidate) goes to a **redo queue**, drained by the same operation;
 4. downstream consumers read the event outbox and never process one group in parallel;
 5. results need to be **close to** the sequential kernel's, not identical: sequential arrival order already changes at most a handful of record pairs (section 8); the redo queue is what drives convergence.
+
+**Gate S, step 1: SIMULATED (2026-10-19; `docs/gate-s.md`).** On the benchmark (7,000 to 31,000 records, in memory) the gate passes: F1 within 0.085 points of sequential at up to 4,096 workers, and the redo queue drains (at most 3 tries). **But validating a read by a group VERSION, as the list above says, is the wrong validation**: 98 to 99% of its conflicts are false alarms, and at 4,096 workers it leaves about 500 effective workers. **Validate by RE-DECIDING instead** (reuse the scores of groups that did not change; a conflict only if the decision would change): conflicts 0.1 / 0.3 / 1.8 / 12.4% at 8 / 64 / 512 / 4,096 workers on 7,363 records and 3.2% at 4,096 on 30,835, so they fall as the data grows (roughly workers divided by records; an extrapolation, not a measurement). The candidate SET must be compared too (a phantom). **Not tested: hot groups** (the benchmark has no group over 20 members), a database, and the design's 1,000,000 records.
 
 **What was measured, and a correction.** In memory (so no database cost), key cap 30, after fixing a bug in my prototype and caching two pure functions:
 
@@ -146,7 +211,7 @@ Where the time goes now (profile, 6,500 records): scoring candidates 47% (22.5 s
 | B2 | keep the hot working set (key index, feature sets, holders) in process memory with write-behind to Postgres; shard by key hash if it does not fit | **BUILT** (`experiments/gate_p/sqlstate.py`); measured on SQLite, including with a cache a seventh of the data: the rate keeps FALLING as the hit rate falls (834 to 457 records/s) | removes reads only while the cache holds the working set |
 | B3 | partition tables by tenant and domain, and by key hash | design | parallel-friendly storage |
 | C1 | declared partitions (never compared with each other) | Ataccama | free coarse parallelism |
-| C2 | optimistic concurrency + redo queue, many workers on one store | Senzing; Gate S | the one-engine scale-out |
+| C2 | optimistic concurrency + redo queue, many workers on one store | Senzing; Gate S | the one-engine scale-out. **SIMULATED** (`docs/gate-s.md`): passes if a read is validated by re-deciding, not by a group version; step 2 (PostgreSQL, data with hubs) not run |
 | C3 | snapshot scoring in parallel, then a serialized assignment phase | Ataccama; a scheduling mode of the same code | fallback inside Gate S |
 | D1 | several worker PROCESSES (Python) | simple; each keeps its own caches | linear until the database saturates |
 | D2 | compile the hot loop (Rust or C) | only if the profile is CPU-bound AFTER B | 10x or more on the CPU part; high cost |
@@ -249,7 +314,7 @@ decisions**; inactive records **keep their master ID** so a returning customer g
 
 **Not measured:** real data; the cost of a database underneath; any parallel execution; deletes; unmerge on the kernel; the learned scorer and audits on groups; a probabilistic scorer.
 
-## 9. Tests the real kernel must carry over (they exist now, in `experiments/test_kernel_v2.py`: 21 tests, and all 13 deliberate breakages of the kernel are caught)
+## 9. Tests the kernel carries (the prototype's are in `experiments/test_kernel_v2.py`: 34 tests; the application's in `tests/test_kernel_engine.py`: 30)
 
 Replay equals state; same data and order gives the same answer and events; an update leaves its group and the golden forgets it; a corrected typo rejoins; a group left empty is removed; the feature set
 finds a spelling variant and a second phone; an identifier held by many groups does not merge a record that is only that identifier, but does merge one whose name agrees; an over-populated key is not
@@ -262,7 +327,10 @@ used; households are linked and not merged; the scorer is replaceable; under the
 3. **Key and cap calibration** per tenant and domain; hub names (Smith, Garcia) need a corroboration rule beyond the cap.
 4. **The scorer** is still hand-set weights. A probabilistic scorer is the largest remaining accuracy lever and fits the interface.
 5. **The two competitor-reading decisions are made** (section 7b items 4 and 5): update = match again as Senzing and Reltio do, with our surname rule; group merging = automatic. Both stay settings (`update_policy`, `merge_groups`).
-6. **System regrouping stays off** by decision. If it is ever wanted, `resolve(group scope)` is the hook: re-run section 3 over one group's members with human constraints applied.
+6. **Writes are batched; PostgreSQL and the next steps are not done (section 0).** The remaining cost on SQLite is spread (about 60% Python overhead), and the rate still falls with the data (654 to about 420 records/s over 50,000): partly explained in section 0, not solved. On PostgreSQL the same code sends about 25 statements per record as network round trips, so a cache for the reads comes next (the writes are already down to about 8 statements per record). **The batched writes have never run on PostgreSQL; Gate P and Gate S (concurrent workers) are unrun.** A long batch holds SQLite's single write lock (other writers wait up to 30 s).
+7. **Not yet in the application:** relationships between groups (households), the event outbox for downstream systems, the `anchored` update setting, `MDM_ENGINE` per tenant (it is global), and
+   concurrent workers. A changed record can now leave its group, so a downstream system that holds entity ids must expect an entity to LOSE a record, not only to gain one.
+8. **System regrouping stays off** by decision. If it is ever wanted, `resolve(group scope)` is the hook: re-run section 3 over one group's members with human constraints applied.
 
 
 ## 11. Which database? (written in response to "what if the customer's database is not Postgres?")

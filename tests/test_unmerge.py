@@ -16,7 +16,7 @@ import unittest.mock as mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.db import Store  # noqa: E402
-from app.models import MatchCandidate  # noqa: E402
+from app.models import MatchCandidate, now_iso  # noqa: E402
 from app.pipeline import ingest_record, merge_two_records, resolve_candidate  # noqa: E402
 from app.unmerge import CannotUnmerge, plan_unmerge, separation_violations, unmerge_pair  # noqa: E402
 
@@ -44,6 +44,17 @@ class Chain(unittest.TestCase):
 
     def ingest(self, name, attrs, store=None):
         return ingest_record(store or self.store, TENANT, DOMAIN, "src", name, attrs)
+
+    def ingest_tied_every_way(self, name, attrs):
+        """Ingest a record that matches A, B and C, and make sure it is tied to EACH of them: a second path between records that were already joined.
+        The legacy engine saved a pair for every record the newcomer matched, so this happened by itself. The kernel joins a record to its group with ONE pair (an entity is a
+        tree, so unmerge always has one pair to remove); a second path now arises when a steward confirms a pair that already holds, and that is what this does."""
+        result = self.ingest(name, attrs)
+        for other in "ABC":
+            if not self.store.confirmed_pairs_among(TENANT, DOMAIN, [self.rid(name), self.rid(other)]):
+                self.store.save_candidate(MatchCandidate(record_a_id=self.rid(name), record_b_id=self.rid(other), tenant_id=TENANT, domain=DOMAIN, score=0.9, match_type="fuzzy",
+                                                         status="confirmed", decided_by="steward:test", decided_at=now_iso()))
+        return result
 
     def rec(self, name):
         return next(r for r in self.store.list_source_records(TENANT, DOMAIN) if r.source_record_id == name)
@@ -130,7 +141,7 @@ class TestSplitting(Chain):
 
 class TestWhatItRefuses(Chain):
     def test_records_still_joined_by_another_path_are_not_split_and_the_path_is_named(self):
-        self.ingest("D", D)                                                                       # D matches A, B and C: now A-D-B joins A and B another way
+        self.ingest_tied_every_way("D", D)                                                        # D matches A, B and C: now A-D-B joins A and B another way
         self.assertEqual(len({self.entity(n) for n in "ABCD"}), 1)
         ab = self.pair("A", "B")
         before = self.snapshot()
